@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Sat, 17 Oct 2026 13:17:33 +0800
+Subject: [PATCH] Remove cloud history notes integration and activation
+
+---
+ codex-rs/Cargo.lock                       | 1 -
+ codex-rs/app-server/Cargo.toml            | 1 -
+ codex-rs/app-server/src/extensions.rs     | 1 -
+ codex-rs/core/src/config/mod.rs           | 4 +---
+ codex-rs/core/src/session/token_budget.rs | 7 +++----
+ 5 files changed, 4 insertions(+), 10 deletions(-)
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index ca1255f58d60e84ec7f753815d9d923b7c4cd4f7..001dbb8c701b735f682e54744f18b8add563b70b 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -2122,7 +2122,6 @@ dependencies = [
+  "codex-git-utils",
+  "codex-goal-extension",
+  "codex-guardian-v2",
+- "codex-history-notes-extension",
+  "codex-home",
+  "codex-hooks",
+  "codex-http-client",
+diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+index 5be87eef07ad4257aec6ad966004266b616693e7..499a7a984e68570c656c69412d778ea51db5fb3d 100644
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -56,7 +56,6 @@ codex-guardian-v2 = { workspace = true }
+ codex-git-utils = { workspace = true }
+ codex-file-watcher = { workspace = true }
+ codex-hooks = { workspace = true }
+-codex-history-notes-extension = { workspace = true }
+ codex-http-client = { workspace = true }
+ codex-otel = { workspace = true }
+ codex-plugin = { workspace = true }
+diff --git a/codex-rs/app-server/src/extensions.rs b/codex-rs/app-server/src/extensions.rs
+index 8146d437224a13f1c8b423877bc83546d4a44b62..1b7e4fa5eef5f67f966986b057d28dcbd01caf2d 100644
+--- a/codex-rs/app-server/src/extensions.rs
++++ b/codex-rs/app-server/src/extensions.rs
+@@ -69,7 +69,6 @@ pub(crate) fn thread_extensions(
+     if let Some(queue_service) = queue_service {
+         codex_queue_extension::install(&mut builder, queue_service);
+     }
+-    codex_history_notes_extension::install(&mut builder, auth_manager.clone());
+     codex_core::install_agent_message_board(&mut builder, thread_manager.clone());
+     if let Some(state_db) = state_db {
+         codex_goal_extension::install_with_backend(
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index 46e43dfc1975874273011848140830ae84ff5278..9b48cff4dec83282c05cceda495bb6985eee4b52 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -2911,9 +2911,7 @@ pub(crate) fn resolve_token_budget_config(
+     }
+ 
+     let token_budget_config = token_budget_toml_config(config_toml.features.as_ref());
+-    let use_history_notes_extension = token_budget_config
+-        .and_then(|config| config.use_history_notes_extension)
+-        .unwrap_or_default();
++    let use_history_notes_extension = false;
+     let reminder_threshold_tokens =
+         token_budget_config.and_then(|config| config.reminder_threshold_tokens);
+     let reminder_message_template = token_budget_config
+diff --git a/codex-rs/core/src/session/token_budget.rs b/codex-rs/core/src/session/token_budget.rs
+index eebf9e1c8fda32fa1ad41a3208b2e721a05bec33..4f6ed2ce6fb4cf29ba42f87159754edfff7288da 100644
+--- a/codex-rs/core/src/session/token_budget.rs
++++ b/codex-rs/core/src/session/token_budget.rs
+@@ -53,7 +53,7 @@ pub(super) fn apply_experimental_context(
+     config
+         .token_budget
+         .get_or_insert_default()
+-        .use_history_notes_extension = true;
++        .use_history_notes_extension = false;
+     Ok(())
+ }
+ 
+@@ -96,8 +96,7 @@ pub(super) fn resolve_token_budget(
+     };
+ 
+     let token_budget = TokenBudgetConfig {
+-        use_history_notes_extension: configured_token_budget
+-            .is_some_and(|token_budget| token_budget.use_history_notes_extension),
++        use_history_notes_extension: false,
+         reminder_threshold_tokens: Some(model_defaults.reminder_threshold_tokens),
+         reminder_message_template: model_defaults.reminder_message_template.clone(),
+         guidance_message: Some(model_defaults.guidance_message.clone()),
+@@ -153,7 +152,7 @@ pub(super) fn apply_model_defaults(config: &mut Config, model_info: &ModelInfo)
+ 
+     // Keep prompts unresolved so later turns and model switches use their own defaults.
+     config.token_budget = Some(TokenBudgetConfig {
+-        use_history_notes_extension: model_defaults.use_history_notes_extension,
++        use_history_notes_extension: false,
+         ..TokenBudgetConfig::default()
+     });
+ }

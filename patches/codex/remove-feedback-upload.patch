@@ -1,0 +1,350 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Sat, 17 Oct 2026 13:29:23 +0800
+Subject: [PATCH] Remove feedback RPC and network upload transports
+
+---
+ codex-rs/Cargo.lock                           |   2 -
+ .../src/protocol/common.rs                    |   5 -
+ codex-rs/app-server/src/message_processor.rs  |  14 --
+ codex-rs/app-server/src/request_processors.rs |   2 -
+ codex-rs/feedback/Cargo.toml                  |   2 -
+ codex-rs/feedback/src/lib.rs                  | 158 +-----------------
+ 6 files changed, 3 insertions(+), 180 deletions(-)
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 37361bf67348a3a2ded3e7970dd8ca749c09bb29..ca7dcb8955be27a2cd7ec1ff8b0545738a708e34 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -3438,7 +3438,6 @@ name = "codex-feedback"
+ version = "0.163.0"
+ dependencies = [
+  "anyhow",
+- "bytes",
+  "codex-http-client",
+  "codex-login",
+  "codex-protocol",
+@@ -3446,7 +3445,6 @@ dependencies = [
+  "codex-state",
+  "flate2",
+  "http 1.4.0",
+- "httpdate",
+  "log",
+  "mime_guess",
+  "pretty_assertions",
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+index df76f4ef251b1c5f1c714dbe7dfbcba599f47f86..d256fa788efb59d0c5b1d162c127ae3d7f2107bb 100644
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -1241,11 +1241,6 @@ client_request_definitions! {
+         response: v2::SendAddCreditsNudgeEmailResponse,
+     },
+ 
+-    FeedbackUpload => "feedback/upload" {
+-        params: v2::FeedbackUploadParams,
+-        serialization: None,
+-        response: v2::FeedbackUploadResponse,
+-    },
+ 
+     /// Execute a standalone command (argv vector) under the server's sandbox.
+     OneOffCommandExec => "command/exec" {
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 42d20546d141db0842dc8ccd1f174779388c2831..0d1303a56ca9aea3f4f19ddaebad3bab40ae56c4 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -29,7 +29,6 @@ use crate::request_processors::CatalogRequestProcessor;
+ use crate::request_processors::CommandExecRequestProcessor;
+ use crate::request_processors::ConfigRequestProcessor;
+ use crate::request_processors::EnvironmentRequestProcessor;
+-use crate::request_processors::FeedbackRequestProcessor;
+ use crate::request_processors::FsRequestProcessor;
+ use crate::request_processors::GitRequestProcessor;
+ use crate::request_processors::InitializeRequestProcessor;
+@@ -147,7 +146,6 @@ pub(crate) struct MessageProcessor {
+     config_processor: ConfigRequestProcessor,
+     environment_processor: EnvironmentRequestProcessor,
+     external_agent_config_processor: ExternalAgentConfigRequestProcessor,
+-    feedback_processor: FeedbackRequestProcessor,
+     fs_processor: FsRequestProcessor,
+     git_processor: GitRequestProcessor,
+     initialize_processor: InitializeRequestProcessor,
+@@ -409,14 +407,6 @@ impl MessageProcessor {
+             outgoing.clone(),
+             Arc::clone(&environment_manager_for_requests),
+         );
+-        let feedback_processor = FeedbackRequestProcessor::new(
+-            auth_manager.clone(),
+-            Arc::clone(&thread_manager),
+-            Arc::clone(&config),
+-            feedback,
+-            log_db.clone(),
+-            state_db.clone(),
+-        );
+         let git_processor = GitRequestProcessor::new();
+         let initialize_processor = InitializeRequestProcessor::new(
+             gateway_login_control,
+@@ -528,7 +518,6 @@ impl MessageProcessor {
+             config_processor,
+             environment_processor,
+             external_agent_config_processor,
+-            feedback_processor,
+             fs_processor,
+             git_processor,
+             initialize_processor,
+@@ -1709,9 +1698,6 @@ impl MessageProcessor {
+                     .process_resize_pty(request_id.clone(), params)
+                     .await
+             }
+-            ClientRequest::FeedbackUpload { params, .. } => {
+-                self.feedback_processor.feedback_upload(params).await
+-            }
+         };
+ 
+         match result {
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index f53f794e7ab1b546963b589e6ee709c2ede281a6..eb2fa6b0dedc0b6ba5f604d95b13d4272fe01c49 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -463,7 +463,6 @@ mod config_reload_tests;
+ mod diagnostics;
+ mod environment_processor;
+ mod feedback_doctor_report;
+-mod feedback_processor;
+ mod feedback_rollout_history;
+ mod feedback_thread_index;
+ mod fs_processor;
+@@ -495,7 +494,6 @@ pub(crate) use command_exec_processor::CommandExecRequestProcessor;
+ pub(crate) use config_processor::ConfigRequestProcessor;
+ pub(crate) use diagnostics::read_server_diagnostics;
+ pub(crate) use environment_processor::EnvironmentRequestProcessor;
+-pub(crate) use feedback_processor::FeedbackRequestProcessor;
+ pub(crate) use fs_processor::FsRequestProcessor;
+ pub(crate) use git_processor::GitRequestProcessor;
+ pub(crate) use initialize_processor::InitializeRequestProcessor;
+diff --git a/codex-rs/feedback/Cargo.toml b/codex-rs/feedback/Cargo.toml
+index ee56043b1cabfbc99eb8df45693f782c1b025f2f..587916a459fb552f9f094bc15d9d9bf905e9cc9a 100644
+--- a/codex-rs/feedback/Cargo.toml
++++ b/codex-rs/feedback/Cargo.toml
+@@ -9,7 +9,6 @@ workspace = true
+ 
+ [dependencies]
+ anyhow = { workspace = true }
+-bytes = { workspace = true }
+ codex-http-client = { workspace = true }
+ codex-login = { workspace = true }
+ codex-protocol = { workspace = true }
+@@ -17,7 +16,6 @@ codex-rollout = { workspace = true }
+ codex-state = { workspace = true }
+ flate2 = { workspace = true }
+ http = { workspace = true }
+-httpdate = { workspace = true }
+ mime_guess = { workspace = true }
+ sentry = { version = "0.46", default-features = false }
+ serde_json = { workspace = true }
+diff --git a/codex-rs/feedback/src/lib.rs b/codex-rs/feedback/src/lib.rs
+index 1d1fad256723521648fd29028965aec08a52c7c3..9227364b9a213e9a15c81fb505fe2f456b056461 100644
+--- a/codex-rs/feedback/src/lib.rs
++++ b/codex-rs/feedback/src/lib.rs
+@@ -15,9 +15,7 @@ use std::time::Instant;
+ use anyhow::Context;
+ use anyhow::Result;
+ use anyhow::anyhow;
+-use codex_http_client::ClientRouteClass;
+ use codex_http_client::HttpClientFactory;
+-use codex_http_client::RouteAwareClientPool;
+ use codex_login::AuthEnvTelemetry;
+ use codex_protocol::ThreadId;
+ use codex_protocol::protocol::SessionSource;
+@@ -35,9 +33,7 @@ mod daemon_logs;
+ pub use daemon_logs::daemon_log_attachments;
+ pub(crate) mod feedback_diagnostics;
+ mod guardian;
+-mod report_upload;
+ mod rollout_archive;
+-mod upload;
+ pub use feedback_diagnostics::FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME;
+ pub use feedback_diagnostics::FeedbackDiagnostic;
+ pub use feedback_diagnostics::FeedbackDiagnostics;
+@@ -45,9 +41,6 @@ pub use guardian::GuardianReviewFailures;
+ pub use guardian::GuardianReviewRecord;
+ pub use guardian::guardian_review_failures;
+ pub use guardian::record_guardian_review_failure;
+-pub use report_upload::FeedbackDelivery;
+-pub use report_upload::FeedbackTransport;
+-pub use report_upload::prepare_report_attachment;
+ 
+ /// Filename used for the redacted `codex doctor --json` feedback attachment.
+ pub const DOCTOR_REPORT_ATTACHMENT_FILENAME: &str = "codex-doctor-report.json";
+@@ -58,9 +51,6 @@ pub const CODEX_APP_DIRECTORY_CACHE_ATTACHMENT_FILENAME: &str = "codex-app-direc
+ /// Filename used for the Windows sandbox log feedback attachment.
+ pub const WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME: &str = "windows-sandbox.log";
+ const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+-const SENTRY_DSN: &str =
+-    "https://ae32ed50620d7a7792c1ce5df38b3e3e@o33249.ingest.us.sentry.io/4510195390611458";
+-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 300);
+ // Raw collection budgets used by the report API, not the interactive upload.
+ pub const MAX_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
+ pub const MAX_ATTACHMENTS_BYTES: usize = 126 * 1024 * 1024;
+@@ -607,159 +597,17 @@ impl FeedbackSnapshot {
+     }
+ 
+     /// Submit feedback to Sentry with whole attachments within a shared deadline.
+-    /// Success means HTTP acceptance, not durable attachment storage. Callers must
+-    /// retain their source files; errors can occur after part of a report is accepted.
+-    /// https://github.com/getsentry/relay/blob/master/relay-server/src/endpoints/common.rs
++    /// Uploads are unavailable; local diagnostic snapshots remain supported.
+     pub async fn upload_feedback(
+         &self,
+         options: FeedbackUploadOptions<'_>,
+         http_client_factory: &HttpClientFactory,
+     ) -> Result<()> {
+-        self.upload_feedback_with_dsn(
+-            options,
+-            http_client_factory,
+-            SENTRY_DSN,
+-            Instant::now() + UPLOAD_TIMEOUT,
+-        )
+-        .await
++        let _ = (options, http_client_factory);
++        anyhow::bail!("Feedback upload is disabled in this runtime")
+     }
+ 
+-    async fn upload_feedback_with_dsn(
+-        &self,
+-        options: FeedbackUploadOptions<'_>,
+-        http_client_factory: &HttpClientFactory,
+-        dsn: &str,
+-        deadline: Instant,
+-    ) -> Result<()> {
+-        use std::str::FromStr;
+-
+-        use sentry::protocol::Envelope;
+-        use sentry::protocol::EnvelopeItem;
+-        use sentry::types::Dsn;
+-
+-        let started_at = Instant::now();
+-        let dsn = Dsn::from_str(dsn).map_err(|error| anyhow!("invalid DSN: {error}"))?;
+-
+-        let event = self.feedback_event(
+-            options.classification,
+-            options.reason,
+-            options.tags,
+-            options.session_source.as_ref(),
+-        );
+-        let mut envelope = Envelope::new();
+-        envelope.add_item(EnvelopeItem::Event(event));
+-        let (event_body, event_bytes) =
+-            upload::encode_envelope(&envelope).context("failed to serialize feedback event")?;
+-        anyhow::ensure!(
+-            event_bytes <= MAX_EVENT_BYTES,
+-            "feedback event exceeds the size limit"
+-        );
+-        let headers = envelope.headers().clone();
+-        drop(envelope);
+-        let client_pool = RouteAwareClientPool::new_without_redirects_or_request_logging(
+-            http_client_factory.clone(),
+-            ClientRouteClass::Other,
+-        );
+-        // Accept the report before reading diagnostics; all envelopes share one deadline.
+-        let mut rate_limited = false;
+-        let status = upload::send_envelope(
+-            &client_pool,
+-            &dsn,
+-            event_body,
+-            upload::EnvelopeKind::Event,
+-            deadline,
+-            &mut rate_limited,
+-        )
+-        .await?;
+-        anyhow::ensure!(
+-            status.is_success(),
+-            "Sentry rejected feedback upload with HTTP status {status}"
+-        );
+-
+-        let mut attachments = self.feedback_attachments(
+-            &headers,
+-            options.include_logs,
+-            options.extra_attachments,
+-            options.extra_attachment_paths,
+-            options.logs_override,
+-        );
+-        let mut uploaded_attachments = 0;
+-        let mut attachments_failed = false;
+-        // Keep attachments linked to the accepted event, without replaying its contents.
+-        // Inspect the upper bound without reading the next file after the deadline.
+-        while attachments.size_hint().1 != Some(0) {
+-            if rate_limited || Instant::now() >= deadline {
+-                attachments_failed = true;
+-                tracing::error!(
+-                    reason = if rate_limited {
+-                        "rate limit"
+-                    } else {
+-                        "upload deadline"
+-                    },
+-                    "remaining feedback attachments skipped"
+-                );
+-                break;
+-            }
+-            let Some(attachment) = attachments.next() else {
+-                break;
+-            };
+-            if Instant::now() >= deadline {
+-                attachments_failed = true;
+-                tracing::error!(
+-                    "remaining feedback attachments skipped: upload deadline reached while reading attachment"
+-                );
+-                break;
+-            }
+-            let mut status = None;
+-            let result: Result<()> = async {
+-                let body = upload::encode_attachment_envelope(&headers, attachment?)?;
+-                let response_status = upload::send_envelope(
+-                    &client_pool,
+-                    &dsn,
+-                    body,
+-                    upload::EnvelopeKind::Attachment,
+-                    deadline,
+-                    &mut rate_limited,
+-                )
+-                .await
+-                .map_err(|error| {
+-                    // Transport error strings can contain credential-bearing URLs.
+-                    if let Some(cause) = error.downcast_ref::<codex_http_client::RouteAwareRequestError>() {
+-                        anyhow!(
+-                            "feedback transport failed: class={:?}, timeout={}, connect={}, request={}, body={}",
+-                            cause.failure_class(), cause.is_timeout(), cause.is_connect(), cause.is_request(), cause.is_body()
+-                        )
+-                    } else {
+-                        error
+-                    }
+-                })?;
+ 
+-                status = Some(response_status.as_u16());
+-                anyhow::ensure!(response_status.is_success(), "Sentry rejected attachment");
+-                Ok(())
+-            }
+-            .await;
+-            if let Err(error) = result {
+-                attachments_failed = true;
+-                // Keep trying other diagnostics before reporting the partial failure.
+-                tracing::error!(status, error = %format!("{error:#}"), "feedback attachment upload failed; continuing");
+-            } else {
+-                uploaded_attachments += 1;
+-            }
+-        }
+-        tracing::info!(
+-            thread_id = %self.thread_id,
+-            uploaded_attachments,
+-            attachments_failed,
+-            elapsed_ms = started_at.elapsed().as_millis(),
+-            "feedback event uploaded to Sentry"
+-        );
+-        anyhow::ensure!(
+-            !attachments_failed,
+-            "feedback report was accepted, but some attachments failed to upload"
+-        );
+-        Ok(())
+-    }
+ 
+     fn upload_tags(
+         &self,

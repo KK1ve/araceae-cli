@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Mon, 19 Oct 2026 15:13:52 +1100
+Subject: [PATCH] Use araceae names for the package layout directories and
+ manifest
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ codex-rs/install-context/src/lib.rs           | 10 +++---
+ codex-rs/linux-sandbox/src/bundled_bwrap.rs   |  4 +--
+ codex-rs/linux-sandbox/src/launcher.rs        |  2 +-
+ .../src/helper_materialization.rs             |  2 +-
+ scripts/codex_package/cli.py                  |  3 +-
+ scripts/codex_package/layout.py               | 35 ++++++++++---------
+ scripts/codex_package/targets.py              |  3 ++
+ 7 files changed, 33 insertions(+), 26 deletions(-)
+
+diff --git a/codex-rs/install-context/src/lib.rs b/codex-rs/install-context/src/lib.rs
+index ac76e09282064630bbf5677d60f63681b26d32aa..6caa36a60fb7e91c7cd2481cf700b1bae8abd07b 100644
+--- a/codex-rs/install-context/src/lib.rs
++++ b/codex-rs/install-context/src/lib.rs
+@@ -13,10 +13,10 @@ const CODE_MODE_HOST_EXECUTABLE_NAME: &str = if cfg!(windows) {
+ } else {
+     "araceae-code-mode-host"
+ };
+-const PACKAGE_METADATA_FILENAME: &str = "codex-package.json";
+-const PATH_DIRNAME: &str = "codex-path";
++const PACKAGE_METADATA_FILENAME: &str = "araceae-package.json";
++const PATH_DIRNAME: &str = "araceae-path";
+ const RELEASES_DIRNAME: &str = "releases";
+-const RESOURCES_DIRNAME: &str = "codex-resources";
++const RESOURCES_DIRNAME: &str = "araceae-resources";
+ const STANDALONE_PACKAGES_DIRNAME: &str = "standalone";
+ static INSTALL_CONTEXT: OnceLock<InstallContext> = OnceLock::new();
+ 
+@@ -57,7 +57,7 @@ pub enum InstallMethod {
+         /// such as
+         /// `~/.codex/packages/standalone/releases/0.111.0-x86_64-unknown-linux-musl`.
+         /// Package-layout installs use the package root that contains `bin/`,
+-        /// `codex-resources/`, and `codex-path/`.
++        /// `araceae-resources/`, and `araceae-path/`.
+         release_dir: AbsolutePathBuf,
+         /// The bundled resource directory for managed dependencies.
+         resources_dir: Option<AbsolutePathBuf>,
+@@ -173,7 +173,7 @@ impl InstallContext {
+     }
+ 
+     pub fn code_mode_host_program(&self) -> PathBuf {
+-        // prefer the one packed under codex-resources
++        // prefer the one packed under araceae-resources
+         self.bundled_resource(CODE_MODE_HOST_EXECUTABLE_NAME)
+             .map_or_else(
+                 || self.code_mode_host_program_from_exe(std::env::current_exe().ok().as_deref()),
+diff --git a/codex-rs/linux-sandbox/src/bundled_bwrap.rs b/codex-rs/linux-sandbox/src/bundled_bwrap.rs
+index 7cf48734b720c68ee1bfb46f4b21037d5f9a0324..56fb2a680fd807cf5005fa9e2cf56cd29d775f8f 100644
+--- a/codex-rs/linux-sandbox/src/bundled_bwrap.rs
++++ b/codex-rs/linux-sandbox/src/bundled_bwrap.rs
+@@ -127,9 +127,9 @@ fn legacy_candidates_for_exe(exe: &Path, bazel_candidate: Option<PathBuf>) -> Ve
+     };
+ 
+     let mut candidates = Vec::new();
+-    candidates.push(exe_dir.join("codex-resources").join("bwrap"));
++    candidates.push(exe_dir.join("araceae-resources").join("bwrap"));
+     if let Some(package_target_dir) = exe_dir.parent() {
+-        candidates.push(package_target_dir.join("codex-resources").join("bwrap"));
++        candidates.push(package_target_dir.join("araceae-resources").join("bwrap"));
+     }
+     candidates.push(exe_dir.join("bwrap"));
+     if let Some(path) = bazel_candidate {
+diff --git a/codex-rs/linux-sandbox/src/launcher.rs b/codex-rs/linux-sandbox/src/launcher.rs
+index 84df99c936cdfea16cb8b55bd8bdd7205029e0b1..1182d3c2cda2dc16c69e97ecb63840b9fe3ddbd2 100644
+--- a/codex-rs/linux-sandbox/src/launcher.rs
++++ b/codex-rs/linux-sandbox/src/launcher.rs
+@@ -59,7 +59,7 @@ pub(crate) fn exec_bwrap(mut argv: Vec<String>, preserved_files: Vec<File>) -> !
+         BubblewrapLauncher::Unavailable => {
+             panic!(
+                 "bubblewrap is unavailable: no system bwrap was found on PATH and no bundled \
+-                 codex-resources/bwrap binary was found next to the Codex executable"
++                 araceae-resources/bwrap binary was found next to the Codex executable"
+             )
+         }
+     }
+diff --git a/codex-rs/windows-sandbox-rs/src/helper_materialization.rs b/codex-rs/windows-sandbox-rs/src/helper_materialization.rs
+index 9050f6124410b00b8a903721df23c4fab6dfe694..05e436a6b352950b3b03e05d7de5a5a871a57240 100644
+--- a/codex-rs/windows-sandbox-rs/src/helper_materialization.rs
++++ b/codex-rs/windows-sandbox-rs/src/helper_materialization.rs
+@@ -23,7 +23,7 @@ use crate::setup::SetupRuntime;
+ const DEV_BUILD_VERSION_SENTINEL: &str = "0.0.0";
+ pub(crate) const COMMAND_RUNNER_EXE: &str = "araceae-command-runner.exe";
+ pub(crate) const BIN_DIRNAME: &str = "bin";
+-pub(crate) const RESOURCES_DIRNAME: &str = "codex-resources";
++pub(crate) const RESOURCES_DIRNAME: &str = "araceae-resources";
+ 
+ pub(crate) fn helper_bin_dir(codex_home: &Path) -> PathBuf {
+     sandbox_bin_dir(codex_home)
+diff --git a/scripts/codex_package/cli.py b/scripts/codex_package/cli.py
+index be082eb9dc6223fc2208208eda2fd55689d363fe..37336a28534f3c383c4e8eabc6717cb765e89282 100644
+--- a/scripts/codex_package/cli.py
++++ b/scripts/codex_package/cli.py
+@@ -12,6 +12,7 @@ from .layout import prepare_package_dir
+ from .layout import validate_package_dir
+ from .ripgrep import resolve_rg_bin
+ from .symbols import strip_binary
++from .targets import PACKAGE_METADATA_FILENAME
+ from .targets import PACKAGE_VARIANTS
+ from .targets import TARGET_SPECS
+ from .targets import PackageInputs
+@@ -72,7 +73,7 @@ def create_parser() -> argparse.ArgumentParser:
+         "--package-version",
+         type=parse_package_version,
+         default=read_workspace_version(),
+-        help="Semantic version to record in codex-package.json.",
++        help=f"Semantic version to record in {PACKAGE_METADATA_FILENAME}.",
+     )
+     parser.add_argument(
+         "--package-dir",
+diff --git a/scripts/codex_package/layout.py b/scripts/codex_package/layout.py
+index 5da2c85ce29106f829e8aaa9bf78d75dec7ff8eb..293bbe6608c57bad4e7d2cf6e10473ff701baed8 100644
+--- a/scripts/codex_package/layout.py
++++ b/scripts/codex_package/layout.py
+@@ -6,6 +6,9 @@ import stat
+ from pathlib import Path
+ 
+ from .targets import COMMAND_RUNNER_BIN
++from .targets import PACKAGE_METADATA_FILENAME
++from .targets import PATH_DIRNAME
++from .targets import RESOURCES_DIRNAME
+ from .targets import WINDOWS_SANDBOX_SETUP_BIN
+ from .targets import PackageInputs
+ from .targets import PackageVariant
+@@ -40,8 +43,8 @@ def build_package_dir(
+     inputs: PackageInputs,
+ ) -> None:
+     bin_dir = package_dir / "bin"
+-    resources_dir = package_dir / "codex-resources"
+-    path_dir = package_dir / "codex-path"
++    resources_dir = package_dir / RESOURCES_DIRNAME
++    path_dir = package_dir / PATH_DIRNAME
+     bin_dir.mkdir()
+     resources_dir.mkdir()
+     path_dir.mkdir()
+@@ -82,10 +85,10 @@ def build_package_dir(
+         "target": spec.target,
+         "variant": variant.name,
+         "entrypoint": f"bin/{entrypoint_name}",
+-        "resourcesDir": "codex-resources",
+-        "pathDir": "codex-path",
++        "resourcesDir": RESOURCES_DIRNAME,
++        "pathDir": PATH_DIRNAME,
+     }
+-    write_json(package_dir / "codex-package.json", metadata)
++    write_json(package_dir / PACKAGE_METADATA_FILENAME, metadata)
+ 
+ 
+ def validate_package_dir(
+@@ -95,17 +98,17 @@ def validate_package_dir(
+ ) -> None:
+     required_dirs = [
+         Path("bin"),
+-        Path("codex-resources"),
+-        Path("codex-path"),
++        Path(RESOURCES_DIRNAME),
++        Path(PATH_DIRNAME),
+     ]
+     for relative_dir in required_dirs:
+         path = package_dir / relative_dir
+         if not path.is_dir():
+             raise RuntimeError(f"Missing package directory: {relative_dir}")
+ 
+-    metadata_path = package_dir / "codex-package.json"
++    metadata_path = package_dir / PACKAGE_METADATA_FILENAME
+     if not metadata_path.is_file():
+-        raise RuntimeError("Missing package metadata: codex-package.json")
++        raise RuntimeError(f"Missing package metadata: {PACKAGE_METADATA_FILENAME}")
+ 
+     with open(metadata_path, encoding="utf-8") as fh:
+         metadata = json.load(fh)
+@@ -115,8 +118,8 @@ def validate_package_dir(
+         "target": spec.target,
+         "variant": variant.name,
+         "entrypoint": f"bin/{variant.entrypoint_name(spec)}",
+-        "resourcesDir": "codex-resources",
+-        "pathDir": "codex-path",
++        "resourcesDir": RESOURCES_DIRNAME,
++        "pathDir": PATH_DIRNAME,
+     }
+     for key, expected in expected_metadata.items():
+         actual = metadata.get(key)
+@@ -128,19 +131,19 @@ def validate_package_dir(
+     required_files = [
+         Path("bin") / variant.entrypoint_name(spec),
+         Path("bin") / spec.code_mode_host_name,
+-        Path("codex-path") / spec.rg_name,
++        Path(PATH_DIRNAME) / spec.rg_name,
+     ]
+     executable_files = list(required_files)
+ 
+     if spec.is_linux:
+-        required_files.append(Path("codex-resources") / "bwrap")
+-        executable_files.append(Path("codex-resources") / "bwrap")
++        required_files.append(Path(RESOURCES_DIRNAME) / "bwrap")
++        executable_files.append(Path(RESOURCES_DIRNAME) / "bwrap")
+ 
+     if spec.is_windows:
+         required_files.extend(
+             [
+-                Path("codex-resources") / f"{COMMAND_RUNNER_BIN}.exe",
+-                Path("codex-resources") / f"{WINDOWS_SANDBOX_SETUP_BIN}.exe",
++                Path(RESOURCES_DIRNAME) / f"{COMMAND_RUNNER_BIN}.exe",
++                Path(RESOURCES_DIRNAME) / f"{WINDOWS_SANDBOX_SETUP_BIN}.exe",
+             ]
+         )
+ 
+diff --git a/scripts/codex_package/targets.py b/scripts/codex_package/targets.py
+index d536098713813257bf4648d37c34f8c40178e6cb..56492a9614a779299b3955811b54a91ce79fe902 100644
+--- a/scripts/codex_package/targets.py
++++ b/scripts/codex_package/targets.py
+@@ -14,6 +14,9 @@ if _repo_root is None:
+     )
+ REPO_ROOT = Path(_repo_root)
+ 
++PACKAGE_METADATA_FILENAME = "araceae-package.json"
++RESOURCES_DIRNAME = "araceae-resources"
++PATH_DIRNAME = "araceae-path"
+ CODE_MODE_HOST_BIN = "araceae-code-mode-host"
+ COMMAND_RUNNER_BIN = "araceae-command-runner"
+ WINDOWS_SANDBOX_SETUP_BIN = "araceae-windows-sandbox-setup"

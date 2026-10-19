@@ -1,0 +1,193 @@
+{
+  "align-workspace-lock.patch": {
+    "description": "Align local package lockfile versions with the 0.163.0 workspace without changing external dependencies.",
+    "depends_on": [],
+    "sha256": "21b3546c2fb7a31b33f615f46810df5fc57f7e6195b454ef2b62019f18049ec6",
+    "checks": [
+      "locked-build"
+    ]
+  },
+  "minimal-runtime-entrypoint.patch": {
+    "description": "Provide the app-server command and protocol generators through a dedicated runtime entrypoint.",
+    "depends_on": [
+      "align-workspace-lock.patch"
+    ],
+    "sha256": "2e1fe00cdd2e9073745f5d21cff2395cd1cf62547a3a4694822a9d1a4d5584f3",
+    "checks": [
+      "protocol",
+      "helper-dispatch",
+      "runtime-e2e",
+      "dependency-boundary"
+    ]
+  },
+  "require-explicit-model-provider.patch": {
+    "description": "Require an explicit provider without native account fallback",
+    "depends_on": [
+      "minimal-runtime-entrypoint.patch"
+    ],
+    "sha256": "a8f804b4a8ab746dd05b50c00fe0e0cdf6ec533b9b85ed5b57e9d03ea6005ad1",
+    "checks": [
+      "explicit-provider"
+    ]
+  },
+  "remove-cloud-config.patch": {
+    "description": "Load runtime policy exclusively from local configuration",
+    "depends_on": [
+      "require-explicit-model-provider.patch"
+    ],
+    "sha256": "adcbcec66e17db8abdc8c87b09f08b6697d59affe1f23975c49ff0066de123fe",
+    "checks": [
+      "local-config"
+    ]
+  },
+  "remove-remote-control.patch": {
+    "description": "Remove remote control transport and protocol registration",
+    "depends_on": [
+      "remove-cloud-config.patch"
+    ],
+    "sha256": "ad5a48412db550438da7da9ae1cdbd8f19d285100bb6c04e2b8b0a7396e2bafd",
+    "checks": [
+      "no-remote-control"
+    ]
+  },
+  "disable-native-skills.patch": {
+    "description": "Disable native skill discovery and retain isolation RPC compatibility",
+    "depends_on": [
+      "remove-remote-control.patch"
+    ],
+    "sha256": "e21c2acb31eac52891c5712ee585000ba6692b2a61a00e08c1a09a258d6dfe57",
+    "checks": [
+      "no-native-skills"
+    ]
+  },
+  "remove-native-plugin-marketplace.patch": {
+    "description": "Remove native plugin and marketplace entrypoints and loading",
+    "depends_on": [
+      "disable-native-skills.patch"
+    ],
+    "sha256": "a0eb80617fc4d2c006984b29925d8535aa9f5cef02491264e40faf4aeb904fa3",
+    "checks": [
+      "no-native-plugins"
+    ]
+  },
+  "remove-official-apps.patch": {
+    "description": "Remove official Apps RPCs and hosted MCP auto-registration",
+    "depends_on": [
+      "remove-native-plugin-marketplace.patch"
+    ],
+    "sha256": "39105edadd4158ec8fc1a8a93082f876796618428df9f71f939a123cc99e91bb",
+    "checks": [
+      "no-official-apps"
+    ]
+  },
+  "remove-cloud-history-notes.patch": {
+    "description": "Remove cloud history notes integration and activation",
+    "depends_on": [
+      "remove-official-apps.patch"
+    ],
+    "sha256": "d013f349bc2fbb0e3053253601f76f2bebdead48df7eb62ccab66a4f6cc11156",
+    "checks": [
+      "no-cloud-history-notes"
+    ]
+  },
+  "remove-cloud-git-attribution.patch": {
+    "description": "Remove cloud Git attribution policy and extension",
+    "depends_on": [
+      "remove-cloud-history-notes.patch"
+    ],
+    "sha256": "7f1166e100afbc9ac68bc88e162f4d610f77d061009514f35c91038194b54fdc",
+    "checks": [
+      "no-cloud-git-attribution"
+    ]
+  },
+  "provider-scoped-model-catalog.patch": {
+    "description": "Use bundled model metadata unless a provider catalog is explicit",
+    "depends_on": [
+      "remove-cloud-git-attribution.patch"
+    ],
+    "sha256": "616c1e2fdf031fc298c9ec44d841a02fc078813b9722657141d7cbec35709598",
+    "checks": [
+      "provider-model-catalog"
+    ]
+  },
+  "provider-scoped-compaction.patch": {
+    "description": "Require explicit provider support for remote compaction",
+    "depends_on": [
+      "provider-scoped-model-catalog.patch"
+    ],
+    "sha256": "faef01e29dd83fff96fad4a65555977d4773be70f335a9e94208f2783e76baff",
+    "checks": [
+      "provider-compaction"
+    ]
+  },
+  "remove-feedback-upload.patch": {
+    "description": "Remove feedback RPC and network upload transports",
+    "depends_on": [
+      "provider-scoped-compaction.patch"
+    ],
+    "sha256": "5c8e2c3f5f35f969876f369d68947aa438ef379377401df75223d59b821be8e9",
+    "checks": [
+      "no-feedback-upload"
+    ]
+  },
+  "remove-analytics-upload.patch": {
+    "description": "Replace analytics queues and senders with an inert instrumentation facade",
+    "depends_on": [
+      "remove-feedback-upload.patch"
+    ],
+    "sha256": "b3658d6608977e9b5a8be256494f35586422adc16fab2567b75a0fd59df5c0d5",
+    "checks": [
+      "no-analytics-upload"
+    ]
+  },
+  "remove-otel-exporters.patch": {
+    "description": "Remove telemetry exporters and runtime reload workers",
+    "depends_on": [
+      "remove-analytics-upload.patch"
+    ],
+    "sha256": "7417e3566560e4817759187b5c06d09c3a2c57081b1983f95f4975e9d06f058d",
+    "checks": [
+      "no-otel-exporters"
+    ]
+  },
+  "remove-managed-account-flows.patch": {
+    "description": "Remove native account lifecycle while retaining provider credential refresh",
+    "depends_on": [
+      "remove-otel-exporters.patch"
+    ],
+    "sha256": "36259ea33d91f33e39c820bb30770c7e6052aeeaa0a5b7bfd959df9175430286",
+    "checks": [
+      "provider-auth-only"
+    ]
+  },
+  "araceae-executable-names.patch": {
+    "description": "Name the runtime entrypoint and its helper executables with the araceae prefix",
+    "depends_on": [
+      "remove-managed-account-flows.patch"
+    ],
+    "sha256": "fa511fa5eede53bf57bbba6966eebb78cb026d8e81afdf3139a2bb54760167f2",
+    "checks": [
+      "araceae-executable-names"
+    ]
+  },
+  "araceae-package-layout.patch": {
+    "description": "Name the package resource and PATH directories and the layout manifest with the araceae prefix",
+    "depends_on": [
+      "araceae-executable-names.patch"
+    ],
+    "sha256": "b14803389fa2d67208e63b3ff738b2e2008677129865d4259b823b001347c06f",
+    "checks": [
+      "araceae-package-layout"
+    ]
+  },
+  "araceae-home-directory.patch": {
+    "description": "Default the runtime state directory to ~/.araceae when CODEX_HOME is unset",
+    "depends_on": [
+      "araceae-package-layout.patch"
+    ],
+    "sha256": "de03ea966605ec9277dd3ef1424b7a43f1300eb6667b824226bd91302cb6223e",
+    "checks": [
+      "araceae-home-directory"
+    ]
+  }
+}

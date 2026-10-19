@@ -1,0 +1,3731 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Sat, 17 Oct 2026 13:49:15 +0800
+Subject: [PATCH] Remove native account lifecycle while retaining provider
+ credential refresh
+
+---
+ codex-rs/Cargo.lock                           |    3 -
+ .../src/protocol/common.rs                    |   76 -
+ .../app-server/src/bespoke_event_handling.rs  |   15 +-
+ codex-rs/app-server/src/lib.rs                |    7 +-
+ codex-rs/app-server/src/message_processor.rs  |  107 +-
+ codex-rs/app-server/src/notification_media.rs |    3 -
+ codex-rs/app-server/src/outgoing_message.rs   |    4 -
+ codex-rs/app-server/src/request_processors.rs |   65 -
+ .../request_processors/account_processor.rs   | 1647 +----------------
+ .../src/request_processors/mcp_processor.rs   |   88 +-
+ codex-rs/app-server/src/turn_cost_worker.rs   |  528 +-----
+ codex-rs/login/Cargo.toml                     |    3 -
+ codex-rs/login/src/auth/manager.rs            |  170 +-
+ codex-rs/login/src/auth/workload_identity.rs  |  492 +----
+ codex-rs/login/src/lib.rs                     |   18 -
+ 15 files changed, 85 insertions(+), 3141 deletions(-)
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index e95f8887e9939a52c0d05d02fa26e6775cd7ab03..5b56dd17755442ddd445aa467f56c2087bfa36a9 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -3863,8 +3863,6 @@ dependencies = [
+  "codex-terminal-detection",
+  "codex-utils-cargo-bin",
+  "codex-utils-process",
+- "codex-utils-template",
+- "codex-workload-identity",
+  "core_test_support",
+  "http 1.4.0",
+  "jsonwebtoken",
+@@ -3886,7 +3884,6 @@ dependencies = [
+  "tracing",
+  "tracing-subscriber",
+  "url",
+- "urlencoding",
+  "webbrowser",
+  "wiremock",
+ ]
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+index 7cefa3e4c828a06362f6942e99f18a6f2122d5cb..c49adb88266fc9b859faf183b80dcef27708b37f 100644
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -1171,75 +1171,16 @@ client_request_definitions! {
+         response: v2::WindowsSandboxReadinessResponse,
+     },
+ 
+-    LoginAccount => "account/login/start" {
+-        params: v2::LoginAccountParams,
+-        inspect_params: true,
+-        serialization: global("account-auth"),
+-        response: v2::LoginAccountResponse,
+-    },
+ 
+-    #[experimental("account/bedrock/discover")]
+-    BedrockDiscover => "account/bedrock/discover" {
+-        params: v2::BedrockDiscoverParams,
+-        serialization: global_shared_read("account-auth"),
+-        response: v2::BedrockDiscoverResponse,
+-    },
+ 
+-    #[experimental("account/bedrock/setup")]
+-    BedrockSetup => "account/bedrock/setup" {
+-        params: v2::BedrockSetupParams,
+-        serialization: global("account-auth"),
+-        response: v2::BedrockSetupResponse,
+-    },
+ 
+-    #[experimental("account/bedrock/checkGovCloudRequirements")]
+-    BedrockCheckGovCloudRequirements => "account/bedrock/checkGovCloudRequirements" {
+-        params: v2::BedrockCheckGovCloudRequirementsParams,
+-        serialization: global("account-auth"),
+-        response: v2::BedrockCheckGovCloudRequirementsResponse,
+-    },
+ 
+-    CancelLoginAccount => "account/login/cancel" {
+-        params: v2::CancelLoginAccountParams,
+-        serialization: global("account-auth"),
+-        response: v2::CancelLoginAccountResponse,
+-    },
+ 
+-    LogoutAccount => "account/logout" {
+-        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+-        serialization: global("account-auth"),
+-        response: v2::LogoutAccountResponse,
+-    },
+ 
+-    GetAccountRateLimits => "account/rateLimits/read" {
+-        params: #[ts(optional, as = "Option<GetAccountRateLimitsParamsTypeScript>", inline)] #[serde(default, skip_serializing_if = "Option::is_none")] v2::NullableGetAccountRateLimitsParams,
+-        serialization: None,
+-        response: v2::GetAccountRateLimitsResponse,
+-    },
+ 
+-    ConsumeAccountRateLimitResetCredit => "account/rateLimitResetCredit/consume" {
+-        params: v2::ConsumeAccountRateLimitResetCreditParams,
+-        serialization: global("account-auth"),
+-        response: v2::ConsumeAccountRateLimitResetCreditResponse,
+-    },
+ 
+-    GetAccountTokenUsage => "account/usage/read" {
+-        params: #[ts(optional, as = "Option<GetAccountTokenUsageParamsTypeScript>", inline)] #[serde(default, skip_serializing_if = "Option::is_none")] v2::NullableGetAccountTokenUsageParams,
+-        serialization: None,
+-        response: v2::GetAccountTokenUsageResponse,
+-    },
+ 
+-    GetWorkspaceMessages => "account/workspaceMessages/read" {
+-        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+-        serialization: None,
+-        response: v2::GetWorkspaceMessagesResponse,
+-    },
+ 
+-    SendAddCreditsNudgeEmail => "account/sendAddCreditsNudgeEmail" {
+-        params: v2::SendAddCreditsNudgeEmailParams,
+-        serialization: global("account-auth"),
+-        response: v2::SendAddCreditsNudgeEmailResponse,
+-    },
+ 
+ 
+     /// Execute a standalone command (argv vector) under the server's sandbox.
+@@ -1340,11 +1281,6 @@ client_request_definitions! {
+         response: v2::ConfigRequirementsReadResponse,
+     },
+ 
+-    GetAccount => "account/read" {
+-        params: v2::GetAccountParams,
+-        serialization: global("account-auth"),
+-        response: v2::GetAccountResponse,
+-    },
+ 
+     /// DEPRECATED APIs below
+     GetConversationSummary => "getConversationSummary" {
+@@ -1358,11 +1294,6 @@ client_request_definitions! {
+         response: v1::GitDiffToRemoteResponse,
+     },
+     /// DEPRECATED in favor of GetAccount
+-    GetAuthStatus => "getAuthStatus" {
+-        params: v1::GetAuthStatusParams,
+-        serialization: global("account-auth"),
+-        response: v1::GetAuthStatusResponse,
+-    },
+     // Legacy fuzzy search cancellation is intentionally concurrent: clients reuse a
+     // cancellation token so a newer request can cancel an older in-flight search.
+     FuzzyFileSearch => "fuzzyFileSearch" {
+@@ -1706,10 +1637,6 @@ server_request_definitions! {
+         response: v2::DynamicToolCallResponse,
+     },
+ 
+-    ChatgptAuthTokensRefresh => "account/chatgptAuthTokens/refresh" {
+-        params: v2::ChatgptAuthTokensRefreshParams,
+-        response: v2::ChatgptAuthTokensRefreshResponse,
+-    },
+ 
+     /// Generate a fresh upstream attestation result on demand.
+     AttestationGenerate => "attestation/generate" {
+@@ -1891,9 +1818,7 @@ server_notification_definitions! {
+     McpServerStatusUpdated => "mcpServer/startupStatus/updated" (v2::McpServerStatusUpdatedNotification),
+     #[experimental("mcpServer/event/stream/notification")]
+     McpServerEventStream => "mcpServer/event/stream/notification" (v2::McpServerEventStreamNotification),
+-    AccountUpdated => "account/updated" (v2::AccountUpdatedNotification),
+     GatewayOAuthChanged => "account/gatewayOAuth/changed" (v2::GatewayOAuthChangedNotification),
+-    AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
+     ExternalAgentConfigImportProgress => "externalAgentConfig/import/progress" (v2::ExternalAgentConfigImportProgressNotification),
+     ExternalAgentConfigImportCompleted => "externalAgentConfig/import/completed" (v2::ExternalAgentConfigImportCompletedNotification),
+     FsChanged => "fs/changed" (v2::FsChangedNotification),
+@@ -1942,7 +1867,6 @@ server_notification_definitions! {
+     WindowsWorldWritableWarning => "windows/worldWritableWarning" (v2::WindowsWorldWritableWarningNotification),
+     WindowsSandboxSetupCompleted => "windowsSandbox/setupCompleted" (v2::WindowsSandboxSetupCompletedNotification),
+ 
+-    AccountLoginCompleted => "account/login/completed" (v2::AccountLoginCompletedNotification),
+ 
+ }
+ 
+diff --git a/codex-rs/app-server/src/bespoke_event_handling.rs b/codex-rs/app-server/src/bespoke_event_handling.rs
+index 5e5430826edf33b22c5cdbdec3f5e5a6078f20aa..288dc1b8608d41025d3e862a6fdc2add5813b4f8 100644
+--- a/codex-rs/app-server/src/bespoke_event_handling.rs
++++ b/codex-rs/app-server/src/bespoke_event_handling.rs
+@@ -8,7 +8,6 @@ use crate::thread_state::TurnSummary;
+ use crate::thread_state::resolve_server_request_on_thread_listener;
+ use crate::thread_status::ThreadWatchActiveGuard;
+ use crate::thread_status::ThreadWatchManager;
+-use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
+ use codex_app_server_protocol::AdditionalPermissionProfile as V2AdditionalPermissionProfile;
+ use codex_app_server_protocol::AuthRecoveryNotification;
+ use codex_app_server_protocol::CodexErrorInfo as V2CodexErrorInfo;
+@@ -1590,7 +1589,10 @@ async fn handle_token_count_event(
+     token_count_event: TokenCountEvent,
+     outgoing: &ThreadScopedOutgoingMessageSender,
+ ) {
+-    let TokenCountEvent { info, rate_limits } = token_count_event;
++    let TokenCountEvent {
++        info,
++        rate_limits: _,
++    } = token_count_event;
+     if let Some(token_usage) = info.map(ThreadTokenUsage::from) {
+         let notification = ThreadTokenUsageUpdatedNotification {
+             thread_id: conversation_id.to_string(),
+@@ -1601,15 +1603,6 @@ async fn handle_token_count_event(
+             .send_server_notification(ServerNotification::ThreadTokenUsageUpdated(notification))
+             .await;
+     }
+-    if let Some(rate_limits) = rate_limits {
+-        outgoing
+-            .send_server_notification(ServerNotification::AccountRateLimitsUpdated(
+-                AccountRateLimitsUpdatedNotification {
+-                    rate_limits: rate_limits.into(),
+-                },
+-            ))
+-            .await;
+-    }
+ }
+ 
+ async fn handle_error(
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+index 384b045c6dd40347ce0d8e16c3820d7b39c9f281..d1ef8e0bdf30bd567d8cfd00f0d17340a404c9c4 100644
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -109,7 +109,6 @@ mod effective_plugin_change;
+ mod error_code;
+ mod extensions;
+ mod external_agent_migration;
+-mod external_auth;
+ mod filters;
+ mod fs_watch;
+ mod fuzzy_file_search;
+@@ -801,10 +800,12 @@ pub async fn run_main_with_transport_options(
+     drop(unix_socket_startup_lock);
+ 
+     if transport_accept_handles.is_empty() {
+-        return Err(std::io::Error::new(ErrorKind::InvalidInput, "A local transport must be configured"));
++        return Err(std::io::Error::new(
++            ErrorKind::InvalidInput,
++            "A local transport must be configured",
++        ));
+     }
+ 
+-
+     let outbound_handle = tokio::spawn(async move {
+         let mut outbound_connections = HashMap::<ConnectionId, OutboundConnectionState>::new();
+         loop {
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 0d1303a56ca9aea3f4f19ddaebad3bab40ae56c4..10bb1b41faef2828a51c36e9aae96e8968c5a66d 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -423,7 +423,6 @@ impl MessageProcessor {
+             thread_state_manager.clone(),
+             outgoing.clone(),
+             config_manager.clone(),
+-            account_processor.clone(),
+         );
+         let search_processor = SearchRequestProcessor::new(outgoing.clone());
+         let thread_goal_processor = ThreadGoalRequestProcessor::new(
+@@ -534,7 +533,6 @@ impl MessageProcessor {
+     }
+ 
+     pub(crate) fn clear_runtime_references(&self) {
+-        self.account_processor.clear_external_auth();
+         self.models_refresh_worker.shutdown();
+         self.skills_watcher.shutdown();
+     }
+@@ -730,8 +728,6 @@ impl MessageProcessor {
+         connection_id: ConnectionId,
+         request_attestation: bool,
+     ) {
+-        self.account_processor
+-            .notify_workspace_routing_to_connection(connection_id);
+         self.thread_processor
+             .connection_initialized(
+                 connection_id,
+@@ -1430,6 +1426,33 @@ impl MessageProcessor {
+             ClientRequest::SkillsConfigWrite { params, .. } => {
+                 self.catalog_processor.skills_config_write(params).await
+             }
++            ClientRequest::GatewayOAuthRead { .. } => {
++                Box::pin(self.account_processor.gateway_oauth_read())
++                    .await
++                    .map(|response| Some(response.into()))
++            }
++            ClientRequest::GatewayOAuthLogin { .. } => {
++                if session
++                    .opted_out_notification_methods()
++                    .contains("account/gatewayOAuth/changed")
++                {
++                    Err(invalid_request(
++                        "Gateway login requires account/gatewayOAuth/changed notifications",
++                    ))
++                } else {
++                    Box::pin(
++                        self.account_processor
++                            .gateway_oauth_login(connection_id, &session.rpc_gate),
++                    )
++                    .await
++                    .map(|response| Some(response.into()))
++                }
++            }
++            ClientRequest::GatewayOAuthCancel { .. } => {
++                Box::pin(self.account_processor.gateway_oauth_cancel(connection_id))
++                    .await
++                    .map(|response| Some(response.into()))
++            }
+             ClientRequest::ModelList { params, .. } => {
+                 self.catalog_processor.model_list(params).await
+             }
+@@ -1559,82 +1582,6 @@ impl MessageProcessor {
+                     .windows_sandbox_setup_start(&request_id, params)
+                     .await
+             }
+-            ClientRequest::LoginAccount { params, .. } => {
+-                self.account_processor
+-                    .login_account(request_id.clone(), params)
+-                    .await
+-            }
+-            ClientRequest::BedrockDiscover { params, .. } => {
+-                self.account_processor.bedrock_discover(params).await
+-            }
+-            ClientRequest::BedrockSetup { params, .. } => {
+-                self.account_processor.bedrock_setup(params).await
+-            }
+-            ClientRequest::BedrockCheckGovCloudRequirements { .. } => {
+-                self.account_processor
+-                    .bedrock_check_gov_cloud_requirements()
+-                    .await
+-            }
+-            ClientRequest::GatewayOAuthRead { .. } => {
+-                Box::pin(self.account_processor.gateway_oauth_read())
+-                    .await
+-                    .map(|response| Some(response.into()))
+-            }
+-            ClientRequest::GatewayOAuthLogin { .. } => {
+-                if session
+-                    .opted_out_notification_methods()
+-                    .contains("account/gatewayOAuth/changed")
+-                {
+-                    Err(invalid_request(
+-                        "Gateway login requires account/gatewayOAuth/changed notifications",
+-                    ))
+-                } else {
+-                    Box::pin(
+-                        self.account_processor
+-                            .gateway_oauth_login(connection_id, &session.rpc_gate),
+-                    )
+-                    .await
+-                    .map(|response| Some(response.into()))
+-                }
+-            }
+-            ClientRequest::GatewayOAuthCancel { .. } => {
+-                Box::pin(self.account_processor.gateway_oauth_cancel(connection_id))
+-                    .await
+-                    .map(|response| Some(response.into()))
+-            }
+-            ClientRequest::LogoutAccount { .. } => {
+-                self.account_processor
+-                    .logout_account(request_id.clone())
+-                    .await
+-            }
+-            ClientRequest::CancelLoginAccount { params, .. } => {
+-                self.account_processor.cancel_login_account(params).await
+-            }
+-            ClientRequest::GetAccount { params, .. } => {
+-                self.account_processor.get_account(params).await
+-            }
+-            ClientRequest::GetAuthStatus { params, .. } => {
+-                self.account_processor.get_auth_status(params).await
+-            }
+-            ClientRequest::GetAccountRateLimits { params, .. } => {
+-                self.account_processor.get_account_rate_limits(params).await
+-            }
+-            ClientRequest::ConsumeAccountRateLimitResetCredit { params, .. } => {
+-                self.account_processor
+-                    .consume_account_rate_limit_reset_credit(params)
+-                    .await
+-            }
+-            ClientRequest::GetAccountTokenUsage { params, .. } => {
+-                self.account_processor.get_account_token_usage(params).await
+-            }
+-            ClientRequest::GetWorkspaceMessages { .. } => {
+-                self.account_processor.get_workspace_messages().await
+-            }
+-            ClientRequest::SendAddCreditsNudgeEmail { params, .. } => {
+-                self.account_processor
+-                    .send_add_credits_nudge_email(params)
+-                    .await
+-            }
+             ClientRequest::GitDiffToRemote { params, .. } => {
+                 self.git_processor.git_diff_to_remote(params).await
+             }
+diff --git a/codex-rs/app-server/src/notification_media.rs b/codex-rs/app-server/src/notification_media.rs
+index f0066a94d7c5c819a9d9bbfa56e00a89170baf81..6c391f251ec3d6eedb07f38afabe1d4c0bb359d0 100644
+--- a/codex-rs/app-server/src/notification_media.rs
++++ b/codex-rs/app-server/src/notification_media.rs
+@@ -100,8 +100,6 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
+         | ServerNotification::McpServerOauthLoginCompleted(_)
+         | ServerNotification::McpServerStatusUpdated(_)
+         | ServerNotification::McpServerEventStream(_)
+-        | ServerNotification::AccountUpdated(_)
+-        | ServerNotification::AccountRateLimitsUpdated(_)
+         | ServerNotification::ExternalAgentConfigImportProgress(_)
+         | ServerNotification::ExternalAgentConfigImportCompleted(_)
+         | ServerNotification::FsChanged(_)
+@@ -134,7 +132,6 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
+         | ServerNotification::ThreadRealtimeClosed(_)
+         | ServerNotification::WindowsWorldWritableWarning(_)
+         | ServerNotification::WindowsSandboxSetupCompleted(_)
+-        | ServerNotification::AccountLoginCompleted(_)
+         | ServerNotification::GatewayOAuthChanged(_) => notification,
+     }
+ }
+diff --git a/codex-rs/app-server/src/outgoing_message.rs b/codex-rs/app-server/src/outgoing_message.rs
+index 9ed210ebd3472daf7c98fa64d4ac59d45c4c0442..913dde229de2c5ba92d4509df7d7caea40675e55 100644
+--- a/codex-rs/app-server/src/outgoing_message.rs
++++ b/codex-rs/app-server/src/outgoing_message.rs
+@@ -46,10 +46,6 @@ pub(crate) type ClientRequestResult = std::result::Result<Result, JSONRPCErrorEr
+ static IN_FLIGHT_REQUESTS: Gauge = Gauge::new("app.requests.in_flight");
+ static PENDING_SERVER_REQUESTS: Gauge = Gauge::new("app.server_requests.pending");
+ 
+-#[path = "account_notifications.rs"]
+-mod account_notifications;
+-pub(crate) use account_notifications::AccountNotification;
+-
+ #[path = "user_verification_auth.rs"]
+ mod user_verification_auth;
+ 
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index eb2fa6b0dedc0b6ba5f604d95b13d4272fe01c49..ba6caccbd7e6e38b58c57614736f9a15d3650910 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -19,20 +19,9 @@ use codex_analytics::AnalyticsEventsClient;
+ use codex_analytics::AnalyticsJsonRpcError;
+ use codex_analytics::InputError;
+ use codex_analytics::TurnSteerRequestError;
+-use codex_app_server_protocol::Account;
+-use codex_app_server_protocol::AccountLoginCompletedNotification;
+-use codex_app_server_protocol::AccountTokenUsageDailyBucket;
+-use codex_app_server_protocol::AccountTokenUsageSummary;
+-use codex_app_server_protocol::AccountUpdatedNotification;
+-use codex_app_server_protocol::AddCreditsNudgeCreditType;
+-use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
+ use codex_app_server_protocol::AdditionalContextEntry;
+ use codex_app_server_protocol::AdditionalContextKind;
+ use codex_app_server_protocol::AskForApproval;
+-use codex_app_server_protocol::AuthMode;
+-use codex_app_server_protocol::CancelLoginAccountParams;
+-use codex_app_server_protocol::CancelLoginAccountResponse;
+-use codex_app_server_protocol::CancelLoginAccountStatus;
+ use codex_app_server_protocol::ClientInfo;
+ use codex_app_server_protocol::ClientRequest;
+ use codex_app_server_protocol::ClientResponsePayload;
+@@ -44,9 +33,6 @@ use codex_app_server_protocol::CommandExecResizeParams;
+ use codex_app_server_protocol::CommandExecTerminateParams;
+ use codex_app_server_protocol::CommandExecWriteParams;
+ use codex_app_server_protocol::ConfigWarningNotification;
+-use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditOutcome;
+-use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditParams;
+-use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditResponse;
+ use codex_app_server_protocol::ConversationGitInfo;
+ use codex_app_server_protocol::ConversationSummary;
+ use codex_app_server_protocol::DeprecationNoticeNotification;
+@@ -65,18 +51,8 @@ use codex_app_server_protocol::ExperimentalFeature as ApiExperimentalFeature;
+ use codex_app_server_protocol::ExperimentalFeatureListParams;
+ use codex_app_server_protocol::ExperimentalFeatureListResponse;
+ use codex_app_server_protocol::ExperimentalFeatureStage as ApiExperimentalFeatureStage;
+-use codex_app_server_protocol::FeedbackUploadParams;
+-use codex_app_server_protocol::FeedbackUploadResponse;
+-use codex_app_server_protocol::GetAccountParams;
+-use codex_app_server_protocol::GetAccountRateLimitsResponse;
+-use codex_app_server_protocol::GetAccountResponse;
+-use codex_app_server_protocol::GetAccountTokenUsageParams;
+-use codex_app_server_protocol::GetAccountTokenUsageResponse;
+-use codex_app_server_protocol::GetAuthStatusParams;
+-use codex_app_server_protocol::GetAuthStatusResponse;
+ use codex_app_server_protocol::GetConversationSummaryParams;
+ use codex_app_server_protocol::GetConversationSummaryResponse;
+-use codex_app_server_protocol::GetWorkspaceMessagesResponse;
+ use codex_app_server_protocol::GitDiffToRemoteParams;
+ use codex_app_server_protocol::GitDiffToRemoteResponse;
+ use codex_app_server_protocol::GitInfo as ApiGitInfo;
+@@ -89,11 +65,6 @@ use codex_app_server_protocol::InitializeResponse;
+ use codex_app_server_protocol::JSONRPCErrorError;
+ use codex_app_server_protocol::ListMcpServerStatusParams;
+ use codex_app_server_protocol::ListMcpServerStatusResponse;
+-use codex_app_server_protocol::LoginAccountParams;
+-use codex_app_server_protocol::LoginAccountResponse;
+-use codex_app_server_protocol::LoginApiKeyParams;
+-use codex_app_server_protocol::LoginAppBrand;
+-use codex_app_server_protocol::LogoutAccountResponse;
+ use codex_app_server_protocol::McpResourceReadParams;
+ use codex_app_server_protocol::McpResourceReadResponse;
+ use codex_app_server_protocol::McpServerOauthClientRegistration;
+@@ -113,18 +84,12 @@ use codex_app_server_protocol::ModelListResponse;
+ use codex_app_server_protocol::PermissionProfileListParams;
+ use codex_app_server_protocol::PermissionProfileListResponse;
+ use codex_app_server_protocol::PermissionProfileSummary;
+-use codex_app_server_protocol::RateLimitResetCredit;
+-use codex_app_server_protocol::RateLimitResetCreditStatus;
+-use codex_app_server_protocol::RateLimitResetCreditsSummary;
+-use codex_app_server_protocol::RateLimitResetType;
+ use codex_app_server_protocol::RequestId;
+ use codex_app_server_protocol::ReviewDelivery as ApiReviewDelivery;
+ use codex_app_server_protocol::ReviewStartParams;
+ use codex_app_server_protocol::ReviewStartResponse;
+ use codex_app_server_protocol::ReviewTarget as ApiReviewTarget;
+ use codex_app_server_protocol::SandboxMode;
+-use codex_app_server_protocol::SendAddCreditsNudgeEmailParams;
+-use codex_app_server_protocol::SendAddCreditsNudgeEmailResponse;
+ use codex_app_server_protocol::ServerNotification;
+ use codex_app_server_protocol::ServerRequestResolvedNotification;
+ use codex_app_server_protocol::SkillsConfigWriteParams;
+@@ -261,19 +226,7 @@ use codex_app_server_protocol::WindowsSandboxSetupCompletedNotification;
+ use codex_app_server_protocol::WindowsSandboxSetupMode;
+ use codex_app_server_protocol::WindowsSandboxSetupStartParams;
+ use codex_app_server_protocol::WindowsSandboxSetupStartResponse;
+-use codex_app_server_protocol::WorkspaceMessage;
+-use codex_app_server_protocol::WorkspaceMessageType;
+ use codex_arg0::Arg0DispatchPaths;
+-use codex_backend_client::AddCreditsNudgeCreditType as BackendAddCreditsNudgeCreditType;
+-use codex_backend_client::Client as BackendClient;
+-use codex_backend_client::CodexWorkspaceMessage as BackendWorkspaceMessage;
+-use codex_backend_client::CodexWorkspaceMessageType as BackendWorkspaceMessageType;
+-use codex_backend_client::CodexWorkspaceMessagesResponse as BackendWorkspaceMessagesResponse;
+-use codex_backend_client::ConsumeRateLimitResetCreditCode as BackendConsumeRateLimitResetCreditCode;
+-use codex_backend_client::RateLimitResetCreditDetails as BackendRateLimitResetCreditDetails;
+-use codex_backend_client::RateLimitResetCreditsDetails as BackendRateLimitResetCreditsDetails;
+-use codex_backend_client::RequestError as BackendRequestError;
+-use codex_backend_client::TokenUsageProfile;
+ use codex_config::CloudConfigBundleLoadError;
+ use codex_config::CloudConfigBundleLoadErrorCode;
+ use codex_config::ConfigLayerStack;
+@@ -319,24 +272,9 @@ use codex_exec_server::LOCAL_FS;
+ use codex_features::FEATURES;
+ use codex_features::Feature;
+ use codex_features::Stage;
+-use codex_feedback::CodexFeedback;
+-use codex_feedback::FeedbackAttachmentPath;
+-use codex_feedback::FeedbackUploadOptions;
+ use codex_git_utils::git_diff_to_remote;
+ use codex_git_utils::resolve_root_git_project_for_trust;
+ use codex_login::AuthManager;
+-use codex_login::CODEX_OPEN_APP_URL;
+-use codex_login::CodexAuth;
+-use codex_login::LoginSuccessPage;
+-use codex_login::LoginSuccessPageBrand;
+-use codex_login::ServerOptions as LoginServerOptions;
+-use codex_login::ShutdownHandle;
+-use codex_login::complete_device_code_login;
+-use codex_login::login_with_api_key;
+-use codex_login::login_with_bedrock_api_key;
+-use codex_login::oauth_client_id;
+-use codex_login::request_device_code;
+-use codex_login::run_login_server;
+ use codex_mcp::McpRuntimeContext;
+ use codex_mcp::McpServerStatusSnapshot;
+ use codex_mcp::McpSnapshotDetail;
+@@ -345,11 +283,9 @@ use codex_mcp::discover_supported_scopes;
+ use codex_mcp::read_mcp_resource as read_mcp_resource_without_thread;
+ use codex_mcp::resolve_oauth_scopes;
+ use codex_memories_write::clear_memory_roots_contents;
+-use codex_model_provider::create_model_provider;
+ use codex_models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets;
+ use codex_protocol::ThreadId;
+ use codex_protocol::config_types::CollaborationMode;
+-use codex_protocol::config_types::ForcedLoginMethod;
+ use codex_protocol::config_types::Personality;
+ use codex_protocol::config_types::ReasoningSummary;
+ use codex_protocol::config_types::TrustLevel;
+@@ -427,7 +363,6 @@ use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
+ use std::collections::BTreeMap;
+ use std::collections::HashMap;
+ use std::collections::HashSet;
+-use std::io::Error as IoError;
+ use std::path::Path;
+ use std::path::PathBuf;
+ use std::result::Result;
+diff --git a/codex-rs/app-server/src/request_processors/account_processor.rs b/codex-rs/app-server/src/request_processors/account_processor.rs
+index b8d56053b11e6d4983a39c841bfd3fbbe1f830a5..add4afddeb875ebd56b74fac5c5e54893a86271e 100644
+--- a/codex-rs/app-server/src/request_processors/account_processor.rs
++++ b/codex-rs/app-server/src/request_processors/account_processor.rs
+@@ -1,1671 +1,40 @@
+-use super::bedrock_auth::BedrockProviderConfig;
+-use super::bedrock_auth::clear_user_model_provider_if_bedrock;
+-use super::bedrock_auth::configure_bedrock_provider;
+-use super::bedrock_auth::ensure_user_model_provider_can_be_bedrock;
+ use super::*;
+-use crate::auth_mode::auth_mode_to_api;
+-use crate::external_auth::ExternalAuthBridge;
+-use crate::outgoing_message::AccountNotification;
+-use chrono::DateTime;
+-use codex_app_server_protocol::DesktopOnboardingEntrypoint;
+-use codex_app_server_protocol::GetAccountRateLimitsParams;
+-use codex_login::LoginOnboardingEntrypoint;
+-use codex_login::login_with_bedrock_access_keys;
+-use codex_mcp::ema_auth_scope;
+-use codex_model_provider::is_supported_amazon_bedrock_region;
+-use codex_otel::auth_storage::AuthStorageOriginator;
+-use codex_rmcp_client::EnterpriseOAuthCredentialGuard;
+-
+-mod bedrock_gov_cloud;
+-mod bedrock_setup;
+-mod enterprise_login;
+ mod gateway_oauth;
+-mod rate_limit_resets;
+-mod workspace_routing;
+-
+-pub(super) use enterprise_login::EnterpriseLoginCompletion;
+-pub(super) use enterprise_login::EnterpriseLoginTarget;
+-
+-// Duration before a browser ChatGPT login attempt is abandoned.
+-const LOGIN_CHATGPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+-const ACCOUNT_TOKEN_USAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 10);
+-const THREAD_USAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 60);
+-const ACCOUNT_WORKSPACE_MESSAGES_FETCH_TIMEOUT: Duration =
+-    Duration::from_millis(/*millis*/ 1000);
+-// Packaged clients use this together with the OAuth client ID override for staging login.
+-const LOGIN_ISSUER_OVERRIDE_ENV_VAR: &str = "CODEX_APP_SERVER_LOGIN_ISSUER";
+-// The development success-page redirect remains debug-only.
+-#[cfg(debug_assertions)]
+-const LOGIN_OPEN_APP_URL_OVERRIDE_ENV_VAR: &str = "CODEX_APP_SERVER_DEV_OPEN_APP_URL";
+-
+-enum ActiveLogin {
+-    Browser {
+-        shutdown_handle: ShutdownHandle,
+-        login_id: Uuid,
+-    },
+-    DeviceCode {
+-        cancel: CancellationToken,
+-        login_id: Uuid,
+-    },
+-}
+-
+-impl ActiveLogin {
+-    fn login_id(&self) -> Uuid {
+-        match self {
+-            ActiveLogin::Browser { login_id, .. } | ActiveLogin::DeviceCode { login_id, .. } => {
+-                *login_id
+-            }
+-        }
+-    }
+-
+-    fn cancel(&self) {
+-        match self {
+-            ActiveLogin::Browser {
+-                shutdown_handle, ..
+-            } => shutdown_handle.shutdown(),
+-            ActiveLogin::DeviceCode { cancel, .. } => cancel.cancel(),
+-        }
+-    }
+-}
+-
+-#[derive(Clone, Copy, Debug)]
+-enum CancelLoginError {
+-    NotFound,
+-}
+-
+-enum RefreshTokenRequestOutcome {
+-    NotAttemptedOrSucceeded,
+-    FailedTransiently,
+-    FailedPermanently,
+-}
+-
+-enum BedrockLoginCredentials {
+-    ApiKey(String),
+-    AccessKeys {
+-        access_key_id: String,
+-        secret_access_key: String,
+-        session_token: Option<String>,
+-    },
+-}
+-
+-impl Drop for ActiveLogin {
+-    fn drop(&mut self) {
+-        self.cancel();
+-    }
+-}
+ 
+ #[derive(Clone)]
+ pub(crate) struct AccountRequestProcessor {
+     auth_manager: Arc<AuthManager>,
+-    thread_manager: Arc<ThreadManager>,
+     outgoing: Arc<OutgoingMessageSender>,
+-    config: Arc<Config>,
+     config_manager: ConfigManager,
+-    active_login: Arc<Mutex<Option<ActiveLogin>>>,
+-    workspace_routing: Arc<Mutex<Option<workspace_routing::CachedWorkspaceRouting>>>,
+-    workspace_routing_fetches: Arc<Mutex<workspace_routing::WorkspaceRoutingFetches>>,
+-    workspace_routing_shutdown: CancellationToken,
+     gateway_login: Arc<std::sync::Mutex<Option<gateway_oauth::ActiveGatewayLogin>>>,
+     gateway_client: Arc<std::sync::Mutex<Option<Arc<codex_login::GatewayAuthManager>>>>,
+     _gateway_notifications: Arc<tokio_util::task::AbortOnDropHandle<()>>,
+-    pub(super) enterprise_login: Arc<enterprise_login::EnterpriseLoginState>,
+ }
+ 
+ impl AccountRequestProcessor {
+     pub(crate) fn new(
+         auth_manager: Arc<AuthManager>,
+-        thread_manager: Arc<ThreadManager>,
++        _thread_manager: Arc<ThreadManager>,
+         outgoing: Arc<OutgoingMessageSender>,
+-        config: Arc<Config>,
++        _config: Arc<Config>,
+         config_manager: ConfigManager,
+     ) -> Arc<Self> {
+-        let gateway_notifications = crate::gateway_oauth_notifications::spawn(
++        let notifications = crate::gateway_oauth_notifications::spawn(
+             Arc::clone(&auth_manager),
+             config_manager.clone(),
+             Arc::clone(&outgoing),
+         );
+-        let enterprise_login = Arc::new(enterprise_login::EnterpriseLoginState::new(
+-            Arc::clone(&auth_manager),
+-            Arc::clone(&thread_manager),
+-            config_manager.clone(),
+-        ));
+-        let processor = Arc::new(Self {
+-            _gateway_notifications: Arc::new(gateway_notifications),
++        Arc::new(Self {
+             auth_manager,
+-            thread_manager,
+             outgoing,
+-            config,
+             config_manager,
+-            active_login: Arc::new(Mutex::new(None)),
+-            gateway_login: Arc::new(std::sync::Mutex::new(/*t*/ None)),
+-            gateway_client: Arc::new(std::sync::Mutex::new(/*t*/ None)),
+-            workspace_routing: Arc::new(Mutex::new(None)),
+-            workspace_routing_fetches: Arc::new(Mutex::new(HashMap::new())),
+-            workspace_routing_shutdown: CancellationToken::new(),
+-            enterprise_login,
+-        });
+-        let resolver: Arc<dyn codex_login::WorkspaceRoutingResolver> = processor.clone();
+-        processor
+-            .auth_manager
+-            .set_workspace_routing_resolver(Arc::downgrade(&resolver));
+-        let startup = processor.clone();
+-        tokio::spawn(async move {
+-            let _ = startup
+-                .read_account_for_background_workspace_routing()
+-                .await;
+-        });
+-        processor
+-    }
+-
+-    pub(crate) async fn login_account(
+-        &self,
+-        request_id: ConnectionRequestId,
+-        params: LoginAccountParams,
+-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+-        self.login_v2(request_id, params).await.map(|()| None)
+-    }
+-
+-    pub(crate) async fn logout_account(
+-        &self,
+-        request_id: ConnectionRequestId,
+-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+-        self.logout_v2(request_id).await.map(|()| None)
+-    }
+-
+-    pub(crate) async fn cancel_login_account(
+-        &self,
+-        params: CancelLoginAccountParams,
+-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+-        self.cancel_login_response(params)
+-            .await
+-            .map(|response| Some(response.into()))
+-    }
+-
+-    pub(crate) async fn get_auth_status(
+-        &self,
+-        params: GetAuthStatusParams,
+-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+-        self.get_auth_status_response(params)
+-            .await
+-            .map(|response| Some(response.into()))
+-    }
+-
+-    pub(crate) async fn get_account_rate_limits(
+-        &self,
+-        params: Option<GetAccountRateLimitsParams>,
+-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+-        self.get_account_rate_limits_response(params.unwrap_or_default())
+-            .await
+-            .map(|response| Some(response.into()))
+-    }
+-
+-    pub(crate) async fn get_account_token_usage(
+-        &self,
+-        params: Option<GetAccountTokenUsageParams>,
+-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+-        self.get_account_token_usage_response(params)
+-            .await
+-            .map(|response| Some(response.into()))
+-    }
+-
+-    pub(crate) async fn get_workspace_messages(
+-        &self,
+-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+-        self.get_workspace_messages_response()
+-            .await
+-            .map(|response| Some(response.into()))
+-    }
+-
+-    pub(crate) async fn send_add_credits_nudge_email(
+-        &self,
+-        params: SendAddCreditsNudgeEmailParams,
+-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+-        self.send_add_credits_nudge_email_response(params)
+-            .await
+-            .map(|response| Some(response.into()))
++            gateway_login: Arc::new(std::sync::Mutex::new(None)),
++            gateway_client: Arc::new(std::sync::Mutex::new(None)),
++            _gateway_notifications: Arc::new(notifications),
++        })
+     }
+ 
+     pub(crate) async fn cancel_active_login(&self) {
+         self.cancel_gateway_login();
+-        self.enterprise_login.cancel(/*login_id*/ None).await;
+-        let mut guard = self.active_login.lock().await;
+-        if let Some(active_login) = guard.take() {
+-            drop(active_login);
+-        }
+-    }
+-
+-    pub(crate) fn clear_external_auth(&self) {
+-        self.workspace_routing_shutdown.cancel();
+-        self.auth_manager.clear_external_auth();
+-    }
+-
+-    fn current_account_updated_notification(&self) -> AccountUpdatedNotification {
+-        let auth = self.auth_manager.auth_cached();
+-        AccountUpdatedNotification {
+-            auth_mode: auth
+-                .as_ref()
+-                .map(CodexAuth::api_auth_mode)
+-                .map(auth_mode_to_api),
+-            plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
+-        }
+-    }
+-
+-    async fn load_latest_config(&self) -> Config {
+-        match self
+-            .config_manager
+-            .load_latest_config(/*fallback_cwd*/ None)
+-            .await
+-        {
+-            Ok(config) => config,
+-            Err(err) => {
+-                tracing::warn!("failed to reload config, using startup config: {err}");
+-                self.config.as_ref().clone()
+-            }
+-        }
+-    }
+-
+-    async fn maybe_refresh_plugin_caches_for_current_config(
+-        config_manager: &ConfigManager,
+-        thread_manager: &Arc<ThreadManager>,
+-        auth: Option<CodexAuth>,
+-    ) {
+-        thread_manager
+-            .plugins_manager()
+-            .clear_recommended_plugins_cache();
+-
+-        match config_manager
+-            .load_latest_config(/*fallback_cwd*/ None)
+-            .await
+-        {
+-            Ok(config) => {
+-                Self::spawn_effective_plugins_changed_task(
+-                    Arc::clone(thread_manager),
+-                    config_manager.clone(),
+-                );
+-                let plugins_config = config.plugins_config_input();
+-                let refresh_thread_manager = Arc::clone(thread_manager);
+-                let refresh_config_manager = config_manager.clone();
+-                let on_effective_plugins_changed: Arc<
+-                    dyn Fn(codex_core_plugins::EffectivePluginsChange) + Send + Sync,
+-                > = Arc::new(move |_change| {
+-                    Self::spawn_effective_plugins_changed_task(
+-                        Arc::clone(&refresh_thread_manager),
+-                        refresh_config_manager.clone(),
+-                    );
+-                });
+-                thread_manager
+-                    .plugins_manager()
+-                    .maybe_start_curated_repo_sync_for_config(
+-                        &plugins_config,
+-                        Some(Arc::clone(&on_effective_plugins_changed)),
+-                    );
+-                thread_manager
+-                    .plugins_manager()
+-                    .maybe_start_remote_plugin_caches_refresh(
+-                        &plugins_config,
+-                        auth,
+-                        Some(on_effective_plugins_changed),
+-                    );
+-            }
+-            Err(err) => {
+-                warn!(
+-                    "failed to reload config after account changed, skipping remote installed plugins cache refresh: {err}"
+-                );
+-            }
+-        }
+-    }
+-
+-    fn spawn_effective_plugins_changed_task(
+-        thread_manager: Arc<ThreadManager>,
+-        config_manager: ConfigManager,
+-    ) {
+-        tokio::spawn(async move {
+-            thread_manager.plugins_manager().clear_cache();
+-            thread_manager.skills_service().clear_cache();
+-            crate::mcp_refresh::reload_mcp_config_best_effort(&thread_manager, &config_manager)
+-                .await;
+-            thread_manager.invalidate_mcp_runtimes().await;
+-        });
+-    }
+-
+-    async fn login_v2(
+-        &self,
+-        request_id: ConnectionRequestId,
+-        params: LoginAccountParams,
+-    ) -> Result<(), JSONRPCErrorError> {
+-        if self.auth_manager.is_workload_identity_selected() {
+-            return Err(self.configured_auth_owned_by_host_error());
+-        }
+-        self.enterprise_login.cancel(/*login_id*/ None).await;
+-        match params {
+-            LoginAccountParams::ApiKey { api_key } => {
+-                self.login_api_key_v2(request_id, LoginApiKeyParams { api_key })
+-                    .await;
+-            }
+-            LoginAccountParams::Chatgpt {
+-                app_brand,
+-                codex_streamlined_login,
+-                use_hosted_login_success_page,
+-            } => {
+-                let login_success_page = if use_hosted_login_success_page {
+-                    let app_brand = match app_brand.unwrap_or_default() {
+-                        LoginAppBrand::Codex => LoginSuccessPageBrand::Codex,
+-                        LoginAppBrand::Chatgpt => LoginSuccessPageBrand::Chatgpt,
+-                    };
+-                    LoginSuccessPage::Hosted {
+-                        url: CODEX_OPEN_APP_URL.parse().map_err(|err| {
+-                            internal_error(format!("invalid Codex open app URL: {err}"))
+-                        })?,
+-                        app_brand,
+-                    }
+-                } else {
+-                    LoginSuccessPage::default()
+-                };
+-                self.login_chatgpt_v2(request_id, codex_streamlined_login, login_success_page)
+-                    .await;
+-            }
+-            LoginAccountParams::ChatgptDeviceCode => {
+-                self.login_chatgpt_device_code_v2(request_id).await;
+-            }
+-            LoginAccountParams::ChatgptAuthTokens {
+-                access_token,
+-                chatgpt_account_id,
+-                chatgpt_plan_type,
+-            } => {
+-                self.login_chatgpt_auth_tokens(
+-                    request_id,
+-                    access_token,
+-                    chatgpt_account_id,
+-                    chatgpt_plan_type,
+-                )
+-                .await;
+-            }
+-            LoginAccountParams::AmazonBedrock { api_key, region } => {
+-                self.login_amazon_bedrock_v2(
+-                    request_id,
+-                    BedrockLoginCredentials::ApiKey(api_key),
+-                    region,
+-                )
+-                .await;
+-            }
+-            LoginAccountParams::AmazonBedrockAccessKeys {
+-                access_key_id,
+-                secret_access_key,
+-                session_token,
+-                region,
+-            } => {
+-                self.login_amazon_bedrock_v2(
+-                    request_id,
+-                    BedrockLoginCredentials::AccessKeys {
+-                        access_key_id,
+-                        secret_access_key,
+-                        session_token,
+-                    },
+-                    region,
+-                )
+-                .await;
+-            }
+-        }
+-        Ok(())
+-    }
+-
+-    fn external_auth_active_error(&self) -> JSONRPCErrorError {
+-        invalid_request(
+-            "External auth is active. Use account/login/start (chatgptAuthTokens) to update it or account/logout to clear it.",
+-        )
+-    }
+-
+-    fn configured_auth_owned_by_host_error(&self) -> JSONRPCErrorError {
+-        invalid_request(
+-            "Configured external authentication is owned by the app-server host and cannot be changed through account RPCs.",
+-        )
+-    }
+-
+-    fn ensure_bedrock_login_allowed(&self) -> Result<(), JSONRPCErrorError> {
+-        if self.auth_manager.is_workload_identity_selected() {
+-            return Err(self.configured_auth_owned_by_host_error());
+-        }
+-        if self.auth_manager.is_external_chatgpt_auth_active() {
+-            return Err(self.external_auth_active_error());
+-        }
+-        if !self
+-            .auth_manager
+-            .is_login_method_allowed(ForcedLoginMethod::Api)
+-        {
+-            return Err(invalid_request(
+-                "Amazon Bedrock login is disabled. Use ChatGPT login instead.",
+-            ));
+-        }
+-        Ok(())
+-    }
+-
+-    async fn login_api_key_common(
+-        &self,
+-        params: &LoginApiKeyParams,
+-    ) -> std::result::Result<(), JSONRPCErrorError> {
+-        if self.auth_manager.is_external_chatgpt_auth_active() {
+-            return Err(self.external_auth_active_error());
+-        }
+-
+-        if !self
+-            .auth_manager
+-            .is_login_method_allowed(ForcedLoginMethod::Api)
+-        {
+-            return Err(invalid_request(
+-                "API key login is disabled. Use ChatGPT login instead.",
+-            ));
+-        }
+-
+-        // Cancel any active login attempt.
+-        {
+-            let mut guard = self.active_login.lock().await;
+-            if let Some(active) = guard.take() {
+-                drop(active);
+-            }
+-        }
+-
+-        match login_with_api_key(
+-            &self.config.codex_home,
+-            &params.api_key,
+-            self.config.cli_auth_credentials_store_mode,
+-            self.config.auth_keyring_backend_kind(),
+-        ) {
+-            Ok(()) => {
+-                self.auth_manager.reload().await;
+-                self.config_manager.clear_cloud_config_bundle_loader();
+-                Ok(())
+-            }
+-            Err(err) => Err(internal_error(format!("failed to save api key: {err}"))),
+-        }
+-    }
+-
+-    async fn login_api_key_v2(&self, request_id: ConnectionRequestId, params: LoginApiKeyParams) {
+-        let result = self
+-            .login_api_key_common(&params)
+-            .await
+-            .map(|()| LoginAccountResponse::ApiKey {});
+-        let logged_in = result.is_ok();
+-        self.outgoing.send_result(request_id, result).await;
+-
+-        if logged_in {
+-            self.send_login_success_notifications(/*login_id*/ None)
+-                .await;
+-        }
+-    }
+-
+-    async fn login_amazon_bedrock_v2(
+-        &self,
+-        request_id: ConnectionRequestId,
+-        credentials: BedrockLoginCredentials,
+-        region: String,
+-    ) {
+-        let result = async {
+-            self.ensure_bedrock_login_allowed()?;
+-
+-            match &credentials {
+-                BedrockLoginCredentials::ApiKey(api_key) => {
+-                    if api_key.trim().is_empty() {
+-                        return Err(invalid_request("Amazon Bedrock API key must not be empty."));
+-                    }
+-                }
+-                BedrockLoginCredentials::AccessKeys {
+-                    access_key_id,
+-                    secret_access_key,
+-                    ..
+-                } => {
+-                    if access_key_id.trim().is_empty() || secret_access_key.trim().is_empty() {
+-                        return Err(invalid_request(
+-                            "AWS access key ID and secret access key must not be empty.",
+-                        ));
+-                    }
+-                }
+-            }
+-            let region = region.trim();
+-            if !is_supported_amazon_bedrock_region(region) {
+-                return Err(invalid_request(format!(
+-                    "Amazon Bedrock does not support region `{region}`"
+-                )));
+-            }
+-
+-            self.cancel_active_login().await;
+-            ensure_user_model_provider_can_be_bedrock(&self.config_manager).await?;
+-            configure_bedrock_provider(
+-                &self.config_manager,
+-                BedrockProviderConfig {
+-                    region: matches!(&credentials, BedrockLoginCredentials::AccessKeys { .. })
+-                        .then_some(region),
+-                    profile: None,
+-                },
+-            )
+-            .await?;
+-
+-            match credentials {
+-                BedrockLoginCredentials::ApiKey(api_key) => login_with_bedrock_api_key(
+-                    &self.config.codex_home,
+-                    api_key.trim(),
+-                    region,
+-                    self.config.cli_auth_credentials_store_mode,
+-                    self.config.auth_keyring_backend_kind(),
+-                ),
+-                BedrockLoginCredentials::AccessKeys {
+-                    access_key_id,
+-                    secret_access_key,
+-                    session_token,
+-                } => {
+-                    let session_token = session_token
+-                        .as_deref()
+-                        .map(str::trim)
+-                        .filter(|token| !token.is_empty());
+-                    login_with_bedrock_access_keys(
+-                        &self.config.codex_home,
+-                        access_key_id.trim(),
+-                        secret_access_key.trim(),
+-                        session_token,
+-                        self.config.cli_auth_credentials_store_mode,
+-                        self.config.auth_keyring_backend_kind(),
+-                    )
+-                }
+-            }
+-            .map_err(|err| internal_error(format!("failed to save Amazon Bedrock auth: {err}")))?;
+-            self.auth_manager.reload().await;
+-            self.config_manager.clear_cloud_config_bundle_loader();
+-            Ok(LoginAccountResponse::AmazonBedrock {})
+-        }
+-        .await;
+-        let logged_in = result.is_ok();
+-        self.outgoing.send_result(request_id, result).await;
+-
+-        if logged_in {
+-            self.send_login_success_notifications(/*login_id*/ None)
+-                .await;
+-        }
+-    }
+-
+-    // Build options for a ChatGPT login attempt; performs validation.
+-    async fn login_chatgpt_common(
+-        &self,
+-        codex_streamlined_login: bool,
+-        login_success_page: LoginSuccessPage,
+-    ) -> std::result::Result<LoginServerOptions, JSONRPCErrorError> {
+-        let config = self.config.as_ref();
+-
+-        if self.auth_manager.is_external_chatgpt_auth_active() {
+-            return Err(self.external_auth_active_error());
+-        }
+-
+-        if !self
+-            .auth_manager
+-            .is_login_method_allowed(ForcedLoginMethod::Chatgpt)
+-        {
+-            return Err(invalid_request(
+-                "ChatGPT login is disabled. Use API key login instead.",
+-            ));
+-        }
+-
+-        let mut opts = LoginServerOptions {
+-            open_browser: false,
+-            codex_streamlined_login,
+-            login_success_page,
+-            ..LoginServerOptions::new(
+-                config.codex_home.to_path_buf(),
+-                oauth_client_id(),
+-                self.auth_manager.effective_chatgpt_workspaces(),
+-                config.cli_auth_credentials_store_mode,
+-                config.auth_keyring_backend_kind(),
+-                config.auth_route_config(),
+-            )
+-        };
+-        if let Ok(issuer) = std::env::var(LOGIN_ISSUER_OVERRIDE_ENV_VAR)
+-            && !issuer.trim().is_empty()
+-        {
+-            opts.issuer = issuer;
+-        }
+-        #[cfg(debug_assertions)]
+-        if let LoginSuccessPage::Hosted { url, .. } = &mut opts.login_success_page
+-            && let Ok(open_app_url) = std::env::var(LOGIN_OPEN_APP_URL_OVERRIDE_ENV_VAR)
+-            && !open_app_url.trim().is_empty()
+-        {
+-            *url = open_app_url
+-                .parse()
+-                .map_err(|err| internal_error(format!("invalid Codex open app URL: {err}")))?;
+-        }
+-
+-        Ok(opts)
+-    }
+-
+-    fn login_chatgpt_device_code_start_error(err: IoError) -> JSONRPCErrorError {
+-        let is_not_found = err.kind() == std::io::ErrorKind::NotFound;
+-        if is_not_found {
+-            invalid_request(err.to_string())
+-        } else {
+-            internal_error(format!("failed to request device code: {err}"))
+-        }
+-    }
+-
+-    async fn login_chatgpt_v2(
+-        &self,
+-        request_id: ConnectionRequestId,
+-        codex_streamlined_login: bool,
+-        login_success_page: LoginSuccessPage,
+-    ) {
+-        let result = self
+-            .login_chatgpt_response(codex_streamlined_login, login_success_page)
+-            .await;
+-        self.outgoing.send_result(request_id, result).await;
+-    }
+-
+-    async fn login_chatgpt_response(
+-        &self,
+-        codex_streamlined_login: bool,
+-        login_success_page: LoginSuccessPage,
+-    ) -> Result<LoginAccountResponse, JSONRPCErrorError> {
+-        let opts = self
+-            .login_chatgpt_common(codex_streamlined_login, login_success_page)
+-            .await?;
+-        let server = run_login_server(opts)
+-            .map_err(|err| internal_error(format!("failed to start login server: {err}")))?;
+-        let login_id = Uuid::new_v4();
+-        let shutdown_handle = server.cancel_handle();
+-
+-        // Replace active login if present.
+-        {
+-            let mut guard = self.active_login.lock().await;
+-            if let Some(existing) = guard.take() {
+-                drop(existing);
+-            }
+-            *guard = Some(ActiveLogin::Browser {
+-                shutdown_handle: shutdown_handle.clone(),
+-                login_id,
+-            });
+-        }
+-
+-        let processor = self.clone();
+-        let active_login = self.active_login.clone();
+-        let auth_url = server.auth_url.clone();
+-        let task = async move {
+-            let (success, error_msg, onboarding_entrypoint) = match tokio::time::timeout(
+-                LOGIN_CHATGPT_TIMEOUT,
+-                server.block_until_done_with_callback_result(),
+-            )
+-            .await
+-            {
+-                Ok(Ok(result)) => (
+-                    true,
+-                    None,
+-                    result
+-                        .onboarding_entrypoint
+-                        .map(|LoginOnboardingEntrypoint::LifeSciences| {
+-                            DesktopOnboardingEntrypoint::LifeSciences
+-                        }),
+-                ),
+-                Ok(Err(err)) => (false, Some(format!("Login server error: {err}")), None),
+-                Err(_elapsed) => {
+-                    shutdown_handle.shutdown();
+-                    (false, Some("Login timed out".to_string()), None)
+-                }
+-            };
+-
+-            processor
+-                .send_chatgpt_login_completion_notifications(AccountLoginCompletedNotification {
+-                    login_id: Some(login_id.to_string()),
+-                    success,
+-                    error: error_msg,
+-                    onboarding_entrypoint,
+-                })
+-                .await;
+-
+-            // Clear the active login if it matches this attempt. It may have been replaced or cancelled.
+-            let mut guard = active_login.lock().await;
+-            if guard.as_ref().map(ActiveLogin::login_id) == Some(login_id) {
+-                *guard = None;
+-            }
+-        };
+-        tokio::spawn(AuthStorageOriginator::current().scope(task));
+-
+-        Ok(LoginAccountResponse::Chatgpt {
+-            login_id: login_id.to_string(),
+-            auth_url,
+-        })
+-    }
+-
+-    async fn login_chatgpt_device_code_v2(&self, request_id: ConnectionRequestId) {
+-        let result = self.login_chatgpt_device_code_response().await;
+-        self.outgoing.send_result(request_id, result).await;
+-    }
+-
+-    async fn login_chatgpt_device_code_response(
+-        &self,
+-    ) -> Result<LoginAccountResponse, JSONRPCErrorError> {
+-        let opts = self
+-            .login_chatgpt_common(
+-                /*codex_streamlined_login*/ false,
+-                LoginSuccessPage::default(),
+-            )
+-            .await?;
+-        let device_code = request_device_code(&opts)
+-            .await
+-            .map_err(Self::login_chatgpt_device_code_start_error)?;
+-        let login_id = Uuid::new_v4();
+-        let cancel = CancellationToken::new();
+-
+-        {
+-            let mut guard = self.active_login.lock().await;
+-            if let Some(existing) = guard.take() {
+-                drop(existing);
+-            }
+-            *guard = Some(ActiveLogin::DeviceCode {
+-                cancel: cancel.clone(),
+-                login_id,
+-            });
+-        }
+-
+-        let verification_url = device_code.verification_url.clone();
+-        let user_code = device_code.user_code.clone();
+-
+-        let processor = self.clone();
+-        let active_login = self.active_login.clone();
+-        let task = async move {
+-            let (success, error_msg) = tokio::select! {
+-                _ = cancel.cancelled() => {
+-                    (false, Some("Login was not completed".to_string()))
+-                }
+-                r = complete_device_code_login(opts, device_code) => {
+-                    match r {
+-                        Ok(()) => (true, None),
+-                        Err(err) => (false, Some(err.to_string())),
+-                    }
+-                }
+-            };
+-
+-            processor
+-                .send_chatgpt_login_completion_notifications(AccountLoginCompletedNotification {
+-                    login_id: Some(login_id.to_string()),
+-                    success,
+-                    error: error_msg,
+-                    onboarding_entrypoint: None,
+-                })
+-                .await;
+-
+-            let mut guard = active_login.lock().await;
+-            if guard.as_ref().map(ActiveLogin::login_id) == Some(login_id) {
+-                *guard = None;
+-            }
+-        };
+-        tokio::spawn(AuthStorageOriginator::current().scope(task));
+-
+-        Ok(LoginAccountResponse::ChatgptDeviceCode {
+-            login_id: login_id.to_string(),
+-            verification_url,
+-            user_code,
+-        })
+-    }
+-
+-    async fn cancel_login_chatgpt_common(
+-        &self,
+-        login_id: Uuid,
+-    ) -> std::result::Result<(), CancelLoginError> {
+-        let mut guard = self.active_login.lock().await;
+-        if guard.as_ref().map(ActiveLogin::login_id) == Some(login_id) {
+-            if let Some(active) = guard.take() {
+-                drop(active);
+-            }
+-            Ok(())
+-        } else {
+-            Err(CancelLoginError::NotFound)
+-        }
+-    }
+-
+-    async fn cancel_login_response(
+-        &self,
+-        params: CancelLoginAccountParams,
+-    ) -> Result<CancelLoginAccountResponse, JSONRPCErrorError> {
+-        let login_id = params.login_id;
+-        let uuid = Uuid::parse_str(&login_id)
+-            .map_err(|_| invalid_request(format!("invalid login id: {login_id}")))?;
+-        if self.enterprise_login.cancel(Some(&login_id)).await {
+-            return Ok(CancelLoginAccountResponse {
+-                status: CancelLoginAccountStatus::Canceled,
+-            });
+-        }
+-        let status = match self.cancel_login_chatgpt_common(uuid).await {
+-            Ok(()) => CancelLoginAccountStatus::Canceled,
+-            Err(CancelLoginError::NotFound) => CancelLoginAccountStatus::NotFound,
+-        };
+-        Ok(CancelLoginAccountResponse { status })
+-    }
+-
+-    async fn login_chatgpt_auth_tokens(
+-        &self,
+-        request_id: ConnectionRequestId,
+-        access_token: String,
+-        chatgpt_account_id: String,
+-        chatgpt_plan_type: Option<String>,
+-    ) {
+-        let result = self
+-            .login_chatgpt_auth_tokens_response(access_token, chatgpt_account_id, chatgpt_plan_type)
+-            .await;
+-        let logged_in = result.is_ok();
+-        self.outgoing.send_result(request_id, result).await;
+-
+-        if logged_in {
+-            self.send_login_success_notifications(/*login_id*/ None)
+-                .await;
+-        }
+-    }
+-
+-    async fn login_chatgpt_auth_tokens_response(
+-        &self,
+-        access_token: String,
+-        chatgpt_account_id: String,
+-        chatgpt_plan_type: Option<String>,
+-    ) -> Result<LoginAccountResponse, JSONRPCErrorError> {
+-        if !self
+-            .auth_manager
+-            .is_login_method_allowed(ForcedLoginMethod::Chatgpt)
+-        {
+-            return Err(invalid_request(
+-                "External ChatGPT auth is disabled. Use API key login instead.",
+-            ));
+-        }
+-
+-        // Cancel any active login attempt to avoid persisting managed auth state.
+-        {
+-            let mut guard = self.active_login.lock().await;
+-            if let Some(active) = guard.take() {
+-                drop(active);
+-            }
+-        }
+-
+-        if let Some(expected_workspaces) = self.auth_manager.effective_chatgpt_workspaces()
+-            && !expected_workspaces.contains(&chatgpt_account_id)
+-        {
+-            return Err(invalid_request(format!(
+-                "External auth must use one of workspace(s) {expected_workspaces:?}, but received {chatgpt_account_id:?}.",
+-            )));
+-        }
+-
+-        let auth = CodexAuth::from_external_chatgpt_tokens(
+-            &access_token,
+-            &chatgpt_account_id,
+-            chatgpt_plan_type.as_deref(),
+-        )
+-        .map_err(|err| internal_error(format!("failed to set external auth: {err}")))?;
+-        self.auth_manager
+-            .set_external_auth(Arc::new(ExternalAuthBridge::new(
+-                Arc::clone(&self.outgoing),
+-                auth,
+-            )))
+-            .await
+-            .map_err(|err| internal_error(format!("failed to set external auth: {err}")))?;
+-        self.config_manager.replace_cloud_config_bundle_loader(
+-            self.auth_manager.clone(),
+-            self.config.chatgpt_base_url.clone(),
+-            self.config.http_client_factory(),
+-        );
+-        self.config_manager
+-            .sync_default_client_residency_requirement()
+-            .await;
+-
+-        Ok(LoginAccountResponse::ChatgptAuthTokens {})
+-    }
+-
+-    async fn send_login_success_notifications(&self, login_id: Option<Uuid>) {
+-        self.thread_manager.invalidate_mcp_runtimes().await;
+-        self.send_account_login_notifications(AccountLoginCompletedNotification {
+-            login_id: login_id.map(|id| id.to_string()),
+-            success: true,
+-            error: None,
+-            onboarding_entrypoint: None,
+-        })
+-        .await;
+-    }
+-
+-    async fn send_account_login_notifications(
+-        &self,
+-        mut payload: AccountLoginCompletedNotification,
+-    ) {
+-        let auth_changes = self.auth_manager.auth_change_state_receiver();
+-        let owner_generation = auth_changes.borrow().owner_generation;
+-        if payload.success
+-            && let Err(error) = self.read_account(/*request*/ None).await
+-        {
+-            payload.success = false;
+-            payload.error = Some(error.to_string());
+-        }
+-        if payload.success && auth_changes.borrow().owner_generation == owner_generation {
+-            Self::maybe_refresh_plugin_caches_for_current_config(
+-                &self.config_manager,
+-                &self.thread_manager,
+-                self.auth_manager.auth_cached(),
+-            )
+-            .await;
+-        }
+-
+-        let success = payload.success;
+-        self.outgoing
+-            .send_account_notification(
+-                /*connection_id*/ None,
+-                &auth_changes,
+-                owner_generation,
+-                AccountNotification::LoginCompleted(payload),
+-            )
+-            .await;
+-
+-        if success {
+-            let notification = self.current_account_updated_notification();
+-            self.outgoing
+-                .send_account_notification(
+-                    /*connection_id*/ None,
+-                    &auth_changes,
+-                    owner_generation,
+-                    AccountNotification::Updated(notification),
+-                )
+-                .await;
+-        }
+-    }
+-
+-    async fn send_chatgpt_login_completion_notifications(
+-        &self,
+-        mut payload_v2: AccountLoginCompletedNotification,
+-    ) {
+-        if payload_v2.success {
+-            self.auth_manager.reload().await;
+-            let auth_changes = self.auth_manager.auth_change_state_receiver();
+-            let owner_generation = auth_changes.borrow().owner_generation;
+-            self.thread_manager.invalidate_mcp_runtimes().await;
+-            self.config_manager.replace_cloud_config_bundle_loader(
+-                self.auth_manager.clone(),
+-                self.config.chatgpt_base_url.clone(),
+-                self.config.http_client_factory(),
+-            );
+-            self.config_manager
+-                .sync_default_client_residency_requirement()
+-                .await;
+-            if auth_changes.borrow().owner_generation != owner_generation {
+-                payload_v2.success = false;
+-                payload_v2.error = Some("account changed before sign-in completed".into());
+-            }
+-        }
+-        self.send_account_login_notifications(payload_v2).await;
+-    }
+-
+-    async fn logout_common(&self) -> std::result::Result<Option<AuthMode>, JSONRPCErrorError> {
+-        if self.auth_manager.is_workload_identity_selected() {
+-            return Err(self.configured_auth_owned_by_host_error());
+-        }
+-        // Another process may have changed the persisted workspace. Reload both
+-        // account authority and its policy before selecting a grant to remove.
+-        self.auth_manager.reload().await;
+-        self.config_manager.replace_cloud_config_bundle_loader(
+-            Arc::clone(&self.auth_manager),
+-            self.config.chatgpt_base_url.clone(),
+-            self.config.http_client_factory(),
+-        );
+-        let config = self
+-            .config_manager
+-            .load_latest_config(/*fallback_cwd*/ None)
+-            .await;
+-        let scope = ema_auth_scope(self.auth_manager.auth_cached().as_ref());
+-        let enterprise_policy_failed = scope.is_some() && config.is_err();
+-        // Startup policy may belong to another workspace. Never use that fallback
+-        // to select a credential; a policy failure must not block primary logout.
+-        let enterprise_grant = config.as_ref().ok().and_then(|config| {
+-            scope
+-                .as_ref()
+-                .zip(config.mcp_enterprise_managed_auth.as_ref())
+-                .map(|(scope, profile)| {
+-                    (
+-                        profile.idp.credential_name(scope),
+-                        profile.idp.issuer.clone(),
+-                        config.auth_keyring_backend_kind(),
+-                    )
+-                })
+-        });
+-        let config = config.unwrap_or_else(|_| self.config.as_ref().clone());
+-
+-        self.cancel_active_login().await;
+-
+-        // Retain the credential lock through primary logout. Otherwise a second
+-        // process can commit after deletion but before the account is removed.
+-        let enterprise_guard =
+-            if let Some((credential_name, issuer, keyring_backend)) = enterprise_grant {
+-                EnterpriseOAuthCredentialGuard::acquire(&credential_name, &issuer, keyring_backend)
+-                    .await
+-                    .map(Some)
+-            } else {
+-                Ok(None)
+-            };
+-        let cleanup_failed = match &enterprise_guard {
+-            Ok(Some(guard)) => guard.delete_tokens().is_err(),
+-            Ok(None) => false,
+-            Err(_) => true,
+-        };
+-        if enterprise_policy_failed || cleanup_failed {
+-            tracing::warn!("Failed to remove enterprise authorization; continuing account logout");
+-        }
+-
+-        match self.auth_manager.logout_with_revoke().await {
+-            Ok(_) => {}
+-            Err(err) => {
+-                return Err(internal_error(format!("logout failed: {err}")));
+-            }
+-        }
+-        drop(enterprise_guard);
+-        self.thread_manager.invalidate_mcp_runtimes().await;
+-
+-        self.config_manager.clear_cloud_config_bundle_loader();
+-
+-        if config.model_provider.is_amazon_bedrock() {
+-            clear_user_model_provider_if_bedrock(&self.config_manager, &config).await?;
+-        }
+-
+-        *self.workspace_routing.lock().await = None;
+-
+-        Self::maybe_refresh_plugin_caches_for_current_config(
+-            &self.config_manager,
+-            &self.thread_manager,
+-            self.auth_manager.auth_cached(),
+-        )
+-        .await;
+-
+-        // Reflect the current auth method after logout (likely None).
+-        Ok(self
+-            .auth_manager
+-            .auth_cached()
+-            .as_ref()
+-            .map(CodexAuth::api_auth_mode)
+-            .map(auth_mode_to_api))
+-    }
+-
+-    async fn logout_v2(&self, request_id: ConnectionRequestId) -> Result<(), JSONRPCErrorError> {
+-        let result = self.logout_common().await;
+-        let account_updated =
+-            result
+-                .as_ref()
+-                .ok()
+-                .cloned()
+-                .map(|auth_mode| AccountUpdatedNotification {
+-                    auth_mode,
+-                    plan_type: None,
+-                });
+-        self.outgoing
+-            .send_result(request_id, result.map(|_| LogoutAccountResponse {}))
+-            .await;
+-
+-        if let Some(payload) = account_updated {
+-            self.outgoing
+-                .send_server_notification(ServerNotification::AccountUpdated(payload))
+-                .await;
+-        }
+-        Ok(())
+-    }
+-
+-    async fn refresh_token_if_requested(&self, do_refresh: bool) -> RefreshTokenRequestOutcome {
+-        if self.auth_manager.is_external_chatgpt_auth_active() {
+-            return RefreshTokenRequestOutcome::NotAttemptedOrSucceeded;
+-        }
+-        if do_refresh && let Err(err) = self.auth_manager.refresh_token().await {
+-            let failed_reason = err.failed_reason();
+-            if failed_reason.is_none() {
+-                tracing::warn!("failed to refresh token while getting account: {err}");
+-                return RefreshTokenRequestOutcome::FailedTransiently;
+-            }
+-            return RefreshTokenRequestOutcome::FailedPermanently;
+-        }
+-        RefreshTokenRequestOutcome::NotAttemptedOrSucceeded
+-    }
+-
+-    async fn get_auth_status_response(
+-        &self,
+-        params: GetAuthStatusParams,
+-    ) -> Result<GetAuthStatusResponse, JSONRPCErrorError> {
+-        let include_token = params.include_token.unwrap_or(false);
+-        let do_refresh = params.refresh_token.unwrap_or(false);
+-
+-        self.refresh_token_if_requested(do_refresh).await;
+-
+-        // Determine whether auth is required based on the active model provider.
+-        // If a custom provider is configured with `requires_openai_auth == false`,
+-        // then no auth step is required; otherwise, default to requiring auth.
+-        let config = self.load_latest_config().await;
+-        let requires_openai_auth = config.model_provider.requires_openai_auth;
+-
+-        let response = if !requires_openai_auth {
+-            GetAuthStatusResponse {
+-                auth_method: None,
+-                auth_token: None,
+-                requires_openai_auth: Some(false),
+-            }
+-        } else {
+-            let auth = if do_refresh {
+-                self.auth_manager.auth_cached()
+-            } else {
+-                self.auth_manager.auth().await
+-            };
+-            match auth {
+-                Some(auth) => {
+-                    let permanent_refresh_failure =
+-                        self.auth_manager.refresh_failure_for_auth(&auth).is_some();
+-                    let auth_mode = auth_mode_to_api(auth.api_auth_mode());
+-                    let (reported_auth_method, token_opt) =
+-                        if self.auth_manager.is_workload_identity_selected()
+-                            || matches!(
+-                                auth,
+-                                CodexAuth::Headers(_)
+-                                    | CodexAuth::AgentIdentity(_)
+-                                    | CodexAuth::PersonalAccessToken(_)
+-                            )
+-                            || include_token && permanent_refresh_failure
+-                        {
+-                            // Host-owned and metadata-bearing credentials are never exported.
+-                            (Some(auth_mode), None)
+-                        } else {
+-                            match auth.get_token() {
+-                                Ok(token) if !token.is_empty() => {
+-                                    let tok = if include_token { Some(token) } else { None };
+-                                    (Some(auth_mode), tok)
+-                                }
+-                                Ok(_) => (None, None),
+-                                Err(err) => {
+-                                    tracing::warn!("failed to get token for auth status: {err}");
+-                                    (None, None)
+-                                }
+-                            }
+-                        };
+-                    GetAuthStatusResponse {
+-                        auth_method: reported_auth_method,
+-                        auth_token: token_opt,
+-                        requires_openai_auth: Some(true),
+-                    }
+-                }
+-                None => GetAuthStatusResponse {
+-                    auth_method: None,
+-                    auth_token: None,
+-                    requires_openai_auth: Some(true),
+-                },
+-            }
+-        };
+-
+-        Ok(response)
+-    }
+-
+-    async fn get_account_rate_limits_response(
+-        &self,
+-        params: GetAccountRateLimitsParams,
+-    ) -> Result<GetAccountRateLimitsResponse, JSONRPCErrorError> {
+-        let Some((auth, http_client_factory)) =
+-            self.auth_manager.auth_with_http_client_factory().await
+-        else {
+-            return Err(invalid_request(
+-                "codex account authentication required to read rate limits",
+-            ));
+-        };
+-
+-        if !auth.uses_codex_backend() {
+-            return Err(invalid_request(
+-                "chatgpt authentication required to read rate limits",
+-            ));
+-        }
+-
+-        let client = BackendClient::from_auth(
+-            self.config.chatgpt_base_url.clone(),
+-            &auth,
+-            http_client_factory,
+-        );
+-
+-        let usage_request = async {
+-            if params.supports_luna_reserve
+-                && auth.auth_mode() == codex_protocol::auth::AuthMode::Chatgpt
+-                && !auth.is_fedramp_account()
+-            {
+-                client.get_rate_limits_with_luna_reserve().await
+-            } else {
+-                client.get_rate_limits_with_reset_credits().await
+-            }
+-        };
+-        let (response, detailed_rate_limit_reset_credits) = tokio::join!(usage_request, async {
+-            if params.exclude_reset_credit_details {
+-                None
+-            } else {
+-                Self::detailed_rate_limit_reset_credits(&client).await
+-            }
+-        },);
+-        let response = response
+-            .map_err(|err| internal_error(format!("failed to fetch codex rate limits: {err}")))?;
+-        if response.rate_limits.is_empty() {
+-            return Err(internal_error(
+-                "failed to fetch codex rate limits: no snapshots returned",
+-            ));
+-        }
+-
+-        let rate_limits_by_limit_id: HashMap<_, _> = response
+-            .rate_limits
+-            .iter()
+-            .cloned()
+-            .map(|snapshot| {
+-                let limit_id = snapshot
+-                    .limit_id
+-                    .clone()
+-                    .unwrap_or_else(|| "codex".to_string());
+-                (limit_id, snapshot)
+-            })
+-            .collect();
+-        let rate_limits = response
+-            .rate_limits
+-            .iter()
+-            .find(|snapshot| snapshot.limit_id.as_deref() == Some("codex"))
+-            .cloned()
+-            .unwrap_or_else(|| response.rate_limits[0].clone());
+-
+-        let rate_limit_reset_credits = detailed_rate_limit_reset_credits.or_else(|| {
+-            response
+-                .rate_limit_reset_credits
+-                .map(|summary| RateLimitResetCreditsSummary {
+-                    available_count: summary.available_count,
+-                    credits: None,
+-                })
+-        });
+-
+-        // Match desktop's account readiness check before exposing account-bound CTA content.
+-        // Normal rate limits remain available when older backends omit identity or banner data.
+-        // Login can change while the backend read is in flight.
+-        let active_auth = self.auth_manager.auth().await;
+-        let matches_active_account = active_auth.is_some_and(|auth| {
+-            !auth.is_fedramp_account()
+-                && response.account_id.is_some()
+-                && response.account_id == auth.get_account_id()
+-                && response.user_id.is_some()
+-                && response.user_id == auth.get_chatgpt_user_id()
+-        });
+-        let rate_limit_upsell = response
+-            .rate_limit_upsell
+-            .filter(|_| matches_active_account);
+-
+-        Ok(GetAccountRateLimitsResponse {
+-            ordinary_usage_allowed: response
+-                .ordinary_usage_allowed
+-                .filter(|_| matches_active_account),
+-            rate_limits: rate_limits.into(),
+-            rate_limits_by_limit_id: Some(
+-                rate_limits_by_limit_id
+-                    .into_iter()
+-                    .map(|(limit_id, snapshot)| (limit_id, snapshot.into()))
+-                    .collect(),
+-            ),
+-            rate_limit_reset_credits,
+-            account_id: response.account_id,
+-            rate_limit_upsell,
+-        })
+-    }
+-
+-    async fn get_account_token_usage_response(
+-        &self,
+-        params: Option<GetAccountTokenUsageParams>,
+-    ) -> Result<GetAccountTokenUsageResponse, JSONRPCErrorError> {
+-        let thread_id = params
+-            .and_then(|params| params.thread_id)
+-            .map(|thread_id| {
+-                ThreadId::from_string(&thread_id)
+-                    .map_err(|err| invalid_request(format!("invalid thread id: {err}")))
+-            })
+-            .transpose()?;
+-
+-        let Some((auth, http_client_factory)) =
+-            self.auth_manager.auth_with_http_client_factory().await
+-        else {
+-            return Err(invalid_request(
+-                "codex account authentication required to read token usage",
+-            ));
+-        };
+-
+-        if !auth.uses_codex_backend() {
+-            return Err(invalid_request(
+-                "chatgpt authentication required to read token usage",
+-            ));
+-        }
+-
+-        let client = BackendClient::from_auth(
+-            self.config.chatgpt_base_url.clone(),
+-            &auth,
+-            http_client_factory,
+-        );
+-        if let Some(thread_id) = thread_id {
+-            let thread_id = thread_id.to_string();
+-            let usage = tokio::time::timeout(
+-                THREAD_USAGE_FETCH_TIMEOUT,
+-                client.get_thread_usage(&thread_id),
+-            )
+-            .await
+-            .map_err(|_| internal_error("thread usage fetch timed out"))?;
+-            let thread_usage = match usage {
+-                Ok(usage) => Some(codex_app_server_protocol::ThreadUsage {
+-                    thread_id: usage.thread_id,
+-                    estimated_usage_credits_micros: usage.estimated_usage_credits_micros,
+-                    estimated_usage_usd_micros: usage.estimated_usage_usd_micros,
+-                    groups: usage
+-                        .groups
+-                        .into_iter()
+-                        .map(
+-                            |group| codex_app_server_protocol::ThreadUsageBreakdownGroup {
+-                                model: group.model,
+-                                reasoning_effort: group.reasoning_effort,
+-                                speed: group.speed,
+-                                estimated_usage_credits_micros: group
+-                                    .estimated_usage_credits_micros,
+-                                net_new_input_tokens: group.net_new_input_tokens,
+-                                cached_input_tokens: group.cached_input_tokens,
+-                                input_tokens: group.input_tokens,
+-                                output_tokens: group.output_tokens,
+-                                total_tokens: group.total_tokens,
+-                            },
+-                        )
+-                        .collect(),
+-                }),
+-                Err(err)
+-                    if matches!(err.status().map(|status| status.as_u16()), Some(403 | 404)) =>
+-                {
+-                    None
+-                }
+-                Err(err) => {
+-                    return Err(internal_error(format!(
+-                        "failed to fetch thread usage: {err}"
+-                    )));
+-                }
+-            };
+-            return Ok(GetAccountTokenUsageResponse {
+-                summary: AccountTokenUsageSummary {
+-                    lifetime_tokens: None,
+-                    peak_daily_tokens: None,
+-                    longest_running_turn_sec: None,
+-                    current_streak_days: None,
+-                    longest_streak_days: None,
+-                },
+-                daily_usage_buckets: None,
+-                thread_usage,
+-            });
+-        }
+-        let profile = tokio::time::timeout(
+-            ACCOUNT_TOKEN_USAGE_FETCH_TIMEOUT,
+-            client.get_token_usage_profile(),
+-        )
+-        .await
+-        .map_err(|_| internal_error("token usage profile fetch timed out"))?
+-        .map_err(|err| internal_error(format!("failed to fetch token usage profile: {err}")))?;
+-        Ok(Self::account_token_usage_response(profile))
+-    }
+-
+-    async fn get_workspace_messages_response(
+-        &self,
+-    ) -> Result<GetWorkspaceMessagesResponse, JSONRPCErrorError> {
+-        let Some((auth, http_client_factory)) =
+-            self.auth_manager.auth_with_http_client_factory().await
+-        else {
+-            return Err(invalid_request(
+-                "codex account authentication required to read workspace messages",
+-            ));
+-        };
+-
+-        if !auth.uses_codex_backend() {
+-            return Err(invalid_request(
+-                "chatgpt authentication required to read workspace messages",
+-            ));
+-        }
+-
+-        let client = BackendClient::from_auth(
+-            self.config.chatgpt_base_url.clone(),
+-            &auth,
+-            http_client_factory,
+-        );
+-        let messages = tokio::time::timeout(
+-            ACCOUNT_WORKSPACE_MESSAGES_FETCH_TIMEOUT,
+-            client.list_workspace_messages(),
+-        )
+-        .await
+-        .map_err(|_| internal_error("workspace messages fetch timed out"))?;
+-
+-        match messages {
+-            Ok(messages) => {
+-                Self::workspace_messages_response(messages, /*feature_enabled*/ true)
+-            }
+-            Err(err) if workspace_messages_feature_disabled(&err) => {
+-                Self::workspace_messages_response(
+-                    BackendWorkspaceMessagesResponse {
+-                        messages: Vec::new(),
+-                    },
+-                    /*feature_enabled*/ false,
+-                )
+-            }
+-            Err(err) => Err(internal_error(format!(
+-                "failed to fetch workspace messages: {err}"
+-            ))),
+-        }
+-    }
+-
+-    fn account_token_usage_response(profile: TokenUsageProfile) -> GetAccountTokenUsageResponse {
+-        let stats = profile.stats;
+-        GetAccountTokenUsageResponse {
+-            summary: AccountTokenUsageSummary {
+-                lifetime_tokens: stats.lifetime_tokens,
+-                peak_daily_tokens: stats.peak_daily_tokens,
+-                longest_running_turn_sec: stats.longest_running_turn_sec,
+-                current_streak_days: stats.current_streak_days,
+-                longest_streak_days: stats.longest_streak_days,
+-            },
+-            daily_usage_buckets: stats.daily_usage_buckets.map(|buckets| {
+-                buckets
+-                    .into_iter()
+-                    .map(|bucket| AccountTokenUsageDailyBucket {
+-                        start_date: bucket.start_date,
+-                        tokens: bucket.tokens,
+-                    })
+-                    .collect()
+-            }),
+-            thread_usage: None,
+-        }
+-    }
+-
+-    fn workspace_messages_response(
+-        messages: BackendWorkspaceMessagesResponse,
+-        feature_enabled: bool,
+-    ) -> Result<GetWorkspaceMessagesResponse, JSONRPCErrorError> {
+-        Ok(GetWorkspaceMessagesResponse {
+-            feature_enabled,
+-            messages: messages
+-                .messages
+-                .into_iter()
+-                .map(workspace_message_from_backend)
+-                .collect::<Result<Vec<_>, _>>()?,
+-        })
+-    }
+-
+-    async fn send_add_credits_nudge_email_response(
+-        &self,
+-        params: SendAddCreditsNudgeEmailParams,
+-    ) -> Result<SendAddCreditsNudgeEmailResponse, JSONRPCErrorError> {
+-        self.send_add_credits_nudge_email_inner(params)
+-            .await
+-            .map(|status| SendAddCreditsNudgeEmailResponse { status })
+-    }
+-
+-    async fn send_add_credits_nudge_email_inner(
+-        &self,
+-        params: SendAddCreditsNudgeEmailParams,
+-    ) -> Result<AddCreditsNudgeEmailStatus, JSONRPCErrorError> {
+-        let Some((auth, http_client_factory)) =
+-            self.auth_manager.auth_with_http_client_factory().await
+-        else {
+-            return Err(invalid_request(
+-                "codex account authentication required to notify workspace owner",
+-            ));
+-        };
+-
+-        if !auth.uses_codex_backend() {
+-            return Err(invalid_request(
+-                "chatgpt authentication required to notify workspace owner",
+-            ));
+-        }
+-
+-        let client = BackendClient::from_auth(
+-            self.config.chatgpt_base_url.clone(),
+-            &auth,
+-            http_client_factory,
+-        );
+-
+-        match client
+-            .send_add_credits_nudge_email(Self::backend_credit_type(params.credit_type))
+-            .await
+-        {
+-            Ok(()) => Ok(AddCreditsNudgeEmailStatus::Sent),
+-            Err(err) if err.status().is_some_and(|status| status.as_u16() == 429) => {
+-                Ok(AddCreditsNudgeEmailStatus::CooldownActive)
+-            }
+-            Err(err) => Err(internal_error(format!(
+-                "failed to notify workspace owner: {err}"
+-            ))),
+-        }
+-    }
+-
+-    fn backend_credit_type(value: AddCreditsNudgeCreditType) -> BackendAddCreditsNudgeCreditType {
+-        match value {
+-            AddCreditsNudgeCreditType::Credits => BackendAddCreditsNudgeCreditType::Credits,
+-            AddCreditsNudgeCreditType::UsageLimit => BackendAddCreditsNudgeCreditType::UsageLimit,
+-        }
+-    }
+-}
+-
+-fn workspace_message_from_backend(
+-    message: BackendWorkspaceMessage,
+-) -> Result<WorkspaceMessage, JSONRPCErrorError> {
+-    Ok(WorkspaceMessage {
+-        message_id: message.message_id,
+-        message_type: workspace_message_type_from_backend(message.message_type),
+-        message_body: message.message_body,
+-        created_at: workspace_message_timestamp_from_backend(message.created_at)?,
+-        archived_at: workspace_message_timestamp_from_backend(message.archived_at)?,
+-    })
+-}
+-
+-fn workspace_message_timestamp_from_backend(
+-    timestamp: Option<String>,
+-) -> Result<Option<i64>, JSONRPCErrorError> {
+-    timestamp
+-        .map(|timestamp| {
+-            DateTime::parse_from_rfc3339(&timestamp)
+-                .map(|timestamp| timestamp.timestamp())
+-                .map_err(|err| {
+-                    internal_error(format!(
+-                        "failed to parse workspace message timestamp `{timestamp}`: {err}"
+-                    ))
+-                })
+-        })
+-        .transpose()
+-}
+-
+-fn workspace_message_type_from_backend(
+-    message_type: BackendWorkspaceMessageType,
+-) -> WorkspaceMessageType {
+-    match message_type {
+-        BackendWorkspaceMessageType::Headline => WorkspaceMessageType::Headline,
+-        BackendWorkspaceMessageType::Announcement => WorkspaceMessageType::Announcement,
+-        BackendWorkspaceMessageType::Unknown => WorkspaceMessageType::Unknown,
+-    }
+-}
+-
+-fn workspace_messages_feature_disabled(err: &BackendRequestError) -> bool {
+-    err.status().is_some_and(|status| status.as_u16() == 404)
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-    use codex_backend_client::TokenUsageProfileDailyBucket;
+-    use codex_backend_client::TokenUsageProfileStats;
+-    use http::StatusCode;
+-    use pretty_assertions::assert_eq;
+-
+-    #[test]
+-    fn account_token_usage_response_maps_profile_stats_and_daily_buckets() {
+-        let response = AccountRequestProcessor::account_token_usage_response(TokenUsageProfile {
+-            stats: TokenUsageProfileStats {
+-                lifetime_tokens: Some(123),
+-                peak_daily_tokens: Some(45),
+-                longest_running_turn_sec: Some(67),
+-                current_streak_days: Some(8),
+-                longest_streak_days: Some(9),
+-                daily_usage_buckets: Some(vec![TokenUsageProfileDailyBucket {
+-                    start_date: "2026-05-29".to_string(),
+-                    tokens: 10,
+-                }]),
+-            },
+-        });
+-
+-        assert_eq!(
+-            response,
+-            GetAccountTokenUsageResponse {
+-                summary: AccountTokenUsageSummary {
+-                    lifetime_tokens: Some(123),
+-                    peak_daily_tokens: Some(45),
+-                    longest_running_turn_sec: Some(67),
+-                    current_streak_days: Some(8),
+-                    longest_streak_days: Some(9),
+-                },
+-                daily_usage_buckets: Some(vec![AccountTokenUsageDailyBucket {
+-                    start_date: "2026-05-29".to_string(),
+-                    tokens: 10,
+-                }]),
+-                thread_usage: None,
+-            }
+-        );
+-    }
+-
+-    #[test]
+-    fn workspace_messages_response_maps_backend_messages() {
+-        let response = AccountRequestProcessor::workspace_messages_response(
+-            BackendWorkspaceMessagesResponse {
+-                messages: vec![BackendWorkspaceMessage {
+-                    message_id: "headline-id".to_string(),
+-                    message_type: BackendWorkspaceMessageType::Headline,
+-                    message_body: "Headline body".to_string(),
+-                    created_at: Some("2026-06-14T00:00:00Z".to_string()),
+-                    archived_at: Some("2026-06-15T00:00:00Z".to_string()),
+-                }],
+-            },
+-            /*feature_enabled*/ true,
+-        )
+-        .expect("workspace message timestamps should parse");
+-
+-        assert_eq!(
+-            response,
+-            GetWorkspaceMessagesResponse {
+-                feature_enabled: true,
+-                messages: vec![WorkspaceMessage {
+-                    message_id: "headline-id".to_string(),
+-                    message_type: WorkspaceMessageType::Headline,
+-                    message_body: "Headline body".to_string(),
+-                    created_at: Some(1_781_395_200),
+-                    archived_at: Some(1_781_481_600),
+-                }],
+-            }
+-        );
+-    }
+-
+-    #[test]
+-    fn workspace_messages_feature_disabled_only_for_not_found() {
+-        let cases = [
+-            (StatusCode::NOT_FOUND, true),
+-            (StatusCode::UNAUTHORIZED, false),
+-            (StatusCode::FORBIDDEN, false),
+-        ];
+-
+-        for (status, expected) in cases {
+-            let err = BackendRequestError::UnexpectedStatus {
+-                method: "GET".to_string(),
+-                url: "https://example.test/api/codex/workspace-messages".to_string(),
+-                status,
+-                content_type: "application/json".to_string(),
+-                body: "{}".to_string(),
+-            };
+-            assert_eq!(workspace_messages_feature_disabled(&err), expected);
+-        }
+     }
+ }
+diff --git a/codex-rs/app-server/src/request_processors/mcp_processor.rs b/codex-rs/app-server/src/request_processors/mcp_processor.rs
+index e65e6d744e3d7bf015b33e5c8d12724aacacb495..6251ab3d7342dcec3ee1f35fbbf42a4880cacc4b 100644
+--- a/codex-rs/app-server/src/request_processors/mcp_processor.rs
++++ b/codex-rs/app-server/src/request_processors/mcp_processor.rs
+@@ -1,14 +1,10 @@
+-use super::account_processor::EnterpriseLoginCompletion;
+-use super::account_processor::EnterpriseLoginTarget;
+ use super::thread_input::ensure_direct_input_allowed;
+ use super::*;
+ use codex_config::types::McpServerAuth;
+ use codex_mcp::McpServerSource;
+ use codex_mcp::ReadResourceRequestParams;
+-use codex_mcp::ema_auth_scope;
+ use codex_mcp::resolve_oauth_callback;
+ use codex_otel::auth_storage::AuthStorageOriginator;
+-use codex_rmcp_client::EnterpriseOAuthLoginRequest;
+ use std::future::Future;
+ 
+ use crate::thread_state::ThreadStateManager;
+@@ -21,7 +17,7 @@ pub(crate) struct McpRequestProcessor {
+     thread_manager: Arc<ThreadManager>,
+     pub(super) outgoing: Arc<OutgoingMessageSender>,
+     config_manager: ConfigManager,
+-    account_processor: Arc<AccountRequestProcessor>,
++
+     pub(super) thread_state_manager: ThreadStateManager,
+ }
+ 
+@@ -32,14 +28,13 @@ impl McpRequestProcessor {
+         thread_state_manager: ThreadStateManager,
+         outgoing: Arc<OutgoingMessageSender>,
+         config_manager: ConfigManager,
+-        account_processor: Arc<AccountRequestProcessor>,
+     ) -> Self {
+         Self {
+             auth_manager,
+             thread_manager,
+             outgoing,
+             config_manager,
+-            account_processor,
++
+             thread_state_manager,
+         }
+     }
+@@ -180,82 +175,9 @@ impl McpRequestProcessor {
+             String,
+             futures::future::BoxFuture<'static, anyhow::Result<()>>,
+         ) = if enterprise {
+-            let thread_id = thread_id.clone().ok_or_else(|| {
+-                invalid_request("enterprise MCP login requires a connected thread")
+-            })?;
+-            if !mcp_config.xaa_enabled {
+-                return Err(invalid_request(
+-                    "enterprise MCP authentication requires `[features].use_xaa = true`",
+-                ));
+-            }
+-            if !server.enabled {
+-                return Err(invalid_request(format!("MCP server '{name}' is disabled.")));
+-            }
+-            server
+-                .validate_ema_auth_transport()
+-                .map_err(|reason| invalid_request(format!("MCP server '{name}' {reason}")))?;
+-            if client_registration.is_some() {
+-                return Err(invalid_request(
+-                    "enterprise MCP login uses the configured enterprise client and does not support clientRegistration overrides",
+-                ));
+-            }
+-            // Resource scopes and per-server callbacks do not alter the shared IdP registration.
+-            let scope = ema_auth_scope(auth.as_ref()).ok_or_else(|| {
+-                invalid_request(
+-                    "enterprise MCP authentication requires a signed-in Codex user and workspace",
+-                )
+-            })?;
+-            let idp = server.oauth_idp().ok_or_else(|| {
+-                invalid_request(format!(
+-                    "MCP server '{name}' has no configured enterprise IdP"
+-                ))
+-            })?;
+-            let registration = server.ema_registration().cloned().ok_or_else(|| {
+-                invalid_request(format!(
+-                    "MCP server '{name}' has no validated enterprise registration"
+-                ))
+-            })?;
+-            let credential_name = idp.credential_name(&scope);
+-            let http_client =
+-                runtime_context
+-                    .resolve_http_client(&name, server)
+-                    .map_err(|err| {
+-                        internal_error(format!("failed to resolve MCP server runtime: {err}"))
+-                    })?;
+-            let login = self
+-                .account_processor
+-                .enterprise_login
+-                .start(
+-                    EnterpriseOAuthLoginRequest {
+-                        credential_name: &credential_name,
+-                        issuer: &idp.issuer,
+-                        client_id: &idp.client_id,
+-                        keyring_backend_kind: mcp_config.auth_keyring_backend_kind,
+-                        callback_port: mcp_config.mcp_oauth_callback_port,
+-                        callback_url: mcp_config.mcp_oauth_callback_url.as_deref(),
+-                        timeout_secs,
+-                        http_client,
+-                        redirect_mode,
+-                    },
+-                    scope,
+-                    EnterpriseLoginTarget {
+-                        thread_id,
+-                        server_name: name.clone(),
+-                        registration,
+-                    },
+-                )
+-                .await?;
+-            let mut completion = login.completion;
+-            (
+-                login.authorization_url,
+-                login.login_id,
+-                Box::pin(async move {
+-                    match completion.wait_for(|state| state.is_complete()).await {
+-                        Ok(result) if *result == EnterpriseLoginCompletion::Succeeded => Ok(()),
+-                        _ => Err(anyhow::anyhow!("Enterprise sign-in failed.")),
+-                    }
+-                }),
+-            )
++            return Err(invalid_request(
++                "Native-account MCP authentication is unavailable; configure MCP OAuth or bearer authentication",
++            ));
+         } else {
+             let (url, http_headers, env_http_headers) = match &server.transport {
+                 McpServerTransportConfig::StreamableHttp {
+diff --git a/codex-rs/app-server/src/turn_cost_worker.rs b/codex-rs/app-server/src/turn_cost_worker.rs
+index c36108b4d58388b58eea79aa266dd4cb3f505d04..b423cb186dc65dc71e18aa3d78bae52801b4cec0 100644
+--- a/codex-rs/app-server/src/turn_cost_worker.rs
++++ b/codex-rs/app-server/src/turn_cost_worker.rs
+@@ -1,538 +1,30 @@
+-use codex_backend_client::ApiKeyTurnCost;
+-use codex_backend_client::ApiKeyTurnCostStatus;
+-use codex_backend_client::Client as BackendClient;
+-use codex_backend_client::RequestError;
+-use codex_config::types::OtelExporterKind;
+ use codex_core::config::Config;
+ use codex_login::AuthManager;
+-use codex_model_provider::SharedModelProvider;
+-use codex_model_provider::create_model_provider;
+ use codex_otel::SessionTelemetry;
+ use codex_protocol::ThreadId;
+-use codex_protocol::auth::AuthMode;
+ use codex_protocol::protocol::Event;
+-use codex_protocol::protocol::EventMsg;
+-use std::collections::HashMap;
+-use std::collections::HashSet;
+ use std::sync::Arc;
+-use std::time::Duration;
+-use std::time::Instant;
+-use tokio::sync::mpsc;
+-use tokio::task::JoinHandle;
+-use tokio_util::sync::CancellationToken;
+-use tracing::warn;
+-
+-const POLL_INTERVAL: Duration = Duration::from_secs(150);
+-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+-const OBSERVATION_CHANNEL_CAPACITY: usize = 16_384;
+-const MAX_TRACKED_TURNS: usize = 4_096;
+-const MAX_QUERY_TURNS: usize = 100;
+-const MAX_TRACKED_RESPONSES_PER_TURN: usize = 4_096;
+-const MAX_STALLED_POLL_ATTEMPTS: u8 = 5;
+-
+-pub(crate) struct TurnCostWorker {
+-    handle: TurnCostWorkerHandle,
+-    shutdown: CancellationToken,
+-    _task: JoinHandle<()>,
+-}
+-
+-#[derive(Clone)]
+-pub(crate) struct TurnCostWorkerHandle {
+-    sender: mpsc::Sender<TurnCostObservation>,
+-    backend: TurnCostBackend,
+-    config: Arc<Config>,
+-}
+-
+-enum TurnCostObservationKind {
+-    Started {
+-        session_telemetry: Box<SessionTelemetry>,
+-    },
+-    ResponseCompleted {
+-        response_id: String,
+-    },
+-    Finished {
+-        interrupted: bool,
+-    },
+-}
+-
+-struct TurnCostObservation {
+-    thread_id: ThreadId,
+-    turn_id: String,
+-    kind: TurnCostObservationKind,
+-}
+-
+-#[derive(Clone, Copy, PartialEq, Eq)]
+-enum TurnCostStatus {
+-    Running,
+-    Completed,
+-    Interrupted,
+-}
+-
+-struct TurnCostEntry {
+-    thread_id: ThreadId,
+-    session_telemetry: SessionTelemetry,
+-    expected_response_ids: HashSet<String>,
+-    status: TurnCostStatus,
+-    next_poll_at: Instant,
+-    attempt_count: u8,
+-}
+-
+-struct WorkerRuntime {
+-    config: Arc<Config>,
+-    backend: TurnCostBackend,
+-    turns: HashMap<String, TurnCostEntry>,
+-}
+ 
++pub(crate) struct TurnCostWorker;
+ #[derive(Clone)]
+-enum TurnCostBackend {
+-    OpenAi(Arc<AuthManager>),
+-    ModelProvider(SharedModelProvider),
+-}
+-
+-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+-enum BackendAvailability {
+-    AwaitingAuthChange,
+-    RetryProbe,
+-    Ready,
+-    Disabled,
+-}
++pub(crate) struct TurnCostWorkerHandle;
+ 
+ impl TurnCostWorker {
+-    pub(crate) fn spawn(config: Arc<Config>, auth_manager: Arc<AuthManager>) -> Option<Self> {
+-        let has_otel_log_exporter = matches!(
+-            config.otel.exporter,
+-            OtelExporterKind::OtlpHttp { .. } | OtelExporterKind::OtlpGrpc { .. }
+-        );
+-        let has_otel_metrics_exporter = matches!(
+-            config.otel.metrics_exporter,
+-            OtelExporterKind::OtlpHttp { .. } | OtelExporterKind::OtlpGrpc { .. }
+-        );
+-        if !(has_otel_log_exporter || has_otel_metrics_exporter)
+-            || config.model_provider.is_amazon_bedrock()
+-        {
+-            return None;
+-        }
+-        let is_openai = config.model_provider.is_openai();
+-        let backend = if is_openai {
+-            TurnCostBackend::OpenAi(Arc::clone(&auth_manager))
+-        } else {
+-            TurnCostBackend::ModelProvider(create_model_provider(
+-                config.model_provider.clone(),
+-                Some(Arc::clone(&auth_manager)),
+-            ))
+-        };
+-        let (sender, receiver) = mpsc::channel(OBSERVATION_CHANNEL_CAPACITY);
+-        let shutdown = CancellationToken::new();
+-        let runtime = WorkerRuntime {
+-            config: Arc::clone(&config),
+-            backend: backend.clone(),
+-            turns: HashMap::new(),
+-        };
+-        let worker_shutdown = shutdown.clone();
+-        let task = tokio::spawn(async move {
+-            runtime.run(receiver, worker_shutdown).await;
+-        });
+-        Some(Self {
+-            handle: TurnCostWorkerHandle {
+-                sender,
+-                backend,
+-                config,
+-            },
+-            shutdown,
+-            _task: task,
+-        })
++    pub(crate) fn spawn(_config: Arc<Config>, _auth: Arc<AuthManager>) -> Option<Self> {
++        None
+     }
+-
+     pub(crate) fn handle(&self) -> TurnCostWorkerHandle {
+-        self.handle.clone()
+-    }
+-
+-    pub(crate) fn shutdown(&self) {
+-        self.shutdown.cancel();
+-    }
+-}
+-
+-impl Drop for TurnCostWorker {
+-    fn drop(&mut self) {
+-        self.shutdown();
++        TurnCostWorkerHandle
+     }
++    pub(crate) fn shutdown(&self) {}
+ }
+-
+ impl TurnCostWorkerHandle {
+     pub(crate) fn observe_event(
+         &self,
+-        thread_id: ThreadId,
+-        thread_config: &Config,
+-        event: &Event,
+-        session_telemetry: impl FnOnce() -> SessionTelemetry,
++        _thread_id: ThreadId,
++        _config: &Config,
++        _event: &Event,
++        _telemetry: impl FnOnce() -> SessionTelemetry,
+     ) {
+-        if thread_config.model_provider != self.config.model_provider {
+-            return;
+-        }
+-        if let TurnCostBackend::OpenAi(auth_manager) = &self.backend {
+-            let Some(auth) = auth_manager.auth_cached() else {
+-                return;
+-            };
+-            if !auth.is_api_key_auth() && !auth.is_chatgpt_auth() {
+-                return;
+-            }
+-        }
+-        let kind = match &event.msg {
+-            EventMsg::TurnStarted(_) => TurnCostObservationKind::Started {
+-                session_telemetry: Box::new(session_telemetry()),
+-            },
+-            EventMsg::RawResponseCompleted(event) => TurnCostObservationKind::ResponseCompleted {
+-                response_id: event.response_id.clone(),
+-            },
+-            EventMsg::TurnComplete(_) => TurnCostObservationKind::Finished { interrupted: false },
+-            EventMsg::TurnAborted(_) => TurnCostObservationKind::Finished { interrupted: true },
+-            _ => return,
+-        };
+-        let _ = self.sender.try_send(TurnCostObservation {
+-            thread_id,
+-            turn_id: event.id.clone(),
+-            kind,
+-        });
+     }
+ }
+-
+-impl WorkerRuntime {
+-    async fn run(self, receiver: mpsc::Receiver<TurnCostObservation>, shutdown: CancellationToken) {
+-        let auth_changes = match &self.backend {
+-            TurnCostBackend::OpenAi(auth_manager) => Some(auth_manager.auth_change_receiver()),
+-            TurnCostBackend::ModelProvider(_) => None,
+-        };
+-        let backend_availability = self.probe_backend().await;
+-        self.run_with_backend_availability(receiver, shutdown, auth_changes, backend_availability)
+-            .await;
+-    }
+-
+-    async fn run_with_backend_availability(
+-        mut self,
+-        mut receiver: mpsc::Receiver<TurnCostObservation>,
+-        shutdown: CancellationToken,
+-        mut auth_changes: Option<tokio::sync::watch::Receiver<u64>>,
+-        mut backend_availability: BackendAvailability,
+-    ) {
+-        let mut ticker = tokio::time::interval(POLL_INTERVAL);
+-        ticker.tick().await;
+-        loop {
+-            tokio::select! {
+-                biased;
+-                _ = shutdown.cancelled() => break,
+-                changed = async {
+-                    match auth_changes.as_mut() {
+-                        Some(auth_changes) => auth_changes.changed().await,
+-                        None => std::future::pending().await,
+-                    }
+-                } => {
+-                    if changed.is_err() {
+-                        break;
+-                    }
+-                    // Cost telemetry is best effort: auth changes may drop pending turns.
+-                    // Callers can query the cost API directly to reconcile missing telemetry.
+-                    self.turns.clear();
+-                    while receiver.try_recv().is_ok() {}
+-                    backend_availability = self.probe_backend().await;
+-                }
+-                observation = receiver.recv() => {
+-                    let Some(observation) = observation else {
+-                        break;
+-                    };
+-                    if !matches!(
+-                        backend_availability,
+-                        BackendAvailability::Ready | BackendAvailability::RetryProbe
+-                    ) {
+-                        continue;
+-                    }
+-                    self.record_observation(observation);
+-                }
+-                _ = ticker.tick() => {
+-                    match backend_availability {
+-                        BackendAvailability::Ready => self.poll_due().await,
+-                        BackendAvailability::RetryProbe => {
+-                            backend_availability = self.probe_backend().await;
+-                        }
+-                        BackendAvailability::AwaitingAuthChange
+-                        | BackendAvailability::Disabled => {}
+-                    }
+-                }
+-            }
+-        }
+-    }
+-
+-    async fn probe_backend(&self) -> BackendAvailability {
+-        let probe_turn_ids = [uuid::Uuid::new_v4().to_string()];
+-        match tokio::time::timeout(REQUEST_TIMEOUT, self.query_turn_costs(&probe_turn_ids)).await {
+-            Ok(Ok(Some(_))) => BackendAvailability::Ready,
+-            Ok(Ok(None)) => match self.backend {
+-                TurnCostBackend::OpenAi(_) => BackendAvailability::AwaitingAuthChange,
+-                TurnCostBackend::ModelProvider(_) => BackendAvailability::Disabled,
+-            },
+-            Ok(Err(error)) => match error.status().map(|status| status.as_u16()) {
+-                Some(401 | 403) if matches!(self.backend, TurnCostBackend::OpenAi(_)) => {
+-                    tracing::debug!(
+-                        status = error.status().map(|status| status.as_u16()),
+-                        "turn cost worker waiting for auth change after backend availability check"
+-                    );
+-                    BackendAvailability::AwaitingAuthChange
+-                }
+-                Some(401 | 403 | 429) => BackendAvailability::RetryProbe,
+-                Some(400..=499) => {
+-                    tracing::debug!(
+-                        status = error.status().map(|status| status.as_u16()),
+-                        "turn cost worker disabled by backend availability check"
+-                    );
+-                    BackendAvailability::Disabled
+-                }
+-                _ => {
+-                    tracing::debug!(
+-                        status = error.status().map(|status| status.as_u16()),
+-                        "turn cost worker backend availability check failed temporarily"
+-                    );
+-                    BackendAvailability::RetryProbe
+-                }
+-            },
+-            Err(_) => {
+-                tracing::debug!(
+-                    "turn cost worker backend availability check timed out; will retry"
+-                );
+-                BackendAvailability::RetryProbe
+-            }
+-        }
+-    }
+-
+-    fn record_observation(&mut self, observation: TurnCostObservation) {
+-        match observation.kind {
+-            TurnCostObservationKind::Started { session_telemetry } => {
+-                if self.turns.len() < MAX_TRACKED_TURNS {
+-                    self.turns
+-                        .entry(observation.turn_id)
+-                        .or_insert(TurnCostEntry {
+-                            thread_id: observation.thread_id,
+-                            session_telemetry: *session_telemetry,
+-                            expected_response_ids: HashSet::new(),
+-                            status: TurnCostStatus::Running,
+-                            next_poll_at: Instant::now(),
+-                            attempt_count: 0,
+-                        });
+-                }
+-            }
+-            TurnCostObservationKind::ResponseCompleted { response_id } => {
+-                if let Some(entry) = self.turns.get_mut(&observation.turn_id)
+-                    && entry.status == TurnCostStatus::Running
+-                {
+-                    if entry.expected_response_ids.len() >= MAX_TRACKED_RESPONSES_PER_TURN {
+-                        self.turns.remove(&observation.turn_id);
+-                        return;
+-                    }
+-                    entry.expected_response_ids.insert(response_id);
+-                }
+-            }
+-            TurnCostObservationKind::Finished { interrupted } => {
+-                let Some(entry) = self.turns.get_mut(&observation.turn_id) else {
+-                    return;
+-                };
+-                if entry.status != TurnCostStatus::Running {
+-                    return;
+-                }
+-                entry.status = if interrupted {
+-                    TurnCostStatus::Interrupted
+-                } else {
+-                    TurnCostStatus::Completed
+-                };
+-                entry.next_poll_at = Instant::now();
+-            }
+-        }
+-    }
+-
+-    async fn poll_due(&mut self) {
+-        let now = Instant::now();
+-        let due_turn_ids: Vec<String> = self
+-            .turns
+-            .iter()
+-            .filter(|(_, entry)| {
+-                entry.status != TurnCostStatus::Running && entry.next_poll_at <= now
+-            })
+-            .take(MAX_QUERY_TURNS)
+-            .map(|(turn_id, _)| turn_id.clone())
+-            .collect();
+-        if !due_turn_ids.is_empty() {
+-            self.poll_entries(&due_turn_ids).await;
+-        }
+-    }
+-
+-    async fn poll_entries(&mut self, turn_ids: &[String]) {
+-        let costs =
+-            match tokio::time::timeout(REQUEST_TIMEOUT, self.query_turn_costs(turn_ids)).await {
+-                Ok(Ok(Some(costs))) => costs,
+-                Ok(Ok(None)) => return,
+-                Ok(Err(error)) => {
+-                    warn!(
+-                        status = error.status().map(|status| status.as_u16()),
+-                        "failed to query turn costs"
+-                    );
+-                    self.retry_entries(turn_ids);
+-                    return;
+-                }
+-                Err(_) => {
+-                    warn!("timed out querying turn costs");
+-                    self.retry_entries(turn_ids);
+-                    return;
+-                }
+-            };
+-        let costs_by_turn: HashMap<String, ApiKeyTurnCost> = costs
+-            .into_iter()
+-            .map(|cost| (cost.turn_id.clone(), cost))
+-            .collect();
+-        for turn_id in turn_ids {
+-            let Some(cost) = costs_by_turn.get(turn_id) else {
+-                self.retry_entry(turn_id);
+-                continue;
+-            };
+-            self.process_turn_cost(turn_id, cost);
+-        }
+-    }
+-
+-    async fn query_turn_costs(
+-        &self,
+-        turn_ids: &[String],
+-    ) -> Result<Option<Vec<ApiKeyTurnCost>>, RequestError> {
+-        match &self.backend {
+-            TurnCostBackend::OpenAi(auth_manager) => {
+-                let Some((auth, captured_factory)) =
+-                    auth_manager.auth_with_http_client_factory().await
+-                else {
+-                    return Ok(None);
+-                };
+-                let http_client_factory = self
+-                    .config
+-                    .http_client_factory()
+-                    .with_network_policy(captured_factory.network_policy().clone());
+-                if auth.is_chatgpt_auth() {
+-                    return self
+-                        .query_chatgpt_turn_costs(&auth, http_client_factory, turn_ids)
+-                        .await
+-                        .map(Some);
+-                }
+-                if !auth.is_api_key_auth() {
+-                    return Ok(None);
+-                }
+-                let provider = self
+-                    .config
+-                    .model_provider
+-                    .to_api_provider(Some(AuthMode::ApiKey))
+-                    .map_err(|error| RequestError::Other(error.into()))?;
+-                let client = BackendClient::from_auth(
+-                    self.config.chatgpt_base_url.clone(),
+-                    &auth,
+-                    http_client_factory,
+-                );
+-                client
+-                    .query_api_key_turn_costs(turn_ids, &provider.headers)
+-                    .await
+-                    .map(Some)
+-            }
+-            TurnCostBackend::ModelProvider(model_provider) => {
+-                let http_client_factory = self.config.http_client_factory().with_network_policy(
+-                    self.config
+-                        .application_network_policy
+-                        .clone()
+-                        .for_current_account(),
+-                );
+-                if model_provider.info().requires_openai_auth {
+-                    let Some(auth) = model_provider.auth().await else {
+-                        return Ok(None);
+-                    };
+-                    if !auth.is_api_key_auth() {
+-                        return Ok(None);
+-                    }
+-                }
+-                let provider = model_provider
+-                    .api_provider()
+-                    .await
+-                    .map_err(|error| RequestError::Other(error.into()))?;
+-                let auth = model_provider
+-                    .api_auth()
+-                    .await
+-                    .map_err(|error| RequestError::Other(error.into()))?;
+-                let endpoint = provider.url_for_path("analytics/codex/turn-costs");
+-                let client = BackendClient::new(provider.base_url.clone(), http_client_factory)
+-                    .with_auth_provider(auth);
+-                client
+-                    .query_api_key_turn_costs_at(&endpoint, turn_ids, &provider.headers)
+-                    .await
+-                    .map(Some)
+-            }
+-        }
+-    }
+-
+-    fn process_turn_cost(&mut self, turn_id: &str, cost: &ApiKeyTurnCost) {
+-        if cost.status != ApiKeyTurnCostStatus::Priced {
+-            self.retry_entry(turn_id);
+-            return;
+-        }
+-        let response_count = cost
+-            .responses
+-            .as_ref()
+-            .map(|responses| responses.len() as u64)
+-            .or(cost.event_count);
+-        let (Some(total_usd), Some(response_count)) = (cost.total_usd.as_deref(), response_count)
+-        else {
+-            self.retry_entry(turn_id);
+-            return;
+-        };
+-        let Some(entry) = self.turns.get(turn_id) else {
+-            return;
+-        };
+-        if response_count < entry.expected_response_ids.len() as u64 {
+-            self.retry_entry(turn_id);
+-            return;
+-        }
+-        let mut session_telemetry = entry.session_telemetry.clone();
+-        if let Some(model) = cost.model.as_deref() {
+-            session_telemetry = session_telemetry.with_model(model, model);
+-        }
+-        let Some(entry) = self.turns.remove(turn_id) else {
+-            return;
+-        };
+-        session_telemetry.record_turn_cost(
+-            turn_id,
+-            total_usd,
+-            entry.status == TurnCostStatus::Interrupted,
+-            cost.speed.as_deref(),
+-            cost.reasoning_effort.as_deref(),
+-        );
+-    }
+-
+-    fn retry_entries(&mut self, turn_ids: &[String]) {
+-        for turn_id in turn_ids {
+-            self.retry_entry(turn_id);
+-        }
+-    }
+-
+-    fn retry_entry(&mut self, turn_id: &str) {
+-        let Some(entry) = self.turns.get_mut(turn_id) else {
+-            return;
+-        };
+-        entry.attempt_count = entry.attempt_count.saturating_add(1);
+-        if entry.attempt_count >= MAX_STALLED_POLL_ATTEMPTS {
+-            warn!(
+-                thread_id = %entry.thread_id,
+-                turn_id,
+-                attempts = MAX_STALLED_POLL_ATTEMPTS,
+-                "dropping turn cost event after repeated unsuccessful polls"
+-            );
+-            self.turns.remove(turn_id);
+-            return;
+-        }
+-        entry.next_poll_at = Instant::now() + POLL_INTERVAL;
+-    }
+-}
+-
+-#[path = "turn_cost_worker_chatgpt.rs"]
+-mod chatgpt;
+-
+-#[cfg(test)]
+-#[path = "turn_cost_worker_tests.rs"]
+-mod tests;
+diff --git a/codex-rs/login/Cargo.toml b/codex-rs/login/Cargo.toml
+index 50de4dc83a8d67c55a56ec51148b431f14a55511..c01947f08f14cdb664c39e3f9363ecbae19182f6 100644
+--- a/codex-rs/login/Cargo.toml
++++ b/codex-rs/login/Cargo.toml
+@@ -21,8 +21,6 @@ codex-otel = { workspace = true }
+ codex-protocol = { workspace = true }
+ codex-secrets = { workspace = true }
+ codex-terminal-detection = { workspace = true }
+-codex-utils-template = { workspace = true }
+-codex-workload-identity = { workspace = true }
+ http = { workspace = true }
+ once_cell = { workspace = true }
+ os_info = { workspace = true }
+@@ -41,7 +39,6 @@ tokio = { workspace = true, features = [
+ ] }
+ tracing = { workspace = true }
+ url = { workspace = true }
+-urlencoding = { workspace = true }
+ webbrowser = { workspace = true }
+ 
+ [dev-dependencies]
+diff --git a/codex-rs/login/src/auth/manager.rs b/codex-rs/login/src/auth/manager.rs
+index cdc9c8d3560359aca41ebf28b1b313e1a1793304..5ca81d7f550c86ab9df3266f2816d8dfda47aff4 100644
+--- a/codex-rs/login/src/auth/manager.rs
++++ b/codex-rs/login/src/auth/manager.rs
+@@ -43,7 +43,6 @@ use super::change_state::AuthChangeState;
+ use super::change_state::same_owner;
+ use super::external_bearer::BearerTokenRefresher;
+ use super::revoke::revoke_auth_tokens;
+-use super::workload_identity::WorkloadIdentityExternalAuth;
+ use super::workload_identity::WorkloadIdentitySessionError;
+ use crate::auth::AuthHeaders;
+ pub use crate::auth::agent_identity::AgentIdentityAuth;
+@@ -1103,8 +1102,13 @@ fn ensure_auth_workspace_allowed(
+     expected_workspace_ids: Option<&[String]>,
+     account_id: &str,
+ ) -> std::io::Result<()> {
+-    crate::server::ensure_workspace_account_allowed(expected_workspace_ids, account_id)
+-        .map_err(|message| std::io::Error::new(std::io::ErrorKind::PermissionDenied, message))
++    if expected_workspace_ids.is_some_and(|expected| !expected.iter().any(|id| id == account_id)) {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::PermissionDenied,
++            "Workspace is not allowed",
++        ));
++    }
++    Ok(())
+ }
+ 
+ fn ensure_agent_identity_workspace_allowed(
+@@ -1229,23 +1233,8 @@ impl AuthConfig {
+         &self,
+         enable_codex_api_key_env: bool,
+     ) -> std::io::Result<Option<CodexAuth>> {
+-        let allowed_login_methods = self.allowed_login_methods();
+-        let workspaces = self.effective_chatgpt_workspaces();
+-        let agent_identity_authapi_base_url =
+-            agent_identity_authapi_base_url(self.chatgpt_base_url.as_deref()).ok();
+-        let auth = load_auth(
+-            &self.codex_home,
+-            enable_codex_api_key_env,
+-            self.auth_credentials_store_mode,
+-            Some(&allowed_login_methods),
+-            workspaces.as_deref(),
+-            self.chatgpt_base_url.as_deref(),
+-            self.keyring_backend_kind,
+-            agent_identity_authapi_base_url.as_deref(),
+-            &self.auth_route_config,
+-        )
+-        .await?;
+-        Ok(auth.filter(|auth| self.allows_auth(auth)))
++        let _ = ();
++        Ok(None)
+     }
+ 
+     fn allowed_login_methods(&self) -> Vec<ForcedLoginMethod> {
+@@ -1497,103 +1486,18 @@ async fn load_auth(
+     agent_identity_authapi_base_url: Option<&str>,
+     auth_route_config: &AuthRouteConfig,
+ ) -> std::io::Result<Option<CodexAuth>> {
+-    // API key via env var takes precedence over any other auth method.
+-    if enable_codex_api_key_env
+-        && auth_mode_is_allowed(allowed_login_methods, AuthMode::ApiKey)
+-        && let Some(api_key) = read_codex_api_key_from_env()
+-    {
+-        return Ok(Some(CodexAuth::from_api_key(api_key.as_str())));
+-    }
+-
+-    // External ChatGPT auth tokens live in the in-memory (ephemeral) store. Always check this
+-    // first so external auth takes precedence over any persisted credentials.
+-    let ephemeral_storage = create_auth_storage(
+-        codex_home.to_path_buf(),
+-        AuthCredentialsStoreMode::Ephemeral,
+-        AuthKeyringBackendKind::default(),
+-    );
+-    if let Some(auth_dot_json) = ephemeral_storage.load()?
+-        && auth_mode_is_allowed(allowed_login_methods, auth_dot_json.resolved_mode())
+-    {
+-        if let Some(agent_identity) = auth_dot_json.agent_identity.as_ref() {
+-            ensure_agent_identity_workspace_allowed(forced_chatgpt_workspace_id, agent_identity)?;
+-        }
+-        let auth = CodexAuth::from_auth_dot_json(
+-            codex_home,
+-            auth_dot_json,
+-            AuthCredentialsStoreMode::Ephemeral,
+-            chatgpt_base_url,
+-            keyring_backend_kind,
+-            agent_identity_authapi_base_url,
+-            auth_route_config,
+-        )
+-        .await?;
+-        if let CodexAuth::PersonalAccessToken(auth) = &auth {
+-            ensure_auth_workspace_allowed(forced_chatgpt_workspace_id, auth.account_id())?;
+-        }
+-        return Ok(Some(auth));
+-    }
+-
+-    if auth_mode_is_allowed(allowed_login_methods, AuthMode::AgentIdentity)
+-        && let Some(access_token) = read_codex_access_token_from_env()
+-    {
+-        return match classify_codex_access_token(&access_token) {
+-            CodexAccessToken::PersonalAccessToken(access_token) => {
+-                let auth = PersonalAccessTokenAuth::load(access_token, auth_route_config).await?;
+-                ensure_auth_workspace_allowed(forced_chatgpt_workspace_id, auth.account_id())?;
+-                Ok(Some(CodexAuth::PersonalAccessToken(auth)))
+-            }
+-            CodexAccessToken::AgentIdentityJwt(jwt) => {
+-                let record = AgentIdentityAuthRecord::from_agent_identity_jwt(jwt)?;
+-                ensure_auth_workspace_allowed(forced_chatgpt_workspace_id, &record.account_id)?;
+-                CodexAuth::from_agent_identity_jwt_with_authapi_base_url(
+-                    jwt,
+-                    chatgpt_base_url,
+-                    require_agent_identity_authapi_base_url(agent_identity_authapi_base_url)?,
+-                    auth_route_config,
+-                )
+-            }
+-            .await
+-            .map(Some),
+-        };
+-    }
+-
+-    // If the caller explicitly requested ephemeral auth, there is no persisted fallback.
+-    if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
+-        return Ok(None);
+-    }
+-
+-    // Fall back to the configured persistent store (file/keyring/auto) for managed auth.
+-    let storage = create_auth_storage(
+-        codex_home.to_path_buf(),
+-        auth_credentials_store_mode,
+-        keyring_backend_kind,
+-    );
+-    let auth_dot_json = match storage.load()? {
+-        Some(auth) => auth,
+-        None => return Ok(None),
+-    };
+-    if !auth_mode_is_allowed(allowed_login_methods, auth_dot_json.resolved_mode()) {
+-        return Ok(None);
+-    }
+-    if let Some(agent_identity) = auth_dot_json.agent_identity.as_ref() {
+-        ensure_agent_identity_workspace_allowed(forced_chatgpt_workspace_id, agent_identity)?;
+-    }
+-
+-    let auth = CodexAuth::from_auth_dot_json(
++    let _ = (
+         codex_home,
+-        auth_dot_json,
++        enable_codex_api_key_env,
+         auth_credentials_store_mode,
++        allowed_login_methods,
++        forced_chatgpt_workspace_id,
+         chatgpt_base_url,
+         keyring_backend_kind,
+         agent_identity_authapi_base_url,
+         auth_route_config,
+-    )
+-    .await?;
+-    if let CodexAuth::PersonalAccessToken(auth) = &auth {
+-        ensure_auth_workspace_allowed(forced_chatgpt_workspace_id, auth.account_id())?;
+-    }
+-    Ok(Some(auth))
++    );
++    Ok(None)
+ }
+ 
+ // Persist refreshed tokens into auth storage and update last_refresh.
+@@ -2176,11 +2080,8 @@ impl AuthManager {
+     }
+ 
+     async fn new_from_auth_config(auth_config: AuthConfig, enable_codex_api_key_env: bool) -> Self {
+-        let managed_auth = auth_config
+-            .load_auth(enable_codex_api_key_env)
+-            .await
+-            .ok()
+-            .flatten();
++        let managed_auth = None;
++        let _ = enable_codex_api_key_env;
+         let AuthConfig {
+             codex_home,
+             auth_credentials_store_mode,
+@@ -2795,16 +2696,9 @@ impl AuthManager {
+         auth_config: AuthConfig,
+         enable_codex_api_key_env: bool,
+     ) -> Result<Arc<Self>, AuthManagerInitializationError> {
+-        let external_auth = WorkloadIdentityExternalAuth::from_process_config(&auth_config)?;
+-        let mut manager = Self::new_from_auth_config(auth_config, enable_codex_api_key_env).await;
+-        manager.workload_identity_selected = external_auth.is_some();
+-        let manager = Arc::new(manager);
+-        if let Some(external_auth) = external_auth {
+-            manager
+-                .install_external_auth(Arc::new(external_auth))
+-                .await?;
+-        }
+-        Ok(manager)
++        Ok(Arc::new(
++            Self::new_from_auth_config(auth_config, enable_codex_api_key_env).await,
++        ))
+     }
+ 
+     pub fn unauthorized_recovery(self: &Arc<Self>) -> UnauthorizedRecovery {
+@@ -2906,27 +2800,9 @@ impl AuthManager {
+             self.refresh_external_auth(ExternalAuthRefreshReason::Unauthorized)
+                 .await
+         } else {
+-            match attempted_auth.as_ref() {
+-                Some(CodexAuth::Chatgpt(chatgpt_auth)) => {
+-                    let token_data = chatgpt_auth.current_token_data().ok_or_else(|| {
+-                        RefreshTokenError::Transient(std::io::Error::other(
+-                            "Token data is not available.",
+-                        ))
+-                    })?;
+-                    self.refresh_and_persist_chatgpt_token(chatgpt_auth, token_data.refresh_token)
+-                        .await
+-                }
+-                Some(
+-                    CodexAuth::ApiKey(_)
+-                    | CodexAuth::ChatgptAuthTokens(_)
+-                    | CodexAuth::Headers(_)
+-                    | CodexAuth::AgentIdentity(_)
+-                    | CodexAuth::PersonalAccessToken(_)
+-                    | CodexAuth::BedrockApiKey(_)
+-                    | CodexAuth::BedrockAccessKeys(_),
+-                )
+-                | None => Ok(()),
+-            }
++            Err(RefreshTokenError::Transient(std::io::Error::other(
++                "Native account authentication is disabled",
++            )))
+         };
+         if let Some(attempted_auth) = attempted_auth.as_ref()
+             && let Err(RefreshTokenError::Permanent(error)) = &result
+diff --git a/codex-rs/login/src/auth/workload_identity.rs b/codex-rs/login/src/auth/workload_identity.rs
+index 06cf649027714987ee1207d5e7a03339901788b5..e64f500cb6de7ccbe2aa52dd5d98aa4c8567cc40 100644
+--- a/codex-rs/login/src/auth/workload_identity.rs
++++ b/codex-rs/login/src/auth/workload_identity.rs
+@@ -1,493 +1,9 @@
+-use std::ffi::OsString;
+-use std::path::PathBuf;
+-use std::sync::Arc;
+-use std::sync::Mutex;
+-use std::sync::OnceLock;
+-use std::sync::Weak;
+-use std::sync::atomic::AtomicU64;
+-use std::sync::atomic::Ordering;
+-
+-use codex_http_client::HttpClientFactory;
+-use codex_protocol::config_types::ForcedLoginMethod;
+-use codex_protocol::shell_environment::OPENAI_FEDERATION_RULE_ID_ENV_VAR;
+-use codex_protocol::shell_environment::OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR;
+-use codex_protocol::shell_environment::OPENAI_WORKLOAD_IDENTITY_CONTEXT_ENV_VAR;
+-use codex_workload_identity::WorkloadIdentityConfig;
+-use codex_workload_identity::WorkloadIdentityError;
+-use codex_workload_identity::WorkloadIdentityExchange;
+-use codex_workload_identity::WorkloadIdentityToken;
+-use thiserror::Error;
+-use url::Url;
+-
+-use super::AuthConfig;
+-use super::CodexAuth;
+-use super::ExternalAuth;
+-use super::ExternalAuthFuture;
+-use super::ExternalAuthRefreshContext;
+-use super::RefreshTokenError;
+-use super::RefreshTokenFailedError;
+-use super::RefreshTokenFailedReason;
+-use crate::AuthRouteConfig;
+-
+-const PROD_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+-const STAGING_TOKEN_URL: &str = "https://auth.api.openai.org/oauth/token";
+-
+-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+-enum WorkloadIdentityEnvironment {
+-    Production,
+-    Staging,
+-}
+-
+-impl WorkloadIdentityEnvironment {
+-    fn token_url(self) -> Result<Url, WorkloadIdentitySessionError> {
+-        Url::parse(match self {
+-            Self::Production => PROD_TOKEN_URL,
+-            Self::Staging => STAGING_TOKEN_URL,
+-        })
+-        .map_err(|_| invalid_config("workload identity token endpoint is invalid"))
+-    }
+-}
+-
+-#[derive(Clone)]
+-struct WorkloadIdentitySessionConfig {
+-    assertion_file: PathBuf,
+-    environment: WorkloadIdentityEnvironment,
+-    federation_rule_id: String,
+-    http_client_factory: HttpClientFactory,
+-    token_url: Url,
+-    workload_identity_context: Option<String>,
+-}
+-
+-impl std::fmt::Debug for WorkloadIdentitySessionConfig {
+-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        formatter
+-            .debug_struct("WorkloadIdentitySessionConfig")
+-            .field("assertion_file", &self.assertion_file)
+-            .field("environment", &self.environment)
+-            .field("federation_rule_id", &self.federation_rule_id)
+-            .field("http_client_factory", &self.http_client_factory)
+-            .field("token_url", &self.token_url)
+-            .field(
+-                "workload_identity_context",
+-                &self
+-                    .workload_identity_context
+-                    .as_ref()
+-                    .map(|_| "[redacted]"),
+-            )
+-            .finish()
+-    }
+-}
+-
+-impl WorkloadIdentitySessionConfig {
+-    fn fingerprint(&self) -> WorkloadIdentityFingerprint {
+-        WorkloadIdentityFingerprint {
+-            assertion_file: self.assertion_file.clone(),
+-            environment: self.environment,
+-            federation_rule_id: self.federation_rule_id.trim().to_string(),
+-            token_url: self.token_url.to_string(),
+-            workload_identity_context: self.workload_identity_context.clone(),
+-        }
+-    }
+-
+-    fn into_exchange(self) -> Result<WorkloadIdentityExchange, WorkloadIdentityError> {
+-        let config = WorkloadIdentityConfig::new(
+-            self.federation_rule_id,
+-            self.assertion_file,
+-            self.workload_identity_context,
+-        )?;
+-        WorkloadIdentityExchange::new(config, self.token_url, self.http_client_factory)
+-    }
+-}
+-
+-#[derive(Clone, PartialEq, Eq)]
+-struct WorkloadIdentityFingerprint {
+-    assertion_file: PathBuf,
+-    environment: WorkloadIdentityEnvironment,
+-    federation_rule_id: String,
+-    token_url: String,
+-    workload_identity_context: Option<String>,
+-}
+-
+-#[derive(Debug, Error)]
++#[derive(Debug, thiserror::Error)]
+ pub(super) enum WorkloadIdentitySessionError {
+-    #[error(transparent)]
+-    Exchange(#[from] WorkloadIdentityError),
+-    #[error("a different workload identity configuration is already active in this process")]
+-    ConflictingConfiguration,
+-    #[error("the workload identity process-session registry is unavailable")]
+-    RegistryUnavailable,
+-    #[error("{0}")]
+-    InvalidConfiguration(String),
++    #[error("Native workload identity authentication is disabled")]
++    Disabled,
+ }
+ 
+-/// Returns whether workload identity was selected through process configuration.
+-///
+-/// Either marker selects workload identity. Partial configuration then fails validation rather
+-/// than falling back to another credential source.
+ pub fn is_workload_identity_selected() -> bool {
+-    ProcessEnvironment::read().has_marker()
++    false
+ }
+-
+-fn resolve_config(
+-    chatgpt_base_url: &str,
+-    environment: ProcessEnvironment,
+-    chatgpt_login_allowed: bool,
+-    auth_route_config: AuthRouteConfig,
+-) -> Result<Option<WorkloadIdentitySessionConfig>, WorkloadIdentitySessionError> {
+-    if !environment.has_marker() {
+-        return Ok(None);
+-    }
+-    if !chatgpt_login_allowed {
+-        return Err(invalid_config(
+-            "workload identity requires a login policy that permits ChatGPT authentication",
+-        ));
+-    }
+-
+-    let federation_rule_id = required_unicode(
+-        environment.federation_rule_id,
+-        OPENAI_FEDERATION_RULE_ID_ENV_VAR,
+-    )?;
+-    let assertion_file = required_path(
+-        environment.identity_token_file,
+-        OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR,
+-    )?;
+-    let workload_identity_context = optional_unicode(
+-        environment.workload_identity_context,
+-        OPENAI_WORKLOAD_IDENTITY_CONTEXT_ENV_VAR,
+-    )?;
+-    let auth_environment = classify_auth_environment(chatgpt_base_url)?;
+-
+-    Ok(Some(WorkloadIdentitySessionConfig {
+-        assertion_file,
+-        environment: auth_environment,
+-        federation_rule_id,
+-        http_client_factory: auth_route_config
+-            .authentication_factory(auth_environment.token_url()?.as_str()),
+-        token_url: auth_environment.token_url()?,
+-        workload_identity_context,
+-    }))
+-}
+-
+-fn required_path(
+-    value: Option<OsString>,
+-    variable: &'static str,
+-) -> Result<PathBuf, WorkloadIdentitySessionError> {
+-    let path = PathBuf::from(
+-        value.ok_or_else(|| invalid_config(format!("workload identity requires {variable}")))?,
+-    );
+-    if !path.is_absolute() {
+-        return Err(invalid_config(format!(
+-            "{variable} must be an absolute path"
+-        )));
+-    }
+-    Ok(path)
+-}
+-
+-fn required_unicode(
+-    value: Option<OsString>,
+-    variable: &'static str,
+-) -> Result<String, WorkloadIdentitySessionError> {
+-    let value = value
+-        .ok_or_else(|| invalid_config(format!("workload identity requires {variable}")))?
+-        .into_string()
+-        .map_err(|_| invalid_config(format!("workload identity variable {variable} is invalid")))?;
+-    let value = value.trim();
+-    if value.is_empty() {
+-        return Err(invalid_config(format!(
+-            "workload identity variable {variable} is invalid"
+-        )));
+-    }
+-    Ok(value.to_string())
+-}
+-
+-fn optional_unicode(
+-    value: Option<OsString>,
+-    variable: &'static str,
+-) -> Result<Option<String>, WorkloadIdentitySessionError> {
+-    value
+-        .map(|value| {
+-            value.into_string().map_err(|_| {
+-                invalid_config(format!("workload identity variable {variable} is invalid"))
+-            })
+-        })
+-        .transpose()
+-}
+-
+-fn classify_auth_environment(
+-    base_url: &str,
+-) -> Result<WorkloadIdentityEnvironment, WorkloadIdentitySessionError> {
+-    match base_url.trim().trim_end_matches('/') {
+-        "https://chatgpt.com"
+-        | "https://chatgpt.com/backend-api"
+-        | "https://chatgpt.com/codex"
+-        | "https://chatgpt.com/backend-api/codex"
+-        | "https://chat.openai.com"
+-        | "https://chat.openai.com/backend-api"
+-        | "https://chat.openai.com/codex"
+-        | "https://chat.openai.com/backend-api/codex" => {
+-            Ok(WorkloadIdentityEnvironment::Production)
+-        }
+-        "https://chatgpt-staging.com"
+-        | "https://chatgpt-staging.com/backend-api"
+-        | "https://chatgpt-staging.com/codex"
+-        | "https://chatgpt-staging.com/backend-api/codex" => {
+-            Ok(WorkloadIdentityEnvironment::Staging)
+-        }
+-        _ => Err(invalid_config(
+-            "workload identity auth supports only trusted production and staging app routing",
+-        )),
+-    }
+-}
+-
+-fn invalid_config(message: impl Into<String>) -> WorkloadIdentitySessionError {
+-    WorkloadIdentitySessionError::InvalidConfiguration(message.into())
+-}
+-
+-#[derive(Default)]
+-struct ProcessEnvironment {
+-    federation_rule_id: Option<OsString>,
+-    identity_token_file: Option<OsString>,
+-    workload_identity_context: Option<OsString>,
+-}
+-
+-impl ProcessEnvironment {
+-    fn read() -> Self {
+-        Self {
+-            federation_rule_id: std::env::var_os(OPENAI_FEDERATION_RULE_ID_ENV_VAR),
+-            identity_token_file: std::env::var_os(OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR),
+-            workload_identity_context: std::env::var_os(OPENAI_WORKLOAD_IDENTITY_CONTEXT_ENV_VAR),
+-        }
+-    }
+-
+-    fn has_marker(&self) -> bool {
+-        self.federation_rule_id.is_some() || self.identity_token_file.is_some()
+-    }
+-}
+-
+-#[derive(Clone, PartialEq, Eq)]
+-struct WorkloadIdentitySubject {
+-    account_id: String,
+-    account_user_id: String,
+-    user_id: String,
+-}
+-
+-impl From<&WorkloadIdentityToken> for WorkloadIdentitySubject {
+-    fn from(token: &WorkloadIdentityToken) -> Self {
+-        Self {
+-            account_id: token.chatgpt_account_id.clone(),
+-            account_user_id: token.chatgpt_account_user_id.clone(),
+-            user_id: token.user_id.clone(),
+-        }
+-    }
+-}
+-
+-struct WorkloadIdentitySession {
+-    exchange: WorkloadIdentityExchange,
+-    subject: Mutex<Option<WorkloadIdentitySubject>>,
+-}
+-
+-impl WorkloadIdentitySession {
+-    fn new(config: WorkloadIdentitySessionConfig) -> Result<Self, WorkloadIdentitySessionError> {
+-        Ok(Self {
+-            exchange: config.into_exchange()?,
+-            subject: Mutex::new(None),
+-        })
+-    }
+-
+-    fn accept_subject(
+-        &self,
+-        token: &WorkloadIdentityToken,
+-        previous_account_id: Option<&str>,
+-    ) -> Result<(), WorkloadIdentityError> {
+-        if previous_account_id.is_some_and(|account_id| account_id != token.chatgpt_account_id) {
+-            return Err(WorkloadIdentityError::InvalidExchangeResponse);
+-        }
+-        let subject = WorkloadIdentitySubject::from(token);
+-        let mut current = self
+-            .subject
+-            .lock()
+-            .map_err(|_| WorkloadIdentityError::InvalidExchangeResponse)?;
+-        match current.as_ref() {
+-            Some(current) if current != &subject => {
+-                Err(WorkloadIdentityError::InvalidExchangeResponse)
+-            }
+-            Some(_) => Ok(()),
+-            None => {
+-                *current = Some(subject);
+-                Ok(())
+-            }
+-        }
+-    }
+-}
+-
+-#[derive(Default)]
+-struct WorkloadIdentitySessionRegistry {
+-    entry: Mutex<Option<WorkloadIdentitySessionEntry>>,
+-}
+-
+-struct WorkloadIdentitySessionEntry {
+-    fingerprint: WorkloadIdentityFingerprint,
+-    session: Weak<WorkloadIdentitySession>,
+-}
+-
+-impl WorkloadIdentitySessionRegistry {
+-    fn session(
+-        &self,
+-        config: WorkloadIdentitySessionConfig,
+-    ) -> Result<Arc<WorkloadIdentitySession>, WorkloadIdentitySessionError> {
+-        let fingerprint = config.fingerprint();
+-        let mut entry = self
+-            .entry
+-            .lock()
+-            .map_err(|_| WorkloadIdentitySessionError::RegistryUnavailable)?;
+-        if let Some(active) = entry.as_ref()
+-            && let Some(session) = active.session.upgrade()
+-        {
+-            if active.fingerprint == fingerprint {
+-                return Ok(session);
+-            }
+-            return Err(WorkloadIdentitySessionError::ConflictingConfiguration);
+-        }
+-
+-        let session = Arc::new(WorkloadIdentitySession::new(config)?);
+-        *entry = Some(WorkloadIdentitySessionEntry {
+-            fingerprint,
+-            session: Arc::downgrade(&session),
+-        });
+-        Ok(session)
+-    }
+-}
+-
+-fn process_registry() -> &'static WorkloadIdentitySessionRegistry {
+-    static REGISTRY: OnceLock<WorkloadIdentitySessionRegistry> = OnceLock::new();
+-    REGISTRY.get_or_init(WorkloadIdentitySessionRegistry::default)
+-}
+-
+-pub(super) struct WorkloadIdentityExternalAuth {
+-    observed_token_version: AtomicU64,
+-    session: Arc<WorkloadIdentitySession>,
+-}
+-
+-impl WorkloadIdentityExternalAuth {
+-    pub(super) fn from_process_config(
+-        auth_config: &AuthConfig,
+-    ) -> Result<Option<Self>, WorkloadIdentitySessionError> {
+-        let registry = process_registry();
+-        resolve_config(
+-            auth_config
+-                .chatgpt_base_url
+-                .as_deref()
+-                .unwrap_or("https://chatgpt.com/backend-api"),
+-            ProcessEnvironment::read(),
+-            auth_config.is_login_method_allowed(ForcedLoginMethod::Chatgpt),
+-            auth_config.auth_route_config.clone(),
+-        )?
+-        .map(|config| Self::from_config_with_registry(config, registry))
+-        .transpose()
+-    }
+-
+-    fn from_config_with_registry(
+-        config: WorkloadIdentitySessionConfig,
+-        registry: &WorkloadIdentitySessionRegistry,
+-    ) -> Result<Self, WorkloadIdentitySessionError> {
+-        Ok(Self {
+-            observed_token_version: AtomicU64::new(0),
+-            session: registry.session(config)?,
+-        })
+-    }
+-
+-    async fn build_validated_auth(
+-        &self,
+-        token: WorkloadIdentityToken,
+-        previous_account_id: Option<&str>,
+-    ) -> std::io::Result<CodexAuth> {
+-        let token_version = token.version();
+-        let result = self.validate_auth(&token, previous_account_id);
+-        if result.is_err() {
+-            self.session
+-                .exchange
+-                .invalidate_if_current(token_version)
+-                .await;
+-        }
+-        let auth = result?;
+-        self.observed_token_version
+-            .store(token_version, Ordering::Release);
+-        Ok(auth)
+-    }
+-
+-    fn validate_auth(
+-        &self,
+-        token: &WorkloadIdentityToken,
+-        previous_account_id: Option<&str>,
+-    ) -> std::io::Result<CodexAuth> {
+-        let auth = CodexAuth::from_external_chatgpt_tokens(
+-            &token.access_token,
+-            &token.chatgpt_account_id,
+-            token.chatgpt_plan_type.as_deref(),
+-        )
+-        .map_err(|_| std::io::Error::other(WorkloadIdentityError::InvalidExchangeResponse))?;
+-        if auth.get_chatgpt_user_id().as_deref() != Some(token.user_id.as_str()) {
+-            return Err(std::io::Error::other(
+-                WorkloadIdentityError::InvalidExchangeResponse,
+-            ));
+-        }
+-        self.session
+-            .accept_subject(token, previous_account_id)
+-            .map_err(std::io::Error::other)?;
+-        Ok(auth)
+-    }
+-}
+-
+-impl ExternalAuth for WorkloadIdentityExternalAuth {
+-    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+-        Box::pin(async move {
+-            let token = self
+-                .session
+-                .exchange
+-                .resolve()
+-                .await
+-                .map_err(std::io::Error::other)?;
+-            self.build_validated_auth(token, /*previous_account_id*/ None)
+-                .await
+-        })
+-    }
+-
+-    fn refresh(&self, context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+-        Box::pin(async move {
+-            let observed_version = self.observed_token_version.load(Ordering::Acquire);
+-            let token = self
+-                .session
+-                .exchange
+-                .refresh(observed_version)
+-                .await
+-                .map_err(std::io::Error::other)?;
+-            self.build_validated_auth(token, context.previous_account_id.as_deref())
+-                .await
+-        })
+-    }
+-
+-    fn classify_error(&self, error: std::io::Error) -> RefreshTokenError {
+-        if let Some(WorkloadIdentityError::Policy(denied)) = error
+-            .get_ref()
+-            .and_then(|source| source.downcast_ref::<WorkloadIdentityError>())
+-        {
+-            return RefreshTokenError::Policy(*denied);
+-        }
+-        if error
+-            .get_ref()
+-            .and_then(|source| source.downcast_ref::<WorkloadIdentityError>())
+-            .is_some_and(WorkloadIdentityError::is_transient)
+-        {
+-            return RefreshTokenError::Transient(error);
+-        }
+-
+-        RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+-            RefreshTokenFailedReason::Other,
+-            error.to_string(),
+-        ))
+-    }
+-}
+-
+-#[cfg(test)]
+-#[path = "workload_identity_tests.rs"]
+-mod tests;
+diff --git a/codex-rs/login/src/lib.rs b/codex-rs/login/src/lib.rs
+index abbbf1d8977e4efe31cf17e561a76a9e1bd76e0d..f914eeadf2affbf8cdad542f8b9cadefcf147aba 100644
+--- a/codex-rs/login/src/lib.rs
++++ b/codex-rs/login/src/lib.rs
+@@ -7,30 +7,12 @@ pub use auth::WorkspaceRoutingRequest;
+ pub use auth::WorkspaceRoutingResolver;
+ pub use auth::WorkspaceRoutingSession;
+ 
+-mod callback_params;
+-mod device_code_auth;
+ mod gateway_auth;
+ mod oauth;
+ mod outbound_proxy;
+-mod pkce;
+-mod server;
+-mod success_page;
+ 
+-pub use callback_params::LoginCallbackResult;
+-pub use callback_params::LoginOnboardingEntrypoint;
+ pub use codex_config::types::AuthCredentialsStoreMode;
+ pub use codex_http_client::BuildCustomCaTransportError as BuildLoginHttpClientError;
+-pub use device_code_auth::DeviceCode;
+-pub use device_code_auth::complete_device_code_login;
+-pub use device_code_auth::request_device_code;
+-pub use device_code_auth::run_device_code_login;
+-pub use server::LoginServer;
+-pub use server::ServerOptions;
+-pub use server::ShutdownHandle;
+-pub use server::run_login_server;
+-pub use success_page::CODEX_OPEN_APP_URL;
+-pub use success_page::LoginSuccessPage;
+-pub use success_page::LoginSuccessPageBrand;
+ 
+ pub use auth::AgentIdentityAuthPolicy;
+ pub use auth::AuthChangeState;

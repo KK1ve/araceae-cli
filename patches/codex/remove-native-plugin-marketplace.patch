@@ -1,0 +1,601 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Sat, 17 Oct 2026 13:09:13 +0800
+Subject: [PATCH] Remove native plugin and marketplace entrypoints and loading
+
+---
+ .../src/protocol/common.rs                    |  81 -------------
+ codex-rs/app-server/src/extensions.rs         |   2 +-
+ codex-rs/app-server/src/message_processor.rs  | 103 +---------------
+ codex-rs/app-server/src/request_processors.rs |  73 ------------
+ codex-rs/core-plugins/src/manager.rs          | 112 +-----------------
+ codex-rs/core/src/config/mod.rs               |   4 +-
+ 6 files changed, 6 insertions(+), 369 deletions(-)
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+index d3fef8a57298a93d9a5d884628b5eced1678f349..c199109d08308c8f621ea2f0e675e82cc96fadb2 100644
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -906,77 +906,6 @@ client_request_definitions! {
+         serialization: global_shared_read("config"),
+         response: v2::HooksListResponse,
+     },
+-    MarketplaceAdd => "marketplace/add" {
+-        params: v2::MarketplaceAddParams,
+-        serialization: global("config"),
+-        response: v2::MarketplaceAddResponse,
+-    },
+-    MarketplaceRemove => "marketplace/remove" {
+-        params: v2::MarketplaceRemoveParams,
+-        serialization: global("config"),
+-        response: v2::MarketplaceRemoveResponse,
+-    },
+-    MarketplaceUpgrade => "marketplace/upgrade" {
+-        params: v2::MarketplaceUpgradeParams,
+-        serialization: global("config"),
+-        response: v2::MarketplaceUpgradeResponse,
+-    },
+-    PluginList => "plugin/list" {
+-        params: v2::PluginListParams,
+-        serialization: None,
+-        response: v2::PluginListResponse,
+-    },
+-    #[experimental("plugin/search")]
+-    PluginSearch => "plugin/search" {
+-        params: v2::PluginSearchParams,
+-        serialization: None,
+-        response: v2::PluginSearchResponse,
+-    },
+-    PluginInstalled => "plugin/installed" {
+-        params: v2::PluginInstalledParams,
+-        serialization: None,
+-        response: v2::PluginInstalledResponse,
+-    },
+-    PluginReconcile => "plugin/reconcile" {
+-        params: v2::PluginReconcileParams,
+-        serialization: None,
+-        response: v2::PluginReconcileResponse,
+-    },
+-    PluginRead => "plugin/read" {
+-        params: v2::PluginReadParams,
+-        serialization: None,
+-        response: v2::PluginReadResponse,
+-    },
+-    PluginSkillRead => "plugin/skill/read" {
+-        params: v2::PluginSkillReadParams,
+-        serialization: global("config"),
+-        response: v2::PluginSkillReadResponse,
+-    },
+-    PluginShareSave => "plugin/share/save" {
+-        params: v2::PluginShareSaveParams,
+-        serialization: global("config"),
+-        response: v2::PluginShareSaveResponse,
+-    },
+-    PluginShareUpdateTargets => "plugin/share/updateTargets" {
+-        params: v2::PluginShareUpdateTargetsParams,
+-        serialization: global("config"),
+-        response: v2::PluginShareUpdateTargetsResponse,
+-    },
+-    PluginShareList => "plugin/share/list" {
+-        params: v2::PluginShareListParams,
+-        serialization: global("config"),
+-        response: v2::PluginShareListResponse,
+-    },
+-    PluginShareCheckout => "plugin/share/checkout" {
+-        params: v2::PluginShareCheckoutParams,
+-        serialization: global("config"),
+-        response: v2::PluginShareCheckoutResponse,
+-    },
+-    PluginShareDelete => "plugin/share/delete" {
+-        params: v2::PluginShareDeleteParams,
+-        serialization: global("config"),
+-        response: v2::PluginShareDeleteResponse,
+-    },
+     AppsRead => "app/read" {
+         params: v2::AppsReadParams,
+         serialization: None,
+@@ -1044,16 +973,6 @@ client_request_definitions! {
+         serialization: global("config"),
+         response: v2::SkillsConfigWriteResponse,
+     },
+-    PluginInstall => "plugin/install" {
+-        params: v2::PluginInstallParams,
+-        serialization: global("config"),
+-        response: v2::PluginInstallResponse,
+-    },
+-    PluginUninstall => "plugin/uninstall" {
+-        params: v2::PluginUninstallParams,
+-        serialization: global("config"),
+-        response: v2::PluginUninstallResponse,
+-    },
+     TurnStart => "turn/start" {
+         params: v2::TurnStartParams,
+         inspect_params: true,
+diff --git a/codex-rs/app-server/src/extensions.rs b/codex-rs/app-server/src/extensions.rs
+index 7eca2565535a6df135335624c15bc8d7e95c311a..ec0c67f52fd7d9c59708b2fcba562ed85ab2c5ee 100644
+--- a/codex-rs/app-server/src/extensions.rs
++++ b/codex-rs/app-server/src/extensions.rs
+@@ -94,7 +94,7 @@ pub(crate) fn thread_extensions(
+     codex_guardian_v2::install(&mut builder, auth_manager.clone(), thread_manager);
+     codex_memories_extension::install(&mut builder, codex_otel::global());
+     codex_mcp_extension::install(&mut builder);
+-    codex_mcp_extension::install_plugins(&mut builder, environment_manager);
++    let _ = environment_manager;
+     codex_web_search_extension::install(&mut builder, auth_manager.clone());
+     codex_image_generation_extension::install(&mut builder, auth_manager, |config: &Config| {
+         Some(config.codex_home.clone())
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 0da30b82753669669f3736487ba6acb0d9a87ada..08b1f2510f7dc64ab3db2ca066852a8ee7de7276 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -23,7 +23,6 @@ use crate::outgoing_message::ConnectionId;
+ use crate::outgoing_message::ConnectionRequestId;
+ use crate::outgoing_message::OutgoingMessageSender;
+ use crate::outgoing_message::RequestContext;
+-use crate::plugin_config_reload;
+ use crate::plugin_config_reload::PluginStartupConfig;
+ use crate::request_processors::AccountRequestProcessor;
+ use crate::request_processors::AppsRequestProcessor;
+@@ -35,11 +34,9 @@ use crate::request_processors::FeedbackRequestProcessor;
+ use crate::request_processors::FsRequestProcessor;
+ use crate::request_processors::GitRequestProcessor;
+ use crate::request_processors::InitializeRequestProcessor;
+-use crate::request_processors::MarketplaceRequestProcessor;
+ use crate::request_processors::McpEventStreamReady;
+ use crate::request_processors::McpEventStreams;
+ use crate::request_processors::McpRequestProcessor;
+-use crate::request_processors::PluginRequestProcessor;
+ use crate::request_processors::ProcessExecRequestProcessor;
+ use crate::request_processors::ProjectRequestProcessor;
+ use crate::request_processors::SearchRequestProcessor;
+@@ -157,9 +154,7 @@ pub(crate) struct MessageProcessor {
+     fs_processor: FsRequestProcessor,
+     git_processor: GitRequestProcessor,
+     initialize_processor: InitializeRequestProcessor,
+-    marketplace_processor: MarketplaceRequestProcessor,
+     mcp_processor: McpRequestProcessor,
+-    plugin_processor: PluginRequestProcessor,
+     project_processor: ProjectRequestProcessor,
+     search_processor: SearchRequestProcessor,
+     thread_goal_processor: ThreadGoalRequestProcessor,
+@@ -394,14 +389,6 @@ impl MessageProcessor {
+             thread_manager.clone(),
+             analytics_events_client.clone(),
+         );
+-        let on_effective_plugins_changed =
+-            crate::effective_plugin_change::effective_plugins_changed_callback(
+-                auth_manager.clone(),
+-                Arc::clone(&thread_manager),
+-                config_manager.clone(),
+-                config_processor.clone(),
+-                request_serialization_queues.clone(),
+-            );
+         let account_processor = AccountRequestProcessor::new(
+             auth_manager.clone(),
+             Arc::clone(&thread_manager),
+@@ -453,8 +440,6 @@ impl MessageProcessor {
+             rpc_transport,
+             Arc::clone(&user_verification),
+         );
+-        let marketplace_processor =
+-            MarketplaceRequestProcessor::new(config_manager.clone(), Arc::clone(&thread_manager));
+         let mcp_processor = McpRequestProcessor::new(
+             auth_manager.clone(),
+             Arc::clone(&thread_manager),
+@@ -463,14 +448,6 @@ impl MessageProcessor {
+             config_manager.clone(),
+             account_processor.clone(),
+         );
+-        let plugin_processor = PluginRequestProcessor::new(
+-            auth_manager.clone(),
+-            Arc::clone(&thread_manager),
+-            outgoing.clone(),
+-            analytics_events_client.clone(),
+-            config_manager.clone(),
+-            on_effective_plugins_changed,
+-        );
+         let search_processor = SearchRequestProcessor::new(outgoing.clone());
+         let thread_goal_processor = ThreadGoalRequestProcessor::new(
+             Arc::clone(&thread_manager),
+@@ -525,26 +502,7 @@ impl MessageProcessor {
+             Arc::clone(&skills_watcher),
+             turn_cost_worker.as_ref().map(TurnCostWorker::handle),
+         );
+-        if let Some(startup_config) = plugin_startup_tasks {
+-            // Keep plugin startup warmups aligned at app-server startup.
+-            let reload_config = match startup_config {
+-                PluginStartupConfig::Current => {
+-                    plugin_config_reload::for_cwd(config_manager.clone(), config.cwd.clone())
+-                }
+-                PluginStartupConfig::Defaults => {
+-                    plugin_config_reload::defaults(config_manager.clone())
+-                }
+-            };
+-            let on_effective_plugins_changed =
+-                plugin_processor.effective_plugins_changed_callback();
+-            thread_manager
+-                .plugins_manager()
+-                .maybe_start_plugin_startup_tasks_for_config(
+-                    &config.plugins_config_input(),
+-                    reload_config,
+-                    Some(on_effective_plugins_changed),
+-                );
+-        }
++        let _ = plugin_startup_tasks;
+         let external_agent_config_processor =
+             ExternalAgentConfigRequestProcessor::new(ExternalAgentConfigRequestProcessorArgs {
+                 outgoing: outgoing.clone(),
+@@ -588,9 +546,7 @@ impl MessageProcessor {
+             fs_processor,
+             git_processor,
+             initialize_processor,
+-            marketplace_processor,
+             mcp_processor,
+-            plugin_processor,
+             project_processor,
+             search_processor,
+             thread_goal_processor,
+@@ -1497,56 +1453,6 @@ impl MessageProcessor {
+             ClientRequest::HooksList { params, .. } => {
+                 self.catalog_processor.hooks_list(params).await
+             }
+-            ClientRequest::MarketplaceAdd { params, .. } => {
+-                self.marketplace_processor.marketplace_add(params).await
+-            }
+-            ClientRequest::MarketplaceRemove { params, .. } => {
+-                self.marketplace_processor.marketplace_remove(params).await
+-            }
+-            ClientRequest::MarketplaceUpgrade { params, .. } => {
+-                self.marketplace_processor.marketplace_upgrade(params).await
+-            }
+-            ClientRequest::PluginList { params, .. } => {
+-                self.plugin_processor.plugin_list(params).await
+-            }
+-            ClientRequest::PluginSearch { params, .. } => {
+-                self.plugin_processor.plugin_search(params).await
+-            }
+-            ClientRequest::PluginInstalled { params, .. } => {
+-                self.plugin_processor.plugin_installed(params).await
+-            }
+-            ClientRequest::PluginReconcile { params, .. } => {
+-                self.plugin_processor
+-                    .plugin_reconcile(
+-                        params,
+-                        self.config_processor.clone(),
+-                        &self.request_serialization_queues,
+-                    )
+-                    .await
+-            }
+-            ClientRequest::PluginRead { params, .. } => {
+-                self.plugin_processor.plugin_read(params).await
+-            }
+-            ClientRequest::PluginSkillRead { params, .. } => {
+-                self.plugin_processor.plugin_skill_read(params).await
+-            }
+-            ClientRequest::PluginShareSave { params, .. } => {
+-                self.plugin_processor.plugin_share_save(params).await
+-            }
+-            ClientRequest::PluginShareUpdateTargets { params, .. } => {
+-                self.plugin_processor
+-                    .plugin_share_update_targets(params)
+-                    .await
+-            }
+-            ClientRequest::PluginShareList { params, .. } => {
+-                self.plugin_processor.plugin_share_list(params).await
+-            }
+-            ClientRequest::PluginShareCheckout { params, .. } => {
+-                self.plugin_processor.plugin_share_checkout(params).await
+-            }
+-            ClientRequest::PluginShareDelete { params, .. } => {
+-                self.plugin_processor.plugin_share_delete(params).await
+-            }
+             ClientRequest::AppsRead { params, .. } => self.apps_processor.apps_read(params).await,
+             ClientRequest::AppsList { params, .. } => {
+                 self.apps_processor.apps_list(&request_id, params).await
+@@ -1559,13 +1465,6 @@ impl MessageProcessor {
+             ClientRequest::SkillsConfigWrite { params, .. } => {
+                 self.catalog_processor.skills_config_write(params).await
+             }
+-            ClientRequest::PluginInstall { params, .. } => {
+-                // Keep installation and auth setup state off the shared request dispatcher stack.
+-                Box::pin(self.plugin_processor.plugin_install(params)).await
+-            }
+-            ClientRequest::PluginUninstall { params, .. } => {
+-                self.plugin_processor.plugin_uninstall(params).await
+-            }
+             ClientRequest::ModelList { params, .. } => {
+                 self.catalog_processor.model_list(params).await
+             }
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index ff4fa4fb9f9eafa4c3a5631b4e5458be23aafb4f..35ef2accbc97263b7f994d0021dde6a38182649c 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -29,9 +29,6 @@ use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
+ use codex_app_server_protocol::AdditionalContextEntry;
+ use codex_app_server_protocol::AdditionalContextKind;
+ use codex_app_server_protocol::AppListUpdatedNotification;
+-use codex_app_server_protocol::AppSummary;
+-use codex_app_server_protocol::AppTemplateSummary;
+-use codex_app_server_protocol::AppTemplateUnavailableReason;
+ use codex_app_server_protocol::AppsInstalledParams;
+ use codex_app_server_protocol::AppsInstalledResponse;
+ use codex_app_server_protocol::AppsListParams;
+@@ -105,14 +102,6 @@ use codex_app_server_protocol::LoginAccountResponse;
+ use codex_app_server_protocol::LoginApiKeyParams;
+ use codex_app_server_protocol::LoginAppBrand;
+ use codex_app_server_protocol::LogoutAccountResponse;
+-use codex_app_server_protocol::MarketplaceAddParams;
+-use codex_app_server_protocol::MarketplaceAddResponse;
+-use codex_app_server_protocol::MarketplaceInterface;
+-use codex_app_server_protocol::MarketplaceRemoveParams;
+-use codex_app_server_protocol::MarketplaceRemoveResponse;
+-use codex_app_server_protocol::MarketplaceUpgradeErrorInfo;
+-use codex_app_server_protocol::MarketplaceUpgradeParams;
+-use codex_app_server_protocol::MarketplaceUpgradeResponse;
+ use codex_app_server_protocol::McpResourceReadParams;
+ use codex_app_server_protocol::McpResourceReadResponse;
+ use codex_app_server_protocol::McpServerOauthClientRegistration;
+@@ -132,41 +121,6 @@ use codex_app_server_protocol::ModelListResponse;
+ use codex_app_server_protocol::PermissionProfileListParams;
+ use codex_app_server_protocol::PermissionProfileListResponse;
+ use codex_app_server_protocol::PermissionProfileSummary;
+-use codex_app_server_protocol::PluginDetail;
+-use codex_app_server_protocol::PluginInstallParams;
+-use codex_app_server_protocol::PluginInstallResponse;
+-use codex_app_server_protocol::PluginInstalledParams;
+-use codex_app_server_protocol::PluginInstalledResponse;
+-use codex_app_server_protocol::PluginInterface;
+-use codex_app_server_protocol::PluginListMarketplaceKind;
+-use codex_app_server_protocol::PluginListParams;
+-use codex_app_server_protocol::PluginListResponse;
+-use codex_app_server_protocol::PluginMarketplaceEntry;
+-use codex_app_server_protocol::PluginReadParams;
+-use codex_app_server_protocol::PluginReadResponse;
+-use codex_app_server_protocol::PluginShareCheckoutParams;
+-use codex_app_server_protocol::PluginShareCheckoutResponse;
+-use codex_app_server_protocol::PluginShareContext;
+-use codex_app_server_protocol::PluginShareDeleteParams;
+-use codex_app_server_protocol::PluginShareDeleteResponse;
+-use codex_app_server_protocol::PluginShareDiscoverability;
+-use codex_app_server_protocol::PluginShareListItem;
+-use codex_app_server_protocol::PluginShareListParams;
+-use codex_app_server_protocol::PluginShareListResponse;
+-use codex_app_server_protocol::PluginSharePrincipal;
+-use codex_app_server_protocol::PluginSharePrincipalType;
+-use codex_app_server_protocol::PluginShareSaveParams;
+-use codex_app_server_protocol::PluginShareSaveResponse;
+-use codex_app_server_protocol::PluginShareTarget;
+-use codex_app_server_protocol::PluginShareUpdateDiscoverability;
+-use codex_app_server_protocol::PluginShareUpdateTargetsParams;
+-use codex_app_server_protocol::PluginShareUpdateTargetsResponse;
+-use codex_app_server_protocol::PluginSkillReadParams;
+-use codex_app_server_protocol::PluginSkillReadResponse;
+-use codex_app_server_protocol::PluginSource;
+-use codex_app_server_protocol::PluginSummary;
+-use codex_app_server_protocol::PluginUninstallParams;
+-use codex_app_server_protocol::PluginUninstallResponse;
+ use codex_app_server_protocol::RateLimitResetCredit;
+ use codex_app_server_protocol::RateLimitResetCreditStatus;
+ use codex_app_server_protocol::RateLimitResetCreditsSummary;
+@@ -181,7 +135,6 @@ use codex_app_server_protocol::SendAddCreditsNudgeEmailParams;
+ use codex_app_server_protocol::SendAddCreditsNudgeEmailResponse;
+ use codex_app_server_protocol::ServerNotification;
+ use codex_app_server_protocol::ServerRequestResolvedNotification;
+-use codex_app_server_protocol::SkillSummary;
+ use codex_app_server_protocol::SkillsConfigWriteParams;
+ use codex_app_server_protocol::SkillsConfigWriteResponse;
+ use codex_app_server_protocol::SkillsExtraRootsSetParams;
+@@ -371,29 +324,7 @@ use codex_core::windows_sandbox::WindowsSandboxLevelExt;
+ use codex_core::windows_sandbox::WindowsSandboxSetupMode as CoreWindowsSandboxSetupMode;
+ use codex_core::windows_sandbox::WindowsSandboxSetupRequest;
+ use codex_core::windows_sandbox::sandbox_setup_is_complete;
+-use codex_core_plugins::PluginInstallError as CorePluginInstallError;
+-use codex_core_plugins::PluginInstallRequest;
+-use codex_core_plugins::PluginReadRequest;
+-use codex_core_plugins::PluginUninstallError as CorePluginUninstallError;
+ use codex_core_plugins::PluginsManager;
+-use codex_core_plugins::loader::load_plugin_apps;
+-use codex_core_plugins::manifest::PluginManifestInterface;
+-use codex_core_plugins::marketplace::MarketplaceError;
+-use codex_core_plugins::marketplace::MarketplacePluginSource;
+-use codex_core_plugins::marketplace_add::MarketplaceAddError;
+-use codex_core_plugins::marketplace_add::MarketplaceAddRequest;
+-use codex_core_plugins::marketplace_add::add_marketplace as add_marketplace_to_codex_home;
+-use codex_core_plugins::marketplace_remove::MarketplaceRemoveError;
+-use codex_core_plugins::marketplace_remove::MarketplaceRemoveRequest as CoreMarketplaceRemoveRequest;
+-use codex_core_plugins::marketplace_remove::remove_marketplace;
+-use codex_core_plugins::remote::RemoteMarketplace;
+-use codex_core_plugins::remote::RemoteMarketplaceSource;
+-use codex_core_plugins::remote::RemotePluginCatalogError;
+-use codex_core_plugins::remote::RemotePluginDetail as RemoteCatalogPluginDetail;
+-use codex_core_plugins::remote::RemotePluginServiceConfig;
+-use codex_core_plugins::remote::RemotePluginShareContext as RemoteCatalogPluginShareContext;
+-use codex_core_plugins::remote::RemotePluginShareSummary as RemoteCatalogPluginShareSummary;
+-use codex_core_plugins::remote::RemotePluginSummary as RemoteCatalogPluginSummary;
+ use codex_exec_server::EnvironmentManager;
+ use codex_exec_server::EnvironmentObservedStatus;
+ use codex_exec_server::LOCAL_ENVIRONMENT_ID;
+@@ -553,12 +484,10 @@ mod feedback_thread_index;
+ mod fs_processor;
+ mod git_processor;
+ mod initialize_processor;
+-mod marketplace_processor;
+ mod mcp_event_stream;
+ mod mcp_processor;
+ mod memory_status;
+ mod persisted_resume_settings;
+-mod plugins;
+ mod process_exec_processor;
+ mod projects;
+ mod rollout;
+@@ -586,11 +515,9 @@ pub(crate) use feedback_processor::FeedbackRequestProcessor;
+ pub(crate) use fs_processor::FsRequestProcessor;
+ pub(crate) use git_processor::GitRequestProcessor;
+ pub(crate) use initialize_processor::InitializeRequestProcessor;
+-pub(crate) use marketplace_processor::MarketplaceRequestProcessor;
+ pub(crate) use mcp_event_stream::McpEventStreamReady;
+ pub(crate) use mcp_event_stream::McpEventStreams;
+ pub(crate) use mcp_processor::McpRequestProcessor;
+-pub(crate) use plugins::PluginRequestProcessor;
+ pub(crate) use process_exec_processor::ProcessExecRequestProcessor;
+ pub(crate) use projects::ProjectRequestProcessor;
+ pub(crate) use search::SearchRequestProcessor;
+diff --git a/codex-rs/core-plugins/src/manager.rs b/codex-rs/core-plugins/src/manager.rs
+index d4411b50da9f459bd8ba267b9c785247c131312d..0c674211cb12668b6a2f7b4a46787e06b4a52724 100644
+--- a/codex-rs/core-plugins/src/manager.rs
++++ b/codex-rs/core-plugins/src/manager.rs
+@@ -18,7 +18,6 @@ use crate::http_client_selector::HttpClientSelector;
+ use crate::installed_marketplaces::installed_marketplace_roots_from_layer_stack;
+ use crate::is_openai_curated_marketplace_name;
+ use crate::loaded_cache_metrics;
+-use crate::loaded_cache_metrics::RequestOutcome;
+ use crate::loader::PluginHookLoadOutcome;
+ use crate::loader::TargetCuratedMarketplace;
+ use crate::loader::configured_curated_plugin_ids_from_codex_home;
+@@ -28,8 +27,6 @@ use crate::loader::load_plugin_hooks;
+ use crate::loader::load_plugin_hooks_from_layer_stack;
+ use crate::loader::load_plugin_mcp_servers_from_manifest_with_format;
+ use crate::loader::load_plugin_skill_inventory;
+-use crate::loader::load_plugins_from_layer_stack;
+-use crate::loader::log_plugin_load_errors;
+ use crate::loader::materialize_marketplace_plugin_source;
+ use crate::loader::plugin_capability_summary_from_root;
+ use crate::loader::plugin_is_eligible_for_target_marketplace;
+@@ -76,7 +73,6 @@ use crate::remote_legacy::RemotePluginMutationError;
+ use crate::remote_plugin_id_resolver::RemoteInstalledPluginsSnapshot;
+ use crate::remote_plugin_id_resolver::RemotePluginIdResolver;
+ use crate::remote_plugin_id_resolver::persisted_remote_plugin_id_for_installation;
+-use crate::skill_snapshots::new_plugin_skill_snapshots;
+ use crate::startup_sync::OPENAI_PLUGINS_GIT_URL;
+ use crate::startup_sync::curated_plugins_api_marketplace_path;
+ use crate::startup_sync::curated_plugins_repo_path;
+@@ -819,112 +815,8 @@ impl PluginsManager {
+         )
+     )]
+     pub async fn plugins_for_config(&self, config: &PluginsConfigInput) -> PluginLoadOutcome {
+-        if !config.plugins_enabled {
+-            return PluginLoadOutcome::default();
+-        }
+-
+-        // Both the semaphore wait and skill loading can outlive the auth state captured at the
+-        // start of this load. Account switches require a restart, so discard those passes;
+-        // same-account revisions also cover ordinary token refreshes, where returning no plugins
+-        // is wrong, so retry those instead.
+-        let auth_change_receiver = self.auth_manager.auth_change_receiver();
+-        let mut cache_outcome = RequestOutcome::Hit;
+-
+-        loop {
+-            let auth_revision = *auth_change_receiver.borrow();
+-            let remote_global_catalog_active = self.remote_global_catalog_active(config);
+-            let auth = self.auth_manager.auth_cached();
+-            let auth_mode = auth.as_ref().map(CodexAuth::api_auth_mode);
+-            let auth_identity = RemoteInstalledPluginsAuthIdentity::from_auth(auth.as_ref());
+-            let cache_key = PluginLoadCacheKey::from_config(
+-                config,
+-                self.codex_home.as_path(),
+-                remote_global_catalog_active,
+-                auth_identity.clone(),
+-            );
+-            if let Some(plugins) = self.cached_loaded_plugins(&cache_key) {
+-                let outcome = self.resolve_loaded_plugins_for_auth(plugins, auth_mode);
+-                if *auth_change_receiver.borrow() == auth_revision {
+-                    cache_outcome.record();
+-                    return outcome;
+-                }
+-                if !self.remote_installed_plugins_auth_is_current(&auth_identity) {
+-                    return PluginLoadOutcome::default();
+-                }
+-                continue;
+-            }
+-
+-            if matches!(cache_outcome, RequestOutcome::Hit) {
+-                cache_outcome = RequestOutcome::HitAfterWait;
+-            }
+-            let wait_started = Instant::now();
+-            let load_permit = self.loaded_plugins_load_semaphore.acquire().await;
+-            loaded_cache_metrics::record_duration(
+-                loaded_cache_metrics::WAIT_DURATION,
+-                wait_started.elapsed(),
+-            );
+-            let Ok(_load_permit) = load_permit else {
+-                warn!("plugin load semaphore closed");
+-                return PluginLoadOutcome::default();
+-            };
+-            if *auth_change_receiver.borrow() != auth_revision {
+-                if !self.remote_installed_plugins_auth_is_current(&auth_identity) {
+-                    return PluginLoadOutcome::default();
+-                }
+-                continue;
+-            }
+-            if let Some(plugins) = self.cached_loaded_plugins(&cache_key) {
+-                let outcome = self.resolve_loaded_plugins_for_auth(plugins, auth_mode);
+-                if *auth_change_receiver.borrow() == auth_revision {
+-                    cache_outcome.record();
+-                    return outcome;
+-                }
+-                if !self.remote_installed_plugins_auth_is_current(&auth_identity) {
+-                    return PluginLoadOutcome::default();
+-                }
+-                continue;
+-            }
+-            let cache_generation = self.loaded_plugins_cache_generation();
+-            let plugin_skill_snapshots = new_plugin_skill_snapshots();
+-            cache_outcome = RequestOutcome::Load;
+-            let load_started = Instant::now();
+-            let plugins = load_plugins_from_layer_stack(
+-                &config.config_layer_stack,
+-                &config.plugins,
+-                self.remote_installed_plugins_snapshot(),
+-                &self.store,
+-                Some(&plugin_skill_snapshots),
+-                self.restriction_product,
+-                remote_global_catalog_active,
+-                self.skill_root_loader.as_ref(),
+-            )
+-            .await;
+-            loaded_cache_metrics::record_duration(
+-                loaded_cache_metrics::LOAD_DURATION,
+-                load_started.elapsed(),
+-            );
+-            if *auth_change_receiver.borrow() != auth_revision {
+-                if !self.remote_installed_plugins_auth_is_current(&auth_identity) {
+-                    return PluginLoadOutcome::default();
+-                }
+-                continue;
+-            }
+-            log_plugin_load_errors(&plugins);
+-            self.cache_loaded_plugins_if_current(
+-                cache_generation,
+-                cache_key,
+-                plugins.clone(),
+-                plugin_skill_snapshots,
+-            );
+-            let outcome = self.resolve_loaded_plugins_for_auth(plugins, auth_mode);
+-            if *auth_change_receiver.borrow() == auth_revision {
+-                cache_outcome.record();
+-                return outcome;
+-            }
+-            if !self.remote_installed_plugins_auth_is_current(&auth_identity) {
+-                return PluginLoadOutcome::default();
+-            }
+-        }
++        let _ = config;
++        PluginLoadOutcome::default()
+     }
+ 
+     fn resolve_loaded_plugins_for_auth(
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index 96ad8bab38d3de094ab7e0cd087c89b422890109..46e43dfc1975874273011848140830ae84ff5278 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -1769,8 +1769,8 @@ impl Config {
+             self.config_layer_stack.clone(),
+             self.plugins.clone(),
+             self.model_provider_id.clone(),
+-            self.features.enabled(Feature::Plugins),
+-            self.features.enabled(Feature::RemotePlugin),
++            false,
++            false,
+             self.chatgpt_base_url.clone(),
+             self.http_client_factory(),
+             self.apps_mcp_product_sku.clone(),

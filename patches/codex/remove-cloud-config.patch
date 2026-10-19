@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Sat, 17 Oct 2026 13:00:33 +0800
+Subject: [PATCH] Load runtime policy exclusively from local configuration
+
+---
+ codex-rs/Cargo.lock                       |  1 -
+ codex-rs/app-server/Cargo.toml            |  1 -
+ codex-rs/app-server/src/config_manager.rs | 29 ++++-------------------
+ 3 files changed, 4 insertions(+), 27 deletions(-)
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 0c649019af7c83049fe43f7e8a62d6d129ad93af..a2bd87f473ebb58b53cba83d202777da02571c4b 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -2105,7 +2105,6 @@ dependencies = [
+  "codex-aws-auth",
+  "codex-backend-client",
+  "codex-chatgpt",
+- "codex-cloud-config",
+  "codex-code-mode",
+  "codex-config",
+  "codex-connectors",
+diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+index 0ef30505cc5e78102d8bfb64e18adaf0e0ad008b..5be87eef07ad4257aec6ad966004266b616693e7 100644
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -38,7 +38,6 @@ codex-analytics = { workspace = true }
+ codex-agent-extension = { workspace = true }
+ codex-arg0 = { workspace = true }
+ codex-aws-auth = { workspace = true }
+-codex-cloud-config = { workspace = true }
+ codex-code-mode = { workspace = true }
+ codex-config = { workspace = true }
+ codex-network-proxy = { workspace = true }
+diff --git a/codex-rs/app-server/src/config_manager.rs b/codex-rs/app-server/src/config_manager.rs
+index d5f2c2b89a6d64d9331b0c9c045a65cd5b5e527c..c67239a02627c03e34f2cefe2c696f31dedf6264 100644
+--- a/codex-rs/app-server/src/config_manager.rs
++++ b/codex-rs/app-server/src/config_manager.rs
+@@ -1,5 +1,4 @@
+ use codex_arg0::Arg0DispatchPaths;
+-use codex_cloud_config::cloud_config_bundle_loader;
+ use codex_config::CloudConfigBundleLoader;
+ use codex_config::ConfigLayerStack;
+ use codex_config::LoaderOverrides;
+@@ -75,7 +74,7 @@ impl ConfigManager {
+         cli_overrides: Vec<(String, TomlValue)>,
+         loader_overrides: LoaderOverrides,
+         strict_config: bool,
+-        cloud_config_bundle: CloudConfigBundleLoader,
++        _cloud_config_bundle: CloudConfigBundleLoader,
+         arg0_paths: Arg0DispatchPaths,
+         thread_config_loader: Arc<dyn ThreadConfigLoader>,
+     ) -> Self {
+@@ -86,7 +85,7 @@ impl ConfigManager {
+             runtime_feature_enablement: Arc::new(RwLock::new(BTreeMap::new())),
+             loader_overrides,
+             strict_config,
+-            cloud_config_bundle: Arc::new(RwLock::new(cloud_config_bundle)),
++            cloud_config_bundle: Arc::new(RwLock::new(CloudConfigBundleLoader::default())),
+             arg0_paths,
+             thread_config_loader,
+             network_policy,
+@@ -143,28 +142,8 @@ impl ConfigManager {
+         chatgpt_base_url: String,
+         http_client_factory: codex_http_client::HttpClientFactory,
+     ) {
+-        let endpoint = codex_backend_client::Client::new(
+-            chatgpt_base_url.clone(),
+-            http_client_factory.clone(),
+-        )
+-        .config_bundle_url();
+-        let http_client_factory = http_client_factory.with_network_policy(
+-            self.local_network_policy
+-                .policy()
+-                .restrict_to_endpoints(endpoint.parse().into_iter().collect()),
+-        );
+-        let loader = cloud_config_bundle_loader(
+-            auth_manager,
+-            chatgpt_base_url,
+-            self.codex_home.clone(),
+-            http_client_factory,
+-        );
+-        if let Ok(mut guard) = self.cloud_config_bundle.write() {
+-            guard.retire_ema_policy();
+-            *guard = loader;
+-        } else {
+-            warn!("failed to update cloud config bundle loader");
+-        }
++        let _ = (auth_manager, chatgpt_base_url, http_client_factory);
++        self.clear_cloud_config_bundle_loader();
+     }
+ 
+     pub(crate) fn clear_cloud_config_bundle_loader(&self) {

@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Sat, 17 Oct 2026 13:25:36 +0800
+Subject: [PATCH] Require explicit provider support for remote compaction
+
+---
+ codex-rs/model-provider/src/capabilities.rs | 12 +-----------
+ 1 file changed, 1 insertion(+), 11 deletions(-)
+
+diff --git a/codex-rs/model-provider/src/capabilities.rs b/codex-rs/model-provider/src/capabilities.rs
+index f8e8891fb048278e9d890cff7124910cb9be0e32..ea6e5fc9e1e4d74d8a3eceec673cf22ee785434b 100644
+--- a/codex-rs/model-provider/src/capabilities.rs
++++ b/codex-rs/model-provider/src/capabilities.rs
+@@ -1,6 +1,5 @@
+ //! Provider capability defaults and resolution of custom provider overrides.
+ 
+-use codex_api::is_azure_responses_provider;
+ use codex_model_provider_info::ModelProviderInfo;
+ use codex_model_provider_info::RemoteCompactionSupport;
+ 
+@@ -29,16 +28,7 @@ impl Default for ProviderCapabilities {
+ 
+ impl ProviderCapabilities {
+     pub(crate) fn from_config(info: &ModelProviderInfo) -> Self {
+-        let defaults = Self {
+-            remote_compaction: if info.is_openai()
+-                || is_azure_responses_provider(&info.name, info.base_url.as_deref())
+-            {
+-                RemoteCompactionSupport::V2
+-            } else {
+-                RemoteCompactionSupport::Unsupported
+-            },
+-            ..Self::default()
+-        };
++        let defaults = Self::default();
+         let overrides = info.capabilities.unwrap_or_default();
+         Self {
+             external_web_access: overrides

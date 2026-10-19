@@ -1,0 +1,145 @@
+name: Codex runtime
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patches:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - run: python scripts/patches.py check
+      - run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+  build:
+    name: Build ${{ matrix.platform }} amd64
+    needs: patches
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - platform: windows
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - platform: macos
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    env:
+      BUILD_PROFILE: release
+      BUILD_TARGET: ${{ matrix.target }}
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Configure Git for Windows paths
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - name: Free Linux runner disk space for Rust builds
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+      - name: Install Linux build libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libcap-dev libssl-dev libasound2-dev clang cmake ninja-build pkg-config protobuf-compiler strace
+      - name: Install pinned tooling
+        run: |
+          npm install --global pnpm@11.13.0
+          pnpm install --frozen-lockfile
+          python - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          lock = json.loads(Path('manifests/runtime-source-lock.json').read_text())
+          subprocess.run(['rustup', 'toolchain', 'install', lock['rust_toolchain'], '--profile', 'minimal', '--component', 'rustfmt', '--target', os.environ['BUILD_TARGET']], check=True)
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as output:
+              output.write('RUSTUP_TOOLCHAIN=' + lock['rust_toolchain'] + '\n')
+          PY
+      - name: Configure MSVC environment
+        if: runner.os == 'Windows'
+        uses: ./codex/.github/actions/setup-msvc-env
+        with:
+          target: ${{ matrix.target }}
+      - name: Configure SQLite for Windows amd64
+        if: runner.os == 'Windows'
+        run: echo 'LIBSQLITE3_FLAGS=SQLITE_DISABLE_INTRINSIC' >> "$GITHUB_ENV"
+      - name: Verify patch maintenance on the target platform
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Prepare the patched runtime source
+        run: |
+          python scripts/patches.py prepare
+          python scripts/patches.py apply
+          cargo fmt --manifest-path .worktrees/runtime/codex-rs/Cargo.toml -p araceae-codex-runtime -- --check
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: .worktrees/runtime/codex-rs -> ../../../.cache/cargo-target
+          key: ${{ matrix.target }}-${{ env.BUILD_PROFILE }}
+          cache-bin: false
+      - name: Build the patched runtime package
+        run: python scripts/build_runtime.py --target "$BUILD_TARGET" --profile "$BUILD_PROFILE"
+      - name: Verify the runtime package and model flows
+        run: |
+          python - <<'PY'
+          import subprocess, sys
+          from pathlib import Path
+          checksums = list(Path('dist').glob('*.sha256'))
+          if len(checksums) != 1:
+              raise SystemExit(f'Expected one runtime archive, found {len(checksums)}')
+          checksum = checksums[0]
+          archive = checksum.with_name(checksum.name.removesuffix('.sha256')).resolve()
+          command = [sys.executable, 'scripts/verify_runtime.py', '--archive', str(archive), '--e2e', '--report', 'artifacts/runtime-verification.json']
+          if sys.platform == 'linux':
+              command.extend(['--network-trace', 'artifacts/runtime-connect.log'])
+          subprocess.run(command, check=True)
+          PY
+      - name: Upload the runtime archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: araceae-${{ matrix.platform }}-amd64-${{ env.BUILD_PROFILE }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+      - name: Upload verification reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verification-${{ matrix.platform }}-amd64-${{ env.BUILD_PROFILE }}
+          if-no-files-found: ignore
+          retention-days: 30
+          path: |
+            artifacts/*-verification.json
+            artifacts/runtime-connect.log

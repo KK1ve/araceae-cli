@@ -1,0 +1,888 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Sat, 17 Oct 2026 13:04:08 +0800
+Subject: [PATCH] Remove remote control transport and protocol registration
+
+---
+ codex-rs/Cargo.lock                           |   9 --
+ .../src/precomputed_exports.rs                | 115 ++++++++++++++-
+ .../src/protocol/common.rs                    |  67 +++------
+ codex-rs/app-server-transport/Cargo.toml      |   9 --
+ codex-rs/app-server-transport/src/lib.rs      |  10 --
+ .../app-server-transport/src/transport/mod.rs |  11 --
+ codex-rs/app-server/src/in_process.rs         |   1 -
+ codex-rs/app-server/src/lib.rs                | 137 +-----------------
+ codex-rs/app-server/src/message_processor.rs  |  47 ------
+ codex-rs/app-server/src/notification_media.rs |   1 -
+ codex-rs/app-server/src/request_processors.rs |   2 -
+ codex-rs/app-server/src/transport.rs          |   8 -
+ codex-rs/runtime-cli/src/main.rs              |  17 ---
+ 13 files changed, 138 insertions(+), 296 deletions(-)
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index a2bd87f473ebb58b53cba83d202777da02571c4b..ca1255f58d60e84ec7f753815d9d923b7c4cd4f7 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -2320,27 +2320,19 @@ dependencies = [
+  "axum",
+  "base64 0.22.1",
+  "chrono",
+- "codex-api",
+  "codex-app-server-protocol",
+  "codex-config",
+  "codex-core",
+- "codex-http-client",
+  "codex-login",
+- "codex-model-provider",
+  "codex-protocol",
+- "codex-state",
+  "codex-uds",
+  "codex-utils-absolute-path",
+  "codex-utils-rustls-provider",
+  "codex-websocket-auth",
+- "codex-websocket-client",
+  "futures",
+- "gethostname",
+- "httpdate",
+  "libc",
+  "owo-colors",
+  "pretty_assertions",
+- "rand 0.9.3",
+  "serde",
+  "serde_json",
+  "sha2 0.10.9",
+@@ -2352,7 +2344,6 @@ dependencies = [
+  "tokio-util",
+  "tracing",
+  "url",
+- "uuid",
+ ]
+ 
+ [[package]]
+diff --git a/codex-rs/app-server-protocol/src/precomputed_exports.rs b/codex-rs/app-server-protocol/src/precomputed_exports.rs
+index 51af299a4620a5be7c7d4b1d524ad9acfc7f06b3..0b6e9f369d155a3c1cc91556852fe15e31ca8ef0 100644
+--- a/codex-rs/app-server-protocol/src/precomputed_exports.rs
++++ b/codex-rs/app-server-protocol/src/precomputed_exports.rs
+@@ -119,7 +119,120 @@ fn load_exports(export_set: ExportSet) -> Result<PrecomputedExports> {
+     };
+     let bytes = zstd::stream::decode_all(Cursor::new(compressed))
+         .context("decompress precomputed app-server protocol exports")?;
+-    serde_json::from_slice(&bytes).context("decode precomputed app-server protocol exports")
++    let mut exports: PrecomputedExports =
++        serde_json::from_slice(&bytes).context("decode precomputed app-server protocol exports")?;
++    let methods = BTreeMap::from([
++        ("ClientRequest", crate::ClientRequest::registered_methods()),
++        ("ServerRequest", crate::ServerRequest::registered_methods()),
++        (
++            "ServerNotification",
++            crate::ServerNotification::registered_methods(),
++        ),
++        (
++            "ServerNotificationEnvelope",
++            crate::ServerNotification::registered_methods(),
++        ),
++    ]);
++    for files in [&mut exports.json_schema, &mut exports.internal_json_schema] {
++        for contents in files.values_mut() {
++            let mut schema: serde_json::Value = serde_json::from_str(contents)?;
++            filter_schema_methods(&mut schema, &methods);
++            *contents = serde_json::to_string_pretty(&schema)? + "\n";
++        }
++    }
++    for (name, registered) in &methods {
++        let path = format!("{name}.ts");
++        if let Some(contents) = exports.typescript.get_mut(&path) {
++            *contents = filter_typescript_methods(contents, name, registered)?;
++        }
++    }
++    Ok(exports)
++}
++
++// The snapshots include optional product APIs. Derive the exported method surface
++// from the same macro invocations as the runtime dispatcher, without binary patches.
++fn filter_schema_methods(value: &mut serde_json::Value, methods: &BTreeMap<&str, Vec<String>>) {
++    if let Some(registered) = value
++        .get("title")
++        .and_then(|v| v.as_str())
++        .and_then(|name| methods.get(name))
++        && let Some(variants) = value.get_mut("oneOf").and_then(|v| v.as_array_mut())
++    {
++        variants.retain(|variant| {
++            variant
++                .pointer("/properties/method/enum/0")
++                .and_then(|v| v.as_str())
++                .is_none_or(|method| registered.iter().any(|name| name == method))
++        });
++    }
++    match value {
++        serde_json::Value::Object(object) => {
++            for child in object.values_mut() {
++                filter_schema_methods(child, methods);
++            }
++        }
++        serde_json::Value::Array(array) => {
++            for child in array {
++                filter_schema_methods(child, methods);
++            }
++        }
++        _ => {}
++    }
++}
++
++fn filter_typescript_methods(contents: &str, name: &str, registered: &[String]) -> Result<String> {
++    let prefix = format!("export type {name} =");
++    let (header, declaration) = contents
++        .split_once(&prefix)
++        .context("missing precomputed TypeScript protocol declaration")?;
++    let body = declaration
++        .trim()
++        .strip_suffix(';')
++        .context("unterminated precomputed TypeScript protocol declaration")?;
++    let (envelope, body) = if let Some((envelope, union)) = body.split_once(" & (") {
++        (
++            Some(envelope),
++            union
++                .strip_suffix(')')
++                .context("unterminated notification envelope")?,
++        )
++    } else {
++        (None, body)
++    };
++    let delimiter = " | { \"method\": ";
++    let mut retained = Vec::new();
++    for (index, member) in body.split(delimiter).enumerate() {
++        let member = if index == 0 {
++            member.to_owned()
++        } else {
++            format!("{{ \"method\": {member}")
++        };
++        let method = member
++            .strip_prefix(r#"{ "method": ""#)
++            .and_then(|rest| rest.split_once('\"').map(|(method, _)| method))
++            .context("unexpected precomputed TypeScript protocol union format")?;
++        if registered.iter().any(|name| name == method) {
++            retained.push(member);
++        }
++    }
++    if retained.is_empty() {
++        bail!("empty precomputed TypeScript protocol union {name}");
++    }
++    let body = retained.join(" | ");
++    let body = envelope.map_or_else(|| body.clone(), |envelope| format!("{envelope} & ({body})"));
++    let used: std::collections::HashSet<&str> = body
++        .split(|c: char| !c.is_alphanumeric() && c != '_')
++        .collect();
++    let header: String = header
++        .lines()
++        .filter(|line| {
++            line.strip_prefix("import type { ")
++                .and_then(|rest| rest.split_once(" }").map(|(name, _)| name))
++                .is_none_or(|name| used.contains(name))
++        })
++        .map(|line| format!("{line}\n"))
++        .collect();
++    Ok(format!("{header}{prefix} {body};\n"))
+ }
+ 
+ fn write_typescript_exports(
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+index b710f18f14e711a748318ee980bcdc4168a7d843..b7fecb5f13c2b6e52e669176f103b1ba05f5c5ed 100644
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -205,6 +205,13 @@ macro_rules! serialization_scope_expr {
+     };
+ }
+ 
++fn registered_wire_name(variant: &str, wire: &[&str]) -> String {
++    wire.first().map_or_else(
++        || format!("{}{}", variant[..1].to_ascii_lowercase(), &variant[1..]),
++        |name| (*name).to_owned(),
++    )
++}
++
+ /// Generates an `enum ClientRequest` where each variant is a request that the
+ /// client can send to the server. Each variant has associated `params` and
+ /// `response` types. Also generates a `export_client_responses()` function to
+@@ -242,6 +249,10 @@ macro_rules! client_request_definitions {
+         }
+ 
+         impl ClientRequest {
++            pub(crate) fn registered_methods() -> Vec<String> {
++                vec![$(registered_wire_name(stringify!($variant), &[$wire]),)*]
++            }
++
+             pub fn id(&self) -> &RequestId {
+                 match self {
+                     $(Self::$variant { request_id, .. } => request_id,)*
+@@ -1165,48 +1176,6 @@ client_request_definitions! {
+         serialization: global("config"),
+         response: v2::ExperimentalFeatureEnablementSetResponse,
+     },
+-    #[experimental("remoteControl/enable")]
+-    RemoteControlEnable => "remoteControl/enable" {
+-        params: #[serde(skip_serializing_if = "Option::is_none")] v2::NullableRemoteControlEnableParams,
+-        serialization: global("remote-control"),
+-        response: v2::RemoteControlEnableResponse,
+-    },
+-    #[experimental("remoteControl/disable")]
+-    RemoteControlDisable => "remoteControl/disable" {
+-        params: #[serde(skip_serializing_if = "Option::is_none")] v2::NullableRemoteControlDisableParams,
+-        serialization: global("remote-control"),
+-        response: v2::RemoteControlDisableResponse,
+-    },
+-    #[experimental("remoteControl/status/read")]
+-    RemoteControlStatusRead => "remoteControl/status/read" {
+-        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+-        serialization: global_shared_read("remote-control"),
+-        response: v2::RemoteControlStatusReadResponse,
+-    },
+-    #[experimental("remoteControl/pairing/start")]
+-    RemoteControlPairingStart => "remoteControl/pairing/start" {
+-        params: v2::RemoteControlPairingStartParams,
+-        serialization: global("remote-control-pairing"),
+-        response: v2::RemoteControlPairingStartResponse,
+-    },
+-    #[experimental("remoteControl/pairing/status")]
+-    RemoteControlPairingStatus => "remoteControl/pairing/status" {
+-        params: v2::RemoteControlPairingStatusParams,
+-        serialization: global_shared_read("remote-control-pairing"),
+-        response: v2::RemoteControlPairingStatusResponse,
+-    },
+-    #[experimental("remoteControl/client/list")]
+-    RemoteControlClientsList => "remoteControl/client/list" {
+-        params: v2::RemoteControlClientsListParams,
+-        serialization: global_shared_read("remote-control-clients"),
+-        response: v2::RemoteControlClientsListResponse,
+-    },
+-    #[experimental("remoteControl/client/revoke")]
+-    RemoteControlClientsRevoke => "remoteControl/client/revoke" {
+-        params: v2::RemoteControlClientsRevokeParams,
+-        serialization: global("remote-control-clients"),
+-        response: v2::RemoteControlClientsRevokeResponse,
+-    },
+     #[experimental("collaborationMode/list")]
+     /// Lists collaboration mode presets.
+     CollaborationModeList => "collaborationMode/list" {
+@@ -1554,6 +1523,10 @@ macro_rules! server_request_definitions {
+         }
+ 
+         impl ServerRequest {
++            pub(crate) fn registered_methods() -> Vec<String> {
++                vec![$(registered_wire_name(stringify!($variant), &[$($wire)?]),)*]
++            }
++
+             pub fn id(&self) -> &RequestId {
+                 match self {
+                     $(Self::$variant { request_id, .. } => request_id,)*
+@@ -1727,6 +1700,10 @@ macro_rules! server_notification_definitions {
+         }
+ 
+         impl ServerNotification {
++            pub(crate) fn registered_methods() -> Vec<String> {
++                vec![$(registered_wire_name(stringify!($variant), &[$($wire)?]),)*]
++            }
++
+             pub fn to_params(self) -> Result<serde_json::Value, serde_json::Error> {
+                 match self {
+                     $(Self::$variant(params) => serde_json::to_value(params),)*
+@@ -2019,7 +1996,6 @@ server_notification_definitions! {
+     GatewayOAuthChanged => "account/gatewayOAuth/changed" (v2::GatewayOAuthChangedNotification),
+     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
+     AppListUpdated => "app/list/updated" (v2::AppListUpdatedNotification),
+-    RemoteControlStatusChanged => "remoteControl/status/changed" (v2::RemoteControlStatusChangedNotification),
+     ExternalAgentConfigImportProgress => "externalAgentConfig/import/progress" (v2::ExternalAgentConfigImportProgressNotification),
+     ExternalAgentConfigImportCompleted => "externalAgentConfig/import/completed" (v2::ExternalAgentConfigImportCompletedNotification),
+     FsChanged => "fs/changed" (v2::FsChangedNotification),
+@@ -2068,10 +2044,7 @@ server_notification_definitions! {
+     WindowsWorldWritableWarning => "windows/worldWritableWarning" (v2::WindowsWorldWritableWarningNotification),
+     WindowsSandboxSetupCompleted => "windowsSandbox/setupCompleted" (v2::WindowsSandboxSetupCompletedNotification),
+ 
+-    #[serde(rename = "account/login/completed")]
+-    #[ts(rename = "account/login/completed")]
+-    #[strum(serialize = "account/login/completed")]
+-    AccountLoginCompleted(v2::AccountLoginCompletedNotification),
++    AccountLoginCompleted => "account/login/completed" (v2::AccountLoginCompletedNotification),
+ 
+ }
+ 
+diff --git a/codex-rs/app-server-transport/Cargo.toml b/codex-rs/app-server-transport/Cargo.toml
+index f78bfebe55d4920081a35999859a70f0212034d0..dce783088f8ac37982c90b245ca06e38ce64116f 100644
+--- a/codex-rs/app-server-transport/Cargo.toml
++++ b/codex-rs/app-server-transport/Cargo.toml
+@@ -13,8 +13,6 @@ doctest = false
+ workspace = true
+ 
+ [dependencies]
+-codex-http-client = { workspace = true }
+-codex-websocket-client = { workspace = true }
+ axum = { workspace = true, default-features = false, features = [
+     "http1",
+     "json",
+@@ -22,22 +20,16 @@ axum = { workspace = true, default-features = false, features = [
+     "ws",
+ ] }
+ base64 = { workspace = true }
+-codex-api = { workspace = true }
+ codex-app-server-protocol = { workspace = true }
+ codex-core = { workspace = true }
+ codex-login = { workspace = true }
+-codex-model-provider = { workspace = true }
+ codex-protocol = { workspace = true }
+-codex-state = { workspace = true }
+ codex-uds = { workspace = true }
+ codex-utils-absolute-path = { workspace = true }
+ codex-utils-rustls-provider = { workspace = true }
+ codex-websocket-auth = { workspace = true }
+ futures = { workspace = true }
+-gethostname = { workspace = true }
+-httpdate = { workspace = true }
+ owo-colors = { workspace = true, features = ["supports-colors"] }
+-rand = { workspace = true }
+ serde = { workspace = true, features = ["derive"] }
+ serde_json = { workspace = true }
+ sha2 = { workspace = true }
+@@ -52,7 +44,6 @@ tokio-tungstenite = { workspace = true }
+ tokio-util = { workspace = true }
+ tracing = { workspace = true, features = ["log"] }
+ url = { workspace = true }
+-uuid = { workspace = true, features = ["serde", "v7"] }
+ 
+ [target.'cfg(unix)'.dependencies]
+ libc = { workspace = true }
+diff --git a/codex-rs/app-server-transport/src/lib.rs b/codex-rs/app-server-transport/src/lib.rs
+index 7b91ece2175d66890c8765496d48ff67ef50e9fd..960d853fcba73496268aef59d3f6dfff564ea77e 100644
+--- a/codex-rs/app-server-transport/src/lib.rs
++++ b/codex-rs/app-server-transport/src/lib.rs
+@@ -23,21 +23,11 @@ pub use transport::AppServerTransportParseError;
+ pub use transport::CHANNEL_CAPACITY;
+ pub use transport::ConnectionOrigin;
+ pub use transport::DaemonShutdownAccess;
+-pub use transport::REMOTE_CONTROL_DISABLED_ENV_VAR;
+-pub use transport::RemoteControlDisabledByRequirements;
+-pub use transport::RemoteControlEnableError;
+-pub use transport::RemoteControlHandle;
+-pub use transport::RemoteControlPolicy;
+-pub use transport::RemoteControlStartConfig;
+-pub use transport::RemoteControlStartupMode;
+-pub use transport::RemoteControlUnavailable;
+ pub use transport::TransportEvent;
+ pub use transport::acquire_app_server_startup_lock;
+ pub use transport::app_server_control_socket_path;
+ pub use transport::app_server_startup_lock_path;
+ pub use transport::daemon_recovery_file_path;
+ pub use transport::start_control_socket_acceptor;
+-pub use transport::start_remote_control;
+ pub use transport::start_stdio_connection;
+ pub use transport::start_websocket_acceptor;
+-pub use transport::take_remote_control_disabled_env;
+diff --git a/codex-rs/app-server-transport/src/transport/mod.rs b/codex-rs/app-server-transport/src/transport/mod.rs
+index 232ce948b0293ff9e45a008ca4a2e5da379cf0c0..c8424abfa10ab6372ad3a96134bbf50ffcb92c7c 100644
+--- a/codex-rs/app-server-transport/src/transport/mod.rs
++++ b/codex-rs/app-server-transport/src/transport/mod.rs
+@@ -23,23 +23,12 @@ use tracing::warn;
+ /// plenty for an interactive CLI.
+ pub const CHANNEL_CAPACITY: usize = 128;
+ 
+-mod remote_control;
+ mod stdio;
+ mod unix_socket;
+ #[cfg(test)]
+ mod unix_socket_tests;
+ mod websocket;
+ 
+-pub use remote_control::REMOTE_CONTROL_DISABLED_ENV_VAR;
+-pub use remote_control::RemoteControlDisabledByRequirements;
+-pub use remote_control::RemoteControlEnableError;
+-pub use remote_control::RemoteControlHandle;
+-pub use remote_control::RemoteControlPolicy;
+-pub use remote_control::RemoteControlStartConfig;
+-pub use remote_control::RemoteControlStartupMode;
+-pub use remote_control::RemoteControlUnavailable;
+-pub use remote_control::start_remote_control;
+-pub use remote_control::take_remote_control_disabled_env;
+ pub use stdio::start_stdio_connection;
+ pub use unix_socket::AppServerStartupLock;
+ pub use unix_socket::DaemonShutdownAccess;
+diff --git a/codex-rs/app-server/src/in_process.rs b/codex-rs/app-server/src/in_process.rs
+index 9673442d388c5b17b718a8c3f1446e941005ccdd..5284e0f1fbb4031fbe85636ef98db14240432baf 100644
+--- a/codex-rs/app-server/src/in_process.rs
++++ b/codex-rs/app-server/src/in_process.rs
+@@ -513,7 +513,6 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
+                 installation_id,
+                 code_mode_session_provider: None,
+                 rpc_transport: AppServerRpcTransport::InProcess,
+-                remote_control_handle: None,
+                 plugin_startup_tasks: Some(PluginStartupConfig::Current),
+             }));
+             let mut thread_created_rx = processor.thread_created_receiver();
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+index 70e8519ab84031347d837877582f57202102fdf3..15ea4b637dc859b3494837aa636267efc16d61cd 100644
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -37,20 +37,16 @@ use crate::transport::ConnectionOrigin;
+ use crate::transport::ConnectionState;
+ use crate::transport::DaemonShutdownAccess;
+ use crate::transport::OutboundConnectionState;
+-use crate::transport::RemoteControlPolicy;
+-use crate::transport::RemoteControlStartConfig;
+ use crate::transport::TransportEvent;
+ use crate::transport::acquire_app_server_startup_lock;
+ use crate::transport::app_server_startup_lock_path;
+ use crate::transport::route_outgoing_envelope;
+ use crate::transport::start_control_socket_acceptor;
+-use crate::transport::start_remote_control;
+ use crate::transport::start_stdio_connection;
+ use crate::transport::start_websocket_acceptor;
+ use codex_analytics::AppServerRpcTransport;
+ use codex_app_server_protocol::ConfigWarningNotification;
+ use codex_app_server_protocol::JSONRPCMessage;
+-use codex_app_server_protocol::ServerNotification;
+ use codex_app_server_protocol::TextPosition as AppTextPosition;
+ use codex_app_server_protocol::TextRange as AppTextRange;
+ use codex_app_server_transport::daemon_recovery_file_path;
+@@ -150,9 +146,7 @@ pub use crate::code_mode_host::CodeModeHostTransport;
+ pub use crate::error_code::INPUT_TOO_LARGE_ERROR_CODE;
+ pub use crate::error_code::INVALID_PARAMS_ERROR_CODE;
+ pub use crate::transport::AppServerTransport;
+-pub use crate::transport::RemoteControlStartupMode;
+ pub use crate::transport::app_server_control_socket_path;
+-pub use crate::transport::take_remote_control_disabled_env;
+ 
+ const LOG_FORMAT_ENV_VAR: &str = "LOG_FORMAT";
+ const OTEL_SERVICE_NAME: &str = "codex-app-server";
+@@ -475,7 +469,6 @@ pub enum PluginStartupTasks {
+ pub struct AppServerRuntimeOptions {
+     pub code_mode_host_transport: CodeModeHostTransport,
+     pub plugin_startup_tasks: PluginStartupTasks,
+-    pub remote_control_startup_mode: RemoteControlStartupMode,
+     pub install_shutdown_signal_handler: bool,
+     pub managed_daemon: bool,
+ }
+@@ -485,7 +478,6 @@ impl Default for AppServerRuntimeOptions {
+         Self {
+             code_mode_host_transport: CodeModeHostTransport::Local,
+             plugin_startup_tasks: PluginStartupTasks::Start,
+-            remote_control_startup_mode: RemoteControlStartupMode::ResolvePersisted,
+             install_shutdown_signal_handler: true,
+             managed_daemon: false,
+         }
+@@ -762,43 +754,17 @@ pub async fn run_main_with_transport_options(
+             None => error!("{}", warning.summary),
+         }
+     }
+-    let remote_control_policy = if config
+-        .config_layer_stack
+-        .requirements()
+-        .allow_remote_control
+-        .as_ref()
+-        .is_some_and(|requirement| !requirement.value)
+-    {
+-        RemoteControlPolicy::DisabledByRequirements
+-    } else {
+-        RemoteControlPolicy::Allowed
+-    };
+-    let remote_control_startup_mode = runtime_options.remote_control_startup_mode;
+-    let remote_control_explicitly_requested =
+-        remote_control_startup_mode == RemoteControlStartupMode::EnabledEphemeral;
+-    if remote_control_explicitly_requested
+-        && remote_control_policy == RemoteControlPolicy::DisabledByRequirements
+-    {
+-        return Err(std::io::Error::new(
+-            ErrorKind::InvalidInput,
+-            "remote control is disabled by managed requirements",
+-        ));
+-    }
+     let installation_id = resolve_installation_id(&config.codex_home).await?;
+     let transport_shutdown_token = CancellationToken::new();
+-    // Remote enrollment must cancel before RPC drain without shutting down telemetry.
+-    let remote_control_shutdown_token = transport_shutdown_token.child_token();
+     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
+ 
+     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
+     let graceful_signal_restart_enabled =
+         runtime_options.install_shutdown_signal_handler && !single_client_mode;
+-    let mut app_server_client_name_rx = None;
+ 
+     match &transport {
+         AppServerTransport::Stdio => {
+-            let (stdio_client_name_tx, stdio_client_name_rx) = oneshot::channel::<String>();
+-            app_server_client_name_rx = Some(stdio_client_name_rx);
++            let (stdio_client_name_tx, _stdio_client_name_rx) = oneshot::channel::<String>();
+             let handle = start_stdio_connection(
+                 transport_event_tx.clone(),
+                 stdio_client_name_tx,
+@@ -838,71 +804,10 @@ pub async fn run_main_with_transport_options(
+     }
+     drop(unix_socket_startup_lock);
+ 
+-    let remote_control_enabled = remote_control_policy == RemoteControlPolicy::Allowed
+-        && remote_control_explicitly_requested
+-        && state_db.is_some();
+-    if remote_control_explicitly_requested && state_db.is_none() {
+-        error!("remote control disabled because sqlite state db is unavailable");
+-    }
+-    let no_local_transport = transport_accept_handles.is_empty();
+-    if no_local_transport
+-        && remote_control_startup_mode != RemoteControlStartupMode::ResolvePersisted
+-        && !remote_control_enabled
+-    {
+-        return Err(std::io::Error::new(
+-            ErrorKind::InvalidInput,
+-            if remote_control_policy == RemoteControlPolicy::DisabledByRequirements {
+-                "no transport configured; remote control disabled by managed requirements"
+-            } else if remote_control_explicitly_requested && state_db.is_none() {
+-                "no transport configured; remote control disabled because sqlite state db is unavailable"
+-            } else {
+-                "no transport configured; use --listen or enable remote control"
+-            },
+-        ));
++    if transport_accept_handles.is_empty() {
++        return Err(std::io::Error::new(ErrorKind::InvalidInput, "A local transport must be configured"));
+     }
+ 
+-    let (remote_control_accept_handle, remote_control_handle) = start_remote_control(
+-        RemoteControlStartConfig {
+-            remote_control_url: config.chatgpt_base_url.clone(),
+-            installation_id: installation_id.clone(),
+-            policy: remote_control_policy,
+-        },
+-        state_db.clone(),
+-        auth_manager.clone(),
+-        transport_event_tx.clone(),
+-        remote_control_shutdown_token.clone(),
+-        app_server_client_name_rx,
+-        remote_control_startup_mode,
+-    )
+-    .await?;
+-    if no_local_transport
+-        && remote_control_startup_mode == RemoteControlStartupMode::ResolvePersisted
+-    {
+-        let persisted_enabled = match remote_control_handle
+-            .resolve_persisted_preference(/*app_server_client_name*/ None)
+-            .await
+-        {
+-            Ok(persisted_enabled) => persisted_enabled,
+-            Err(err) => {
+-                warn!("failed to resolve persisted remote control preference: {err}");
+-                false
+-            }
+-        };
+-        if !persisted_enabled {
+-            transport_shutdown_token.cancel();
+-            let _ = remote_control_accept_handle.await;
+-            return Err(std::io::Error::new(
+-                ErrorKind::InvalidInput,
+-                if remote_control_policy == RemoteControlPolicy::DisabledByRequirements {
+-                    "no transport configured; remote control disabled by managed requirements"
+-                } else {
+-                    "no transport configured; use --listen or enable remote control"
+-                },
+-            ));
+-        }
+-    }
+-    transport_accept_handles.push(remote_control_accept_handle);
+-
+     // Only the standalone server measures its local home, not embedded/cloud runtimes.
+     if let Some(metrics) = otel.as_ref().and_then(codex_otel::OtelProvider::metrics) {
+         codex_home_metrics::spawn(&config, metrics.clone(), transport_shutdown_token.clone());
+@@ -973,17 +878,10 @@ pub async fn run_main_with_transport_options(
+     });
+ 
+     let recovery_file = daemon_recovery_file_path(&config.codex_home);
+-    let daemon_settings_file = managed_daemon.then(|| {
+-        config
+-            .codex_home
+-            .as_path()
+-            .join("app-server-daemon/settings.json")
+-    });
+     let processor_handle = tokio::spawn({
+         let auth_manager = Arc::clone(&auth_manager);
+-        let initialize_notification_sender = outgoing_message_sender.clone();
+         let outbound_control_tx = outbound_control_tx;
+-        let mut processor = MessageProcessor::new(MessageProcessorArgs {
++        let processor = MessageProcessor::new(MessageProcessorArgs {
+             outgoing: outgoing_message_sender,
+             analytics_events_client,
+             arg0_paths,
+@@ -1002,14 +900,12 @@ pub async fn run_main_with_transport_options(
+             installation_id,
+             code_mode_session_provider,
+             rpc_transport: analytics_rpc_transport(&transport),
+-            remote_control_handle: Some(remote_control_handle.clone()),
+             plugin_startup_tasks: matches!(
+                 runtime_options.plugin_startup_tasks,
+                 PluginStartupTasks::Start
+             )
+             .then_some(plugin_startup_config),
+         });
+-        processor.remote_control_processor.daemon_settings_file = daemon_settings_file;
+         let processor = Arc::new(processor);
+         let mut thread_created_rx = processor.thread_created_receiver();
+         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
+@@ -1017,8 +913,6 @@ pub async fn run_main_with_transport_options(
+         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
+         let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
+         let mut thread_listener_tasks = tokio::task::JoinSet::new();
+-        let mut remote_control_status_rx = remote_control_handle.status_receiver();
+-        let mut remote_control_status = remote_control_status_rx.borrow().clone();
+         let transport_shutdown_token = transport_shutdown_token.clone();
+         async move {
+             let recovery_task = if managed_daemon {
+@@ -1188,7 +1082,6 @@ pub async fn run_main_with_transport_options(
+                                 }
+                                 if single_client_mode && stdio_closed {
+                                     // Pending remote enrollment must stop before RPCs drain.
+-                                    remote_control_shutdown_token.cancel();
+                                     break "stdio_connection_closed";
+                                 }
+                             }
+@@ -1241,14 +1134,6 @@ pub async fn run_main_with_transport_options(
+                                                     connection_id,
+                                                 )
+                                                 .await;
+-                                            initialize_notification_sender
+-                                                .send_server_notification_to_connections(
+-                                                    &[connection_id],
+-                                                    ServerNotification::RemoteControlStatusChanged(
+-                                                        remote_control_status.clone(),
+-                                                    ),
+-                                                )
+-                                                .await;
+                                             processor
+                                                 .connection_initialized(
+                                                     connection_id,
+@@ -1281,20 +1166,6 @@ pub async fn run_main_with_transport_options(
+                             warn!("thread listener attachment failed: {err}");
+                         }
+                     }
+-                    changed = remote_control_status_rx.changed() => {
+-                        if changed.is_err() {
+-                            continue;
+-                        }
+-                        let status = remote_control_status_rx.borrow().clone();
+-                        if remote_control_status == status {
+-                            continue;
+-                        }
+-                        remote_control_status = status.clone();
+-                        let notification = ServerNotification::RemoteControlStatusChanged(status);
+-                        initialize_notification_sender
+-                            .send_server_notification(notification)
+-                            .await;
+-                    }
+                     created = thread_created_rx.recv(), if listen_for_threads && !ready_to_exit => {
+                         match created {
+                             Ok(thread_id) => {
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index c9858cd9d513c69a917f6505410ee89b16bdd955..357d0b33b48e4f1ea6da0dcd893bcd3bf06e093f 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -42,7 +42,6 @@ use crate::request_processors::McpRequestProcessor;
+ use crate::request_processors::PluginRequestProcessor;
+ use crate::request_processors::ProcessExecRequestProcessor;
+ use crate::request_processors::ProjectRequestProcessor;
+-use crate::request_processors::RemoteControlRequestProcessor;
+ use crate::request_processors::SearchRequestProcessor;
+ use crate::request_processors::ThreadGoalRequestProcessor;
+ use crate::request_processors::ThreadQueueRequestProcessor;
+@@ -58,7 +57,6 @@ use crate::skills_watcher::SkillsWatcher;
+ use crate::thread_state::ConnectionCapabilities;
+ use crate::thread_state::ThreadStateManager;
+ use crate::transport::AppServerTransport;
+-use crate::transport::RemoteControlHandle;
+ use crate::turn_cost_worker::TurnCostWorker;
+ use codex_analytics::AnalyticsEventsClient;
+ use codex_analytics::AppServerRpcTransport;
+@@ -163,7 +161,6 @@ pub(crate) struct MessageProcessor {
+     mcp_processor: McpRequestProcessor,
+     plugin_processor: PluginRequestProcessor,
+     project_processor: ProjectRequestProcessor,
+-    pub(super) remote_control_processor: RemoteControlRequestProcessor,
+     search_processor: SearchRequestProcessor,
+     thread_goal_processor: ThreadGoalRequestProcessor,
+     thread_queue_processor: ThreadQueueRequestProcessor,
+@@ -264,7 +261,6 @@ pub(crate) struct MessageProcessorArgs {
+     pub(crate) installation_id: String,
+     pub(crate) code_mode_session_provider: Option<Arc<dyn CodeModeSessionProvider>>,
+     pub(crate) rpc_transport: AppServerRpcTransport,
+-    pub(crate) remote_control_handle: Option<RemoteControlHandle>,
+     /// `None` skips startup tasks; otherwise preserve the initial config-loading path.
+     pub(crate) plugin_startup_tasks: Option<PluginStartupConfig>,
+ }
+@@ -290,7 +286,6 @@ impl MessageProcessor {
+             installation_id,
+             code_mode_session_provider,
+             rpc_transport,
+-            remote_control_handle,
+             plugin_startup_tasks,
+         } = args;
+         // Startup credential reads must not open a browser before initialize selects the policy.
+@@ -484,7 +479,6 @@ impl MessageProcessor {
+             config_manager.clone(),
+             on_effective_plugins_changed,
+         );
+-        let remote_control_processor = RemoteControlRequestProcessor::new(remote_control_handle);
+         let search_processor = SearchRequestProcessor::new(outgoing.clone());
+         let thread_goal_processor = ThreadGoalRequestProcessor::new(
+             Arc::clone(&thread_manager),
+@@ -606,7 +600,6 @@ impl MessageProcessor {
+             mcp_processor,
+             plugin_processor,
+             project_processor,
+-            remote_control_processor,
+             search_processor,
+             thread_goal_processor,
+             thread_queue_processor,
+@@ -1176,46 +1169,6 @@ impl MessageProcessor {
+                     .experimental_feature_enablement_set(request_id.clone(), params)
+                     .await
+             }
+-            ClientRequest::RemoteControlEnable { params, .. } => self
+-                .remote_control_processor
+-                .enable(
+-                    params.is_some_and(|params| params.ephemeral),
+-                    app_server_client_name.as_deref(),
+-                )
+-                .await
+-                .map(|response| Some(response.into())),
+-            ClientRequest::RemoteControlDisable { params, .. } => self
+-                .remote_control_processor
+-                .disable(
+-                    params.is_some_and(|params| params.ephemeral),
+-                    app_server_client_name.as_deref(),
+-                )
+-                .await
+-                .map(|response| Some(response.into())),
+-            ClientRequest::RemoteControlStatusRead { .. } => self
+-                .remote_control_processor
+-                .status_read()
+-                .map(|response| Some(response.into())),
+-            ClientRequest::RemoteControlPairingStart { params, .. } => self
+-                .remote_control_processor
+-                .pairing_start(params, app_server_client_name.as_deref())
+-                .await
+-                .map(|response| Some(response.into())),
+-            ClientRequest::RemoteControlPairingStatus { params, .. } => self
+-                .remote_control_processor
+-                .pairing_status(params)
+-                .await
+-                .map(|response| Some(response.into())),
+-            ClientRequest::RemoteControlClientsList { params, .. } => self
+-                .remote_control_processor
+-                .clients_list(params)
+-                .await
+-                .map(|response| Some(response.into())),
+-            ClientRequest::RemoteControlClientsRevoke { params, .. } => self
+-                .remote_control_processor
+-                .clients_revoke(params)
+-                .await
+-                .map(|response| Some(response.into())),
+             ClientRequest::ConfigRequirementsRead { params: _, .. } => self
+                 .config_processor
+                 .config_requirements_read()
+diff --git a/codex-rs/app-server/src/notification_media.rs b/codex-rs/app-server/src/notification_media.rs
+index a1572cbaf7b9026f789c96ce9d027e0a7cc4b1be..66111205d1daf79a66020871bffb4785c043bf97 100644
+--- a/codex-rs/app-server/src/notification_media.rs
++++ b/codex-rs/app-server/src/notification_media.rs
+@@ -103,7 +103,6 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
+         | ServerNotification::AccountUpdated(_)
+         | ServerNotification::AccountRateLimitsUpdated(_)
+         | ServerNotification::AppListUpdated(_)
+-        | ServerNotification::RemoteControlStatusChanged(_)
+         | ServerNotification::ExternalAgentConfigImportProgress(_)
+         | ServerNotification::ExternalAgentConfigImportCompleted(_)
+         | ServerNotification::FsChanged(_)
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index a40486e0d512af66aeef1c1307696b2740053500..4eb9e43745bfaf282a82432536b2bcecc7683d59 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -563,7 +563,6 @@ mod persisted_resume_settings;
+ mod plugins;
+ mod process_exec_processor;
+ mod projects;
+-mod remote_control_processor;
+ mod rollout;
+ mod search;
+ mod thread_attachments;
+@@ -596,7 +595,6 @@ pub(crate) use mcp_processor::McpRequestProcessor;
+ pub(crate) use plugins::PluginRequestProcessor;
+ pub(crate) use process_exec_processor::ProcessExecRequestProcessor;
+ pub(crate) use projects::ProjectRequestProcessor;
+-pub(crate) use remote_control_processor::RemoteControlRequestProcessor;
+ pub(crate) use search::SearchRequestProcessor;
+ pub(crate) use thread_goal_processor::ThreadGoalRequestProcessor;
+ pub(crate) use thread_processor::ThreadRequestProcessor;
+diff --git a/codex-rs/app-server/src/transport.rs b/codex-rs/app-server/src/transport.rs
+index 51df5036ec7f7434f210ee4de9887aece6a12591..63d5a9994a9bfa149605055d6ed85b41c3f7ce45 100644
+--- a/codex-rs/app-server/src/transport.rs
++++ b/codex-rs/app-server/src/transport.rs
+@@ -19,21 +19,13 @@ pub(crate) use codex_app_server_transport::ConnectionOrigin;
+ pub(crate) use codex_app_server_transport::DaemonShutdownAccess;
+ pub(crate) use codex_app_server_transport::OutgoingMessage;
+ pub(crate) use codex_app_server_transport::QueuedOutgoingMessage;
+-pub(crate) use codex_app_server_transport::RemoteControlEnableError;
+-pub(crate) use codex_app_server_transport::RemoteControlHandle;
+-pub(crate) use codex_app_server_transport::RemoteControlPolicy;
+-pub(crate) use codex_app_server_transport::RemoteControlStartConfig;
+-pub use codex_app_server_transport::RemoteControlStartupMode;
+-pub(crate) use codex_app_server_transport::RemoteControlUnavailable;
+ pub(crate) use codex_app_server_transport::TransportEvent;
+ pub(crate) use codex_app_server_transport::acquire_app_server_startup_lock;
+ pub use codex_app_server_transport::app_server_control_socket_path;
+ pub(crate) use codex_app_server_transport::app_server_startup_lock_path;
+ pub(crate) use codex_app_server_transport::start_control_socket_acceptor;
+-pub(crate) use codex_app_server_transport::start_remote_control;
+ pub(crate) use codex_app_server_transport::start_stdio_connection;
+ pub(crate) use codex_app_server_transport::start_websocket_acceptor;
+-pub use codex_app_server_transport::take_remote_control_disabled_env;
+ 
+ pub(crate) struct ConnectionState {
+     pub(crate) origin: ConnectionOrigin,
+diff --git a/codex-rs/runtime-cli/src/main.rs b/codex-rs/runtime-cli/src/main.rs
+index ac3731875012615230cb2f38272911414d378166..0d814a713ba5dc7de03690b1aa0dc918205c189e 100644
+--- a/codex-rs/runtime-cli/src/main.rs
++++ b/codex-rs/runtime-cli/src/main.rs
+@@ -7,7 +7,6 @@ use codex_app_server::AppServerCodeModeHostArgs;
+ use codex_app_server::AppServerExit;
+ use codex_app_server::AppServerRuntimeOptions;
+ use codex_app_server::AppServerTransport;
+-use codex_app_server::RemoteControlStartupMode;
+ use codex_arg0::arg0_dispatch_or_else;
+ use codex_config::LoaderOverrides;
+ use codex_protocol::protocol::SessionSource;
+@@ -65,12 +64,6 @@ struct AppServerCommand {
+     /// Enable analytics unless disabled in configuration.
+     #[arg(long)]
+     analytics_default_enabled: bool,
+-
+-    #[arg(long, hide = true)]
+-    remote_control: bool,
+-
+-    #[arg(long, hide = true)]
+-    managed_daemon: bool,
+ }
+ 
+ #[derive(Debug, Subcommand)]
+@@ -95,7 +88,6 @@ struct SchemaArgs {
+ }
+ 
+ fn main() -> anyhow::Result<()> {
+-    let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
+     arg0_dispatch_or_else(move |arg0_paths| async move {
+         let Cli {
+             config_overrides,
+@@ -130,15 +122,6 @@ fn main() -> anyhow::Result<()> {
+                 };
+                 let options = AppServerRuntimeOptions {
+                     code_mode_host_transport: server.code_mode_host.into(),
+-                    managed_daemon: server.managed_daemon,
+-                    remote_control_startup_mode: match (
+-                        server.remote_control,
+-                        remote_control_disabled,
+-                    ) {
+-                        (true, _) => RemoteControlStartupMode::EnabledEphemeral,
+-                        (false, true) => RemoteControlStartupMode::DisabledEphemeral,
+-                        (false, false) => RemoteControlStartupMode::ResolvePersisted,
+-                    },
+                     ..Default::default()
+                 };
+                 let exit = codex_app_server::run_main_with_transport_options(

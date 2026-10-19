@@ -1,0 +1,14 @@
+{
+  "name": "araceae-codex-runtime-tests",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "packageManager": "pnpm@11.13.0",
+  "scripts": {
+    "test": "node --test tests/runtime-e2e.test.mjs",
+    "test:patches": "python3 -m unittest discover -s tests -p 'test_*.py'"
+  },
+  "devDependencies": {
+    "@copilotkit/aimock": "1.45.1"
+  }
+}

@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Sat, 17 Oct 2026 13:10:53 +0800
+Subject: [PATCH] Remove official Apps RPCs and hosted MCP auto-registration
+
+---
+ .../src/protocol/common.rs                    | 16 --------------
+ codex-rs/app-server/src/extensions.rs         |  1 -
+ codex-rs/app-server/src/message_processor.rs  | 22 -------------------
+ codex-rs/app-server/src/notification_media.rs |  1 -
+ codex-rs/app-server/src/request_processors.rs | 16 --------------
+ codex-rs/features/src/lib.rs                  |  3 +++
+ 6 files changed, 3 insertions(+), 56 deletions(-)
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+index c199109d08308c8f621ea2f0e675e82cc96fadb2..8f9e58e8c37b4e650b07a4ac9ce1ecd38d630a2f 100644
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -906,21 +906,6 @@ client_request_definitions! {
+         serialization: global_shared_read("config"),
+         response: v2::HooksListResponse,
+     },
+-    AppsRead => "app/read" {
+-        params: v2::AppsReadParams,
+-        serialization: None,
+-        response: v2::AppsReadResponse,
+-    },
+-    AppsList => "app/list" {
+-        params: v2::AppsListParams,
+-        serialization: None,
+-        response: v2::AppsListResponse,
+-    },
+-    AppsInstalled => "app/installed" {
+-        params: v2::AppsInstalledParams,
+-        serialization: None,
+-        response: v2::AppsInstalledResponse,
+-    },
+     // File system requests are intentionally concurrent. Desktop already treats local
+     // file system operations as concurrent, and app-server remote fs mirrors that model.
+     FsReadFile => "fs/readFile" {
+@@ -1895,7 +1880,6 @@ server_notification_definitions! {
+     AccountUpdated => "account/updated" (v2::AccountUpdatedNotification),
+     GatewayOAuthChanged => "account/gatewayOAuth/changed" (v2::GatewayOAuthChangedNotification),
+     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
+-    AppListUpdated => "app/list/updated" (v2::AppListUpdatedNotification),
+     ExternalAgentConfigImportProgress => "externalAgentConfig/import/progress" (v2::ExternalAgentConfigImportProgressNotification),
+     ExternalAgentConfigImportCompleted => "externalAgentConfig/import/completed" (v2::ExternalAgentConfigImportCompletedNotification),
+     FsChanged => "fs/changed" (v2::FsChangedNotification),
+diff --git a/codex-rs/app-server/src/extensions.rs b/codex-rs/app-server/src/extensions.rs
+index ec0c67f52fd7d9c59708b2fcba562ed85ab2c5ee..8146d437224a13f1c8b423877bc83546d4a44b62 100644
+--- a/codex-rs/app-server/src/extensions.rs
++++ b/codex-rs/app-server/src/extensions.rs
+@@ -93,7 +93,6 @@ pub(crate) fn thread_extensions(
+     );
+     codex_guardian_v2::install(&mut builder, auth_manager.clone(), thread_manager);
+     codex_memories_extension::install(&mut builder, codex_otel::global());
+-    codex_mcp_extension::install(&mut builder);
+     let _ = environment_manager;
+     codex_web_search_extension::install(&mut builder, auth_manager.clone());
+     codex_image_generation_extension::install(&mut builder, auth_manager, |config: &Config| {
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 08b1f2510f7dc64ab3db2ca066852a8ee7de7276..f74324a3a23cd468b2d88a261a7b827ad253b9dc 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -25,7 +25,6 @@ use crate::outgoing_message::OutgoingMessageSender;
+ use crate::outgoing_message::RequestContext;
+ use crate::plugin_config_reload::PluginStartupConfig;
+ use crate::request_processors::AccountRequestProcessor;
+-use crate::request_processors::AppsRequestProcessor;
+ use crate::request_processors::CatalogRequestProcessor;
+ use crate::request_processors::CommandExecRequestProcessor;
+ use crate::request_processors::ConfigRequestProcessor;
+@@ -96,7 +95,6 @@ use tokio::sync::broadcast;
+ use tokio::sync::watch;
+ use tokio::time::Duration;
+ use tokio::time::timeout;
+-use tokio_util::sync::CancellationToken;
+ use tracing::Instrument;
+ 
+ use crate::models_refresh_worker::ModelsRefreshWorker;
+@@ -143,7 +141,6 @@ pub(crate) struct MessageProcessor {
+     turn_cost_worker: Option<TurnCostWorker>,
+     skills_watcher: Arc<SkillsWatcher>,
+     account_processor: Arc<AccountRequestProcessor>,
+-    apps_processor: AppsRequestProcessor,
+     catalog_processor: CatalogRequestProcessor,
+     command_exec_processor: CommandExecRequestProcessor,
+     process_exec_processor: ProcessExecRequestProcessor,
+@@ -381,7 +378,6 @@ impl MessageProcessor {
+         let thread_watch_manager =
+             crate::thread_status::ThreadWatchManager::new_with_outgoing(outgoing.clone());
+         let thread_list_state_permit = Arc::new(Semaphore::new(/*permits*/ 1));
+-        let app_list_shutdown_token = CancellationToken::new();
+         let request_serialization_queues = RequestSerializationQueues::default();
+         let config_processor = ConfigRequestProcessor::new(
+             outgoing.clone(),
+@@ -396,13 +392,6 @@ impl MessageProcessor {
+             Arc::clone(&config),
+             config_manager.clone(),
+         );
+-        let apps_processor = AppsRequestProcessor::new(
+-            auth_manager.clone(),
+-            Arc::clone(&thread_manager),
+-            outgoing.clone(),
+-            config_manager.clone(),
+-            app_list_shutdown_token,
+-        );
+         let catalog_processor = CatalogRequestProcessor::new(
+             outgoing.clone(),
+             Arc::clone(&skills_watcher),
+@@ -535,7 +524,6 @@ impl MessageProcessor {
+             turn_cost_worker,
+             skills_watcher,
+             account_processor,
+-            apps_processor,
+             catalog_processor,
+             command_exec_processor,
+             process_exec_processor,
+@@ -560,7 +548,6 @@ impl MessageProcessor {
+ 
+     pub(crate) fn clear_runtime_references(&self) {
+         self.account_processor.clear_external_auth();
+-        self.apps_processor.shutdown();
+         self.models_refresh_worker.shutdown();
+         self.skills_watcher.shutdown();
+     }
+@@ -1453,15 +1440,6 @@ impl MessageProcessor {
+             ClientRequest::HooksList { params, .. } => {
+                 self.catalog_processor.hooks_list(params).await
+             }
+-            ClientRequest::AppsRead { params, .. } => self.apps_processor.apps_read(params).await,
+-            ClientRequest::AppsList { params, .. } => {
+-                self.apps_processor.apps_list(&request_id, params).await
+-            }
+-            ClientRequest::AppsInstalled { params, .. } => self
+-                .apps_processor
+-                .apps_installed(params)
+-                .await
+-                .map(|response| Some(response.into())),
+             ClientRequest::SkillsConfigWrite { params, .. } => {
+                 self.catalog_processor.skills_config_write(params).await
+             }
+diff --git a/codex-rs/app-server/src/notification_media.rs b/codex-rs/app-server/src/notification_media.rs
+index 66111205d1daf79a66020871bffb4785c043bf97..f0066a94d7c5c819a9d9bbfa56e00a89170baf81 100644
+--- a/codex-rs/app-server/src/notification_media.rs
++++ b/codex-rs/app-server/src/notification_media.rs
+@@ -102,7 +102,6 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
+         | ServerNotification::McpServerEventStream(_)
+         | ServerNotification::AccountUpdated(_)
+         | ServerNotification::AccountRateLimitsUpdated(_)
+-        | ServerNotification::AppListUpdated(_)
+         | ServerNotification::ExternalAgentConfigImportProgress(_)
+         | ServerNotification::ExternalAgentConfigImportCompleted(_)
+         | ServerNotification::FsChanged(_)
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index 35ef2accbc97263b7f994d0021dde6a38182649c..f53f794e7ab1b546963b589e6ee709c2ede281a6 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -28,13 +28,6 @@ use codex_app_server_protocol::AddCreditsNudgeCreditType;
+ use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
+ use codex_app_server_protocol::AdditionalContextEntry;
+ use codex_app_server_protocol::AdditionalContextKind;
+-use codex_app_server_protocol::AppListUpdatedNotification;
+-use codex_app_server_protocol::AppsInstalledParams;
+-use codex_app_server_protocol::AppsInstalledResponse;
+-use codex_app_server_protocol::AppsListParams;
+-use codex_app_server_protocol::AppsListResponse;
+-use codex_app_server_protocol::AppsReadParams;
+-use codex_app_server_protocol::AppsReadResponse;
+ use codex_app_server_protocol::AskForApproval;
+ use codex_app_server_protocol::AuthMode;
+ use codex_app_server_protocol::CancelLoginAccountParams;
+@@ -93,7 +86,6 @@ use codex_app_server_protocol::HooksListParams;
+ use codex_app_server_protocol::HooksListResponse;
+ use codex_app_server_protocol::InitializeParams;
+ use codex_app_server_protocol::InitializeResponse;
+-use codex_app_server_protocol::InstalledApp;
+ use codex_app_server_protocol::JSONRPCErrorError;
+ use codex_app_server_protocol::ListMcpServerStatusParams;
+ use codex_app_server_protocol::ListMcpServerStatusResponse;
+@@ -282,17 +274,14 @@ use codex_backend_client::RateLimitResetCreditDetails as BackendRateLimitResetCr
+ use codex_backend_client::RateLimitResetCreditsDetails as BackendRateLimitResetCreditsDetails;
+ use codex_backend_client::RequestError as BackendRequestError;
+ use codex_backend_client::TokenUsageProfile;
+-use codex_chatgpt::connectors;
+ use codex_config::CloudConfigBundleLoadError;
+ use codex_config::CloudConfigBundleLoadErrorCode;
+ use codex_config::ConfigLayerStack;
+ use codex_config::loader::project_trust_key;
+ use codex_config::types::McpServerTransportConfig;
+-use codex_connectors::AppInfo;
+ use codex_core::CodexThread;
+ use codex_core::CodexThreadSettingsOverrides;
+ use codex_core::ForkSnapshot;
+-use codex_core::McpManager;
+ use codex_core::NewThread;
+ use codex_core::NotSubmittedReason;
+ #[cfg(test)]
+@@ -308,7 +297,6 @@ use codex_core::TurnStartOptions;
+ use codex_core::config::Config;
+ use codex_core::config::ConfigOverrides;
+ use codex_core::config::NetworkProxyAuditMetadata;
+-use codex_core::connectors::AccessibleConnectorsStatus;
+ use codex_core::exec::ExecCapturePolicy;
+ use codex_core::exec::ExecExpiration;
+ use codex_core::exec::ExecParams;
+@@ -324,7 +312,6 @@ use codex_core::windows_sandbox::WindowsSandboxLevelExt;
+ use codex_core::windows_sandbox::WindowsSandboxSetupMode as CoreWindowsSandboxSetupMode;
+ use codex_core::windows_sandbox::WindowsSandboxSetupRequest;
+ use codex_core::windows_sandbox::sandbox_setup_is_complete;
+-use codex_core_plugins::PluginsManager;
+ use codex_exec_server::EnvironmentManager;
+ use codex_exec_server::EnvironmentObservedStatus;
+ use codex_exec_server::LOCAL_ENVIRONMENT_ID;
+@@ -454,7 +441,6 @@ use tokio::sync::broadcast;
+ use tokio::sync::oneshot;
+ use tokio::sync::watch;
+ use tokio_util::sync::CancellationToken;
+-use tokio_util::sync::DropGuard;
+ use tokio_util::task::TaskTracker;
+ use toml::Value as TomlValue;
+ use tracing::Instrument;
+@@ -467,7 +453,6 @@ use uuid::Uuid;
+ use codex_app_server_protocol::ServerRequest;
+ 
+ mod account_processor;
+-mod apps_processor;
+ mod bedrock_auth;
+ mod catalog_processor;
+ mod command_exec_processor;
+@@ -505,7 +490,6 @@ mod turn_processor;
+ mod windows_sandbox_processor;
+ 
+ pub(crate) use account_processor::AccountRequestProcessor;
+-pub(crate) use apps_processor::AppsRequestProcessor;
+ pub(crate) use catalog_processor::CatalogRequestProcessor;
+ pub(crate) use command_exec_processor::CommandExecRequestProcessor;
+ pub(crate) use config_processor::ConfigRequestProcessor;
+diff --git a/codex-rs/features/src/lib.rs b/codex-rs/features/src/lib.rs
+index 13ff893c1c962ed049f80e6858a130e8bbfbc651..d3269bcea3e0e3fb465a1acb84a4b814e6b6b93f 100644
+--- a/codex-rs/features/src/lib.rs
++++ b/codex-rs/features/src/lib.rs
+@@ -564,6 +564,9 @@ impl Features {
+     }
+ 
+     pub fn enabled(&self, f: Feature) -> bool {
++        if f == Feature::Apps {
++            return false;
++        }
+         self.enabled.contains(&f)
+     }
+ 

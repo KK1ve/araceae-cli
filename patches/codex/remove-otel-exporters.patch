@@ -1,0 +1,1379 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Sat, 17 Oct 2026 13:35:12 +0800
+Subject: [PATCH] Remove telemetry exporters and runtime reload workers
+
+---
+ codex-rs/Cargo.lock                 | 108 ----
+ codex-rs/app-server/src/lib.rs      |  18 -
+ codex-rs/otel/Cargo.toml            |  15 -
+ codex-rs/otel/src/config.rs         |  28 +-
+ codex-rs/otel/src/lib.rs            |   2 -
+ codex-rs/otel/src/metrics/client.rs | 128 +----
+ codex-rs/otel/src/metrics/error.rs  |   6 -
+ codex-rs/otel/src/provider.rs       | 848 +---------------------------
+ 8 files changed, 30 insertions(+), 1123 deletions(-)
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index ef9acdce055ef2eb3b2f97e19bc571a8966eb758..e95f8887e9939a52c0d05d02fa26e6775cd7ab03 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -4234,13 +4234,9 @@ dependencies = [
+  "codex-utils-stream-parser",
+  "codex-utils-string",
+  "eventsource-stream",
+- "gethostname",
+  "http 1.4.0",
+  "libc",
+  "opentelemetry",
+- "opentelemetry-appender-tracing",
+- "opentelemetry-http",
+- "opentelemetry-otlp",
+  "opentelemetry-semantic-conventions",
+  "opentelemetry_sdk",
+  "os_info",
+@@ -5493,18 +5489,6 @@ dependencies = [
+  "windows-sys 0.59.0",
+ ]
+ 
+-[[package]]
+-name = "const-hex"
+-version = "1.17.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "3bb320cac8a0750d7f25280aa97b09c26edfe161164238ecbbb31092b079e735"
+-dependencies = [
+- "cfg-if",
+- "cpufeatures 0.2.17",
+- "proptest",
+- "serde_core",
+-]
+-
+ [[package]]
+ name = "const-oid"
+ version = "0.9.6"
+@@ -11153,68 +11137,6 @@ dependencies = [
+  "tracing",
+ ]
+ 
+-[[package]]
+-name = "opentelemetry-appender-tracing"
+-version = "0.31.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ef6a1ac5ca3accf562b8c306fa8483c85f4390f768185ab775f242f7fe8fdcc2"
+-dependencies = [
+- "opentelemetry",
+- "tracing",
+- "tracing-core",
+- "tracing-subscriber",
+-]
+-
+-[[package]]
+-name = "opentelemetry-http"
+-version = "0.31.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d7a6d09a73194e6b66df7c8f1b680f156d916a1a942abf2de06823dd02b7855d"
+-dependencies = [
+- "async-trait",
+- "bytes",
+- "http 1.4.0",
+- "opentelemetry",
+- "reqwest 0.12.28",
+-]
+-
+-[[package]]
+-name = "opentelemetry-otlp"
+-version = "0.31.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7a2366db2dca4d2ad033cad11e6ee42844fd727007af5ad04a1730f4cb8163bf"
+-dependencies = [
+- "http 1.4.0",
+- "opentelemetry",
+- "opentelemetry-http",
+- "opentelemetry-proto",
+- "opentelemetry_sdk",
+- "prost",
+- "reqwest 0.12.28",
+- "serde_json",
+- "thiserror 2.0.18",
+- "tokio",
+- "tonic",
+- "tracing",
+-]
+-
+-[[package]]
+-name = "opentelemetry-proto"
+-version = "0.31.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a7175df06de5eaee9909d4805a3d07e28bb752c34cab57fa9cff549da596b30f"
+-dependencies = [
+- "base64 0.22.1",
+- "const-hex",
+- "opentelemetry",
+- "opentelemetry_sdk",
+- "prost",
+- "serde",
+- "serde_json",
+- "tonic",
+- "tonic-prost",
+-]
+-
+ [[package]]
+ name = "opentelemetry-semantic-conventions"
+ version = "0.31.0"
+@@ -11942,21 +11864,6 @@ dependencies = [
+  "parking_lot",
+ ]
+ 
+-[[package]]
+-name = "proptest"
+-version = "1.9.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "bee689443a2bd0a16ab0348b52ee43e3b2d1b1f931c8aa5c9f8de4c86fbe8c40"
+-dependencies = [
+- "bitflags 2.13.1",
+- "num-traits",
+- "rand 0.9.3",
+- "rand_chacha 0.9.0",
+- "rand_xorshift",
+- "regex-syntax",
+- "unarray",
+-]
+-
+ [[package]]
+ name = "prost"
+ version = "0.14.3"
+@@ -12705,15 +12612,6 @@ dependencies = [
+  "regex-syntax",
+ ]
+ 
+-[[package]]
+-name = "rand_xorshift"
+-version = "0.4.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
+-dependencies = [
+- "rand_core 0.9.5",
+-]
+-
+ [[package]]
+ name = "ratatui"
+ version = "0.30.2"
+@@ -16321,12 +16219,6 @@ dependencies = [
+  "winapi",
+ ]
+ 
+-[[package]]
+-name = "unarray"
+-version = "0.1.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
+-
+ [[package]]
+ name = "unic-langid"
+ version = "0.9.6"
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+index 15ea4b637dc859b3494837aa636267efc16d61cd..384b045c6dd40347ce0d8e16c3820d7b39c9f281 100644
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -96,7 +96,6 @@ mod attestation;
+ mod auth_mode;
+ mod bespoke_event_handling;
+ mod code_mode_host;
+-mod codex_home_metrics;
+ mod command_exec;
+ mod config_layer;
+ mod config_manager;
+@@ -126,7 +125,6 @@ mod model_catalog;
+ mod models;
+ mod models_refresh_worker;
+ mod notification_media;
+-mod otel_reloader;
+ mod outgoing_message;
+ mod plugin_config_reload;
+ mod request_processors;
+@@ -736,13 +734,11 @@ pub async fn run_main_with_transport_options(
+     let log_db_layer = log_db
+         .clone()
+         .map(|layer| layer.with_filter(log_db::default_filter()));
+-    let (otel_layers, otel_logger_reload_handle) = otel_reloader::layers(otel.as_ref());
+     let _ = tracing_subscriber::registry()
+         .with(stderr_fmt)
+         .with(feedback_layer)
+         .with(feedback_metadata_layer)
+         .with(log_db_layer)
+-        .with(otel_layers)
+         .try_init();
+     #[cfg(unix)]
+     if let Some(Err(err)) = nofile_limit_result {
+@@ -808,19 +804,6 @@ pub async fn run_main_with_transport_options(
+         return Err(std::io::Error::new(ErrorKind::InvalidInput, "A local transport must be configured"));
+     }
+ 
+-    // Only the standalone server measures its local home, not embedded/cloud runtimes.
+-    if let Some(metrics) = otel.as_ref().and_then(codex_otel::OtelProvider::metrics) {
+-        codex_home_metrics::spawn(&config, metrics.clone(), transport_shutdown_token.clone());
+-    }
+-
+-    let otel_reloader_handle = otel_reloader::spawn(
+-        otel,
+-        otel_logger_reload_handle,
+-        config_manager.clone(),
+-        Arc::clone(&auth_manager),
+-        default_analytics_enabled,
+-        transport_shutdown_token.clone(),
+-    );
+ 
+     let outbound_handle = tokio::spawn(async move {
+         let mut outbound_connections = HashMap::<ConnectionId, OutboundConnectionState>::new();
+@@ -1241,7 +1224,6 @@ pub async fn run_main_with_transport_options(
+     let _ = outbound_handle.await;
+ 
+     transport_shutdown_token.cancel();
+-    let _ = otel_reloader_handle.await;
+     for handle in transport_accept_handles {
+         let _ = handle.await;
+     }
+diff --git a/codex-rs/otel/Cargo.toml b/codex-rs/otel/Cargo.toml
+index 3197eaa846bc1e072f34ce60066383114570a451..dd8a47a0b5a384449337351fe4fcb5b09c39331e 100644
+--- a/codex-rs/otel/Cargo.toml
++++ b/codex-rs/otel/Cargo.toml
+@@ -15,7 +15,6 @@ workspace = true
+ [dependencies]
+ bytes = { workspace = true }
+ codex-http-client = { workspace = true }
+-opentelemetry-http = "0.31.0"
+ chrono = { workspace = true }
+ codex-utils-absolute-path = { workspace = true }
+ codex-utils-stream-parser = { workspace = true }
+@@ -23,21 +22,7 @@ codex-utils-string = { workspace = true }
+ codex-api = { workspace = true }
+ codex-protocol = { workspace = true }
+ eventsource-stream = { workspace = true }
+-gethostname = { workspace = true }
+ opentelemetry = { workspace = true, features = ["logs", "metrics", "trace"] }
+-opentelemetry-appender-tracing = { workspace = true }
+-opentelemetry-otlp = { workspace = true, features = [
+-    "grpc-tonic",
+-    "http-proto",
+-    "http-json",
+-    "logs",
+-    "metrics",
+-    "trace",
+-    "reqwest-blocking-client",
+-    "reqwest-rustls",
+-    "tls",
+-    "tls-roots",
+-]}
+ opentelemetry-semantic-conventions = { workspace = true }
+ opentelemetry_sdk = { workspace = true, features = [
+     "experimental_trace_batch_span_processor_with_async_runtime",
+diff --git a/codex-rs/otel/src/config.rs b/codex-rs/otel/src/config.rs
+index 69ad3b62d1da5185da30ed8b9187a7db1aa1898e..bea670fefb5a95eec3ad45409dbc9cbcbec78c32 100644
+--- a/codex-rs/otel/src/config.rs
++++ b/codex-rs/otel/src/config.rs
+@@ -6,33 +6,9 @@ use codex_utils_absolute_path::AbsolutePathBuf;
+ use serde::Deserialize;
+ use serde::Serialize;
+ 
+-pub(crate) const STATSIG_OTLP_HTTP_ENDPOINT: &str = "https://ab.chatgpt.com/otlp/v1/metrics";
+-pub(crate) const STATSIG_API_KEY_HEADER: &str = "statsig-api-key";
+-pub(crate) const STATSIG_API_KEY: &str = "client-MkRuleRQBd6qakfnDYqJVR9JuXcY57Ljly3vi5JVUIO";
+-
+ pub(crate) fn resolve_exporter(exporter: &OtelExporter) -> OtelExporter {
+-    match exporter {
+-        OtelExporter::Statsig => {
+-            // Keep the built-in Statsig default off in debug builds so
+-            // incremental local development and test runs do not emit
+-            // best-effort OTEL traffic unless a test or binary opts into an
+-            // explicit exporter configuration.
+-            if cfg!(debug_assertions) {
+-                return OtelExporter::None;
+-            }
+-
+-            OtelExporter::OtlpHttp {
+-                endpoint: STATSIG_OTLP_HTTP_ENDPOINT.to_string(),
+-                headers: HashMap::from([(
+-                    STATSIG_API_KEY_HEADER.to_string(),
+-                    STATSIG_API_KEY.to_string(),
+-                )]),
+-                protocol: OtelHttpProtocol::Json,
+-                tls: None,
+-            }
+-        }
+-        _ => exporter.clone(),
+-    }
++    let _ = exporter;
++    OtelExporter::None
+ }
+ 
+ /// Validates configured span attributes before they are attached to exported spans.
+diff --git a/codex-rs/otel/src/lib.rs b/codex-rs/otel/src/lib.rs
+index b719515e2fd2667d88eae40437d546bbbbbe9a37..76f16ab00775a9f73258937d718e0b8c0318de69 100644
+--- a/codex-rs/otel/src/lib.rs
++++ b/codex-rs/otel/src/lib.rs
+@@ -7,8 +7,6 @@ pub(crate) mod trace_context;
+ 
+ mod agent_response;
+ mod guardian_assessment;
+-mod network_policy;
+-mod otlp;
+ mod skill_invocation;
+ mod targets;
+ mod tool_result;
+diff --git a/codex-rs/otel/src/metrics/client.rs b/codex-rs/otel/src/metrics/client.rs
+index 8bbb12cdc5138f915e62a582bf0637058f737797..1493b0f290c4f978fe539e1ee40d646bd538c412 100644
+--- a/codex-rs/otel/src/metrics/client.rs
++++ b/codex-rs/otel/src/metrics/client.rs
+@@ -1,5 +1,3 @@
+-use crate::config::OtelExporter;
+-use crate::config::OtelHttpProtocol;
+ use crate::metrics::MetricsError;
+ use crate::metrics::Result;
+ use crate::metrics::config::MetricsConfig;
+@@ -16,13 +14,6 @@ use opentelemetry::metrics::Gauge;
+ use opentelemetry::metrics::Histogram;
+ use opentelemetry::metrics::Meter;
+ use opentelemetry::metrics::MeterProvider as _;
+-use opentelemetry_otlp::OTEL_EXPORTER_OTLP_METRICS_TIMEOUT;
+-use opentelemetry_otlp::Protocol;
+-use opentelemetry_otlp::WithExportConfig;
+-use opentelemetry_otlp::WithHttpConfig;
+-use opentelemetry_otlp::WithTonicConfig;
+-use opentelemetry_otlp::tonic_types::metadata::MetadataMap;
+-use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+ use opentelemetry_sdk::Resource;
+ use opentelemetry_sdk::metrics::InstrumentKind;
+ use opentelemetry_sdk::metrics::ManualReader;
+@@ -362,23 +353,7 @@ impl MetricsClient {
+             MetricsExporter::InMemory(exporter) => {
+                 build_provider(resource, exporter, export_interval, runtime_reader.clone())
+             }
+-            MetricsExporter::Otlp(exporter) => {
+-                let temporality = otlp_metrics_temporality(
+-                    &exporter,
+-                    std::env::var("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE")
+-                        .ok()
+-                        .as_deref(),
+-                );
+-                let exporter = crate::network_policy::PolicyExporter {
+-                    exporter: build_otlp_metric_exporter(
+-                        exporter,
+-                        temporality,
+-                        &http_client_factory,
+-                    )?,
+-                    policy: http_client_factory.network_policy().clone(),
+-                };
+-                build_provider(resource, exporter, export_interval, runtime_reader.clone())
+-            }
++            MetricsExporter::Otlp(_) => return Err(MetricsError::ExporterDisabled),
+         };
+ 
+         Ok(Self {
+@@ -594,104 +569,3 @@ where
+     let meter = provider.meter(METER_NAME);
+     (provider, meter)
+ }
+-
+-fn otlp_metrics_temporality(exporter: &OtelExporter, preference: Option<&str>) -> Temporality {
+-    // Select before resolving Statsig to OTLP so its built-in route stays Delta.
+-    match exporter {
+-        OtelExporter::None | OtelExporter::Statsig => Temporality::Delta,
+-        OtelExporter::OtlpGrpc { .. } | OtelExporter::OtlpHttp { .. } => match preference {
+-            Some(value) if value.eq_ignore_ascii_case("cumulative") => Temporality::Cumulative,
+-            Some(value) if value.eq_ignore_ascii_case("lowmemory") => Temporality::LowMemory,
+-            // Preserve Codex's existing default for unset, empty, or unknown values.
+-            _ => Temporality::Delta,
+-        },
+-    }
+-}
+-
+-fn build_otlp_metric_exporter(
+-    exporter: OtelExporter,
+-    temporality: Temporality,
+-    factory: &codex_http_client::HttpClientFactory,
+-) -> Result<opentelemetry_otlp::MetricExporter> {
+-    match exporter {
+-        OtelExporter::None => Err(MetricsError::ExporterDisabled),
+-        OtelExporter::Statsig => build_otlp_metric_exporter(
+-            crate::config::resolve_exporter(&OtelExporter::Statsig),
+-            temporality,
+-            factory,
+-        ),
+-        OtelExporter::OtlpGrpc {
+-            endpoint,
+-            headers,
+-            tls,
+-        } => {
+-            debug!("Using OTLP Grpc exporter for metrics: {endpoint}");
+-
+-            let header_map = crate::otlp::build_header_map(&headers);
+-
+-            let base_tls_config = ClientTlsConfig::new()
+-                .with_enabled_roots()
+-                .assume_http2(true);
+-
+-            let tls_config = match tls.as_ref() {
+-                Some(tls) => crate::otlp::build_grpc_tls_config(&endpoint, base_tls_config, tls)
+-                    .map_err(|err| MetricsError::InvalidConfig {
+-                        message: err.to_string(),
+-                    })?,
+-                None => base_tls_config,
+-            };
+-
+-            opentelemetry_otlp::MetricExporter::builder()
+-                .with_tonic()
+-                .with_endpoint(endpoint)
+-                .with_temporality(temporality)
+-                .with_metadata(MetadataMap::from_headers(header_map))
+-                .with_tls_config(tls_config)
+-                .build()
+-                .map_err(|source| MetricsError::ExporterBuild { source })
+-        }
+-        OtelExporter::OtlpHttp {
+-            endpoint,
+-            headers,
+-            protocol,
+-            tls,
+-        } => {
+-            debug!("Using OTLP Http exporter for metrics: {endpoint}");
+-
+-            let protocol = match protocol {
+-                OtelHttpProtocol::Binary => Protocol::HttpBinary,
+-                OtelHttpProtocol::Json => Protocol::HttpJson,
+-            };
+-
+-            let mut exporter_builder = opentelemetry_otlp::MetricExporter::builder()
+-                .with_http()
+-                .with_endpoint(endpoint)
+-                .with_temporality(temporality)
+-                .with_protocol(protocol)
+-                .with_headers(headers);
+-
+-            if factory.network_policy().is_managed() {
+-                let client = crate::otlp::build_async_http_client(
+-                    factory,
+-                    tls.as_ref(),
+-                    OTEL_EXPORTER_OTLP_METRICS_TIMEOUT,
+-                )
+-                .map_err(|err| MetricsError::InvalidConfig {
+-                    message: err.to_string(),
+-                })?;
+-                exporter_builder = exporter_builder.with_http_client(client);
+-            } else if let Some(tls) = tls.as_ref() {
+-                let client =
+-                    crate::otlp::build_http_client(tls, OTEL_EXPORTER_OTLP_METRICS_TIMEOUT)
+-                        .map_err(|err| MetricsError::InvalidConfig {
+-                            message: err.to_string(),
+-                        })?;
+-                exporter_builder = exporter_builder.with_http_client(client);
+-            }
+-
+-            exporter_builder
+-                .build()
+-                .map_err(|source| MetricsError::ExporterBuild { source })
+-        }
+-    }
+-}
+diff --git a/codex-rs/otel/src/metrics/error.rs b/codex-rs/otel/src/metrics/error.rs
+index 7312992b1bc2188faa30d88337ab2a9fa9a94537..74f30bc549500b3dd23fd6e790a578f183cfbc79 100644
+--- a/codex-rs/otel/src/metrics/error.rs
++++ b/codex-rs/otel/src/metrics/error.rs
+@@ -23,12 +23,6 @@ pub enum MetricsError {
+     #[error("counter increment must be non-negative for {name}: {inc}")]
+     NegativeCounterIncrement { name: String, inc: i64 },
+ 
+-    #[error("failed to build OTLP metrics exporter")]
+-    ExporterBuild {
+-        #[source]
+-        source: opentelemetry_otlp::ExporterBuildError,
+-    },
+-
+     #[error("invalid OTLP metrics configuration: {message}")]
+     InvalidConfig { message: String },
+ 
+diff --git a/codex-rs/otel/src/provider.rs b/codex-rs/otel/src/provider.rs
+index 24b118a8a9ab3c2c8da5f9394e4d9d4de48b360b..833ab7fd36e2449895e8071b4714f38b90768164 100644
+--- a/codex-rs/otel/src/provider.rs
++++ b/codex-rs/otel/src/provider.rs
+@@ -1,854 +1,60 @@
+-use crate::config::OtelExporter;
+-use crate::config::OtelHttpProtocol;
+ use crate::config::OtelSettings;
+-use crate::config::StatsigMetricsSettings;
+ use crate::metrics::MetricsClient;
+-use crate::metrics::MetricsConfig;
+-use crate::targets::is_log_export_target;
+-use crate::targets::is_trace_safe_target;
+-use gethostname::gethostname;
+-use opentelemetry::Context;
+-use opentelemetry::KeyValue;
+-use opentelemetry::global;
+-use opentelemetry::trace::Span as _;
+-use opentelemetry::trace::SpanBuilder;
+-use opentelemetry::trace::TracerProvider as _;
+-use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+-use opentelemetry_otlp::LogExporter;
+-use opentelemetry_otlp::OTEL_EXPORTER_OTLP_LOGS_TIMEOUT;
+-use opentelemetry_otlp::OTEL_EXPORTER_OTLP_TRACES_TIMEOUT;
+-use opentelemetry_otlp::Protocol;
+-use opentelemetry_otlp::SpanExporter;
+-use opentelemetry_otlp::WithExportConfig;
+-use opentelemetry_otlp::WithHttpConfig;
+-use opentelemetry_otlp::WithTonicConfig;
+-use opentelemetry_otlp::tonic_types::metadata::MetadataMap;
+-use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+-use opentelemetry_sdk::Resource;
+-use opentelemetry_sdk::error::OTelSdkResult;
+-use opentelemetry_sdk::logs::SdkLoggerProvider;
+-use opentelemetry_sdk::propagation::TraceContextPropagator;
+-use opentelemetry_sdk::runtime;
+-use opentelemetry_sdk::trace::BatchSpanProcessor;
+-use opentelemetry_sdk::trace::SdkTracerProvider;
+-use opentelemetry_sdk::trace::Span;
+-use opentelemetry_sdk::trace::SpanData;
+-use opentelemetry_sdk::trace::SpanProcessor;
+-use opentelemetry_sdk::trace::Tracer;
+-use opentelemetry_sdk::trace::TracerProviderBuilder;
+-use opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProcessor as TokioBatchSpanProcessor;
+-use opentelemetry_semantic_conventions as semconv;
+-use std::collections::BTreeMap;
+ use std::error::Error;
+-use std::io;
+-use std::mem::ManuallyDrop;
+-use std::sync::atomic::AtomicBool;
+-use std::sync::atomic::Ordering;
+-use std::sync::mpsc;
+ use std::time::Duration;
+-use tracing::debug;
+ use tracing_subscriber::Layer;
+-use tracing_subscriber::registry::LookupSpan;
+-
+-const ENV_ATTRIBUTE: &str = "env";
+-const HOST_NAME_ATTRIBUTE: &str = "host.name";
+-
+-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+-enum ResourceKind {
+-    Logs,
+-    Traces,
+-}
+ 
++/// Retains local instrumentation interfaces without constructing network exporters.
+ pub struct OtelProvider {
+-    pub logger: Option<SdkLoggerProvider>,
+-    pub tracer_provider: Option<SdkTracerProvider>,
+-    pub tracer: Option<Tracer>,
++    pub logger: Option<opentelemetry_sdk::logs::SdkLoggerProvider>,
++    pub tracer_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
++    pub tracer: Option<opentelemetry_sdk::trace::Tracer>,
+     pub metrics: Option<MetricsClient>,
+-    shutdown_started: AtomicBool,
+-    shutdown_worker: Option<mpsc::SyncSender<ShutdownWorker>>,
+-}
+-
+-struct ShutdownWorker {
+-    provider: ManuallyDrop<OtelProvider>,
+-    completed_tx: tokio::sync::oneshot::Sender<()>,
+-}
+-
+-struct ShutdownWorkerStartup {
+-    worker_rx: mpsc::Receiver<ShutdownWorker>,
+-    ready_tx: mpsc::SyncSender<()>,
+-}
+-
+-#[derive(Debug)]
+-struct GlobalTracer {
+-    service_name: &'static str,
+-}
+-
+-impl opentelemetry::trace::Tracer for GlobalTracer {
+-    type Span = global::BoxedSpan;
+-
+-    fn build_with_context(&self, builder: SpanBuilder, parent: &Context) -> Self::Span {
+-        global::tracer(self.service_name).build_with_context(builder, parent)
+-    }
+ }
+ 
+ impl OtelProvider {
+-    /// Flushes and shuts down configured exporters at most once.
+-    pub fn shutdown(&self) {
+-        if self.shutdown_started.swap(/*val*/ true, Ordering::AcqRel) {
+-            return;
+-        }
+-
+-        if let Some(tracer_provider) = &self.tracer_provider {
+-            let _ = tracer_provider.shutdown();
+-        }
+-        if let Some(metrics) = &self.metrics {
+-            let _ = metrics.shutdown();
+-        }
+-        if let Some(logger) = &self.logger {
+-            let _ = logger.shutdown();
+-        }
+-    }
+-
+-    /// Starts the detached shutdown worker before shutdown-time resource pressure.
+-    fn prepare_shutdown_worker(&mut self) -> io::Result<()> {
+-        self.prepare_shutdown_worker_with_spawner(|startup| {
+-            std::thread::Builder::new()
+-                .name("codex-otel-shutdown".to_string())
+-                .spawn(move || {
+-                    if startup.ready_tx.send(()).is_err() {
+-                        return;
+-                    }
+-                    let Ok(worker) = startup.worker_rx.recv() else {
+-                        return;
+-                    };
+-                    let provider = ManuallyDrop::into_inner(worker.provider);
+-                    provider.shutdown();
+-                    drop(provider);
+-                    let _ = worker.completed_tx.send(());
+-                })
+-        })
++    pub fn try_new(_settings: &OtelSettings) -> Result<Option<Self>, Box<dyn Error>> {
++        crate::metrics::buffered::GLOBAL.disable();
++        Ok(None)
+     }
+ 
+-    fn prepare_shutdown_worker_with_spawner<F>(&mut self, spawn: F) -> io::Result<()>
+-    where
+-        F: FnOnce(ShutdownWorkerStartup) -> io::Result<std::thread::JoinHandle<()>>,
+-    {
+-        if self.shutdown_worker.is_some() {
+-            return Ok(());
+-        }
++    pub fn shutdown(&self) {}
+ 
+-        let (worker_tx, worker_rx) = mpsc::sync_channel(/*bound*/ 1);
+-        let (ready_tx, ready_rx) = mpsc::sync_channel(/*bound*/ 1);
+-        let startup = ShutdownWorkerStartup {
+-            worker_rx,
+-            ready_tx,
+-        };
+-        let _shutdown_worker = spawn(startup)?;
+-        ready_rx.recv().map_err(|_| {
+-            io::Error::new(
+-                io::ErrorKind::BrokenPipe,
+-                "telemetry shutdown worker stopped before initializing",
+-            )
+-        })?;
+-        self.shutdown_worker = Some(worker_tx);
++    pub async fn shutdown_with_timeout(self, _timeout: Duration) -> std::io::Result<()> {
+         Ok(())
+     }
+ 
+-    /// Shuts down exporters on a prepared detached thread within a time budget.
+-    pub async fn shutdown_with_timeout(mut self, timeout: Duration) -> io::Result<()> {
+-        let Some(worker_tx) = self.shutdown_worker.take() else {
+-            // Best-effort shutdown must not run a potentially blocking destructor
+-            // when its worker could not be prepared.
+-            let _provider = ManuallyDrop::new(self);
+-            return Err(io::Error::new(
+-                io::ErrorKind::NotConnected,
+-                "telemetry shutdown worker was not initialized",
+-            ));
+-        };
+-
+-        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+-        let worker = ShutdownWorker {
+-            provider: ManuallyDrop::new(self),
+-            completed_tx,
+-        };
+-        worker_tx.send(worker).map_err(|_| {
+-            io::Error::new(
+-                io::ErrorKind::BrokenPipe,
+-                "telemetry shutdown worker stopped before receiving the provider",
+-            )
+-        })?;
+-
+-        match tokio::time::timeout(timeout, completed_rx).await {
+-            Ok(Ok(())) => Ok(()),
+-            Ok(Err(_)) => Err(io::Error::new(
+-                io::ErrorKind::BrokenPipe,
+-                "telemetry shutdown worker stopped before completing",
+-            )),
+-            Err(_) => Err(io::Error::new(
+-                io::ErrorKind::TimedOut,
+-                "telemetry shutdown exceeded its time budget",
+-            )),
+-        }
+-    }
+-
+-    pub fn try_new(settings: &OtelSettings) -> Result<Option<Self>, Box<dyn Error>> {
+-        let log_enabled = !matches!(settings.exporter, OtelExporter::None);
+-        let trace_enabled = !matches!(settings.trace_exporter, OtelExporter::None);
+-        let metric_exporter = crate::config::resolve_exporter(&settings.metrics_exporter);
+-        let metrics_enabled = !matches!(metric_exporter, OtelExporter::None);
+-
+-        if !log_enabled && !trace_enabled && !metrics_enabled {
+-            // Tracestate propagation is process-global; clear it when these
+-            // settings do not install an active provider.
+-            crate::trace_context::set_tracestate_entries(BTreeMap::new())?;
+-            crate::metrics::buffered::GLOBAL.disable();
+-            debug!("No OTEL exporter enabled in settings.");
+-            return Ok(None);
+-        }
+-
+-        // Provider setup installs process-global OTEL state that cannot be
+-        // rolled back. Validate trace metadata before any setup path can
+-        // mutate those globals, and keep span attribute checks aligned with
+-        // config loading when traces are exported.
+-        if trace_enabled {
+-            crate::config::validate_span_attributes(&settings.span_attributes)?;
+-        }
+-        crate::trace_context::validate_tracestate_entries(&settings.tracestate)?;
+-
+-        let metrics = if matches!(metric_exporter, OtelExporter::None) {
+-            None
+-        } else {
+-            let mut config = MetricsConfig::otlp(
+-                settings.environment.clone(),
+-                settings.service_name.clone(),
+-                settings.service_version.clone(),
+-                settings.metrics_exporter.clone(),
+-            )
+-            .with_http_client_factory(settings.http_client_factory.clone());
+-            if settings.runtime_metrics {
+-                config = config.with_runtime_reader();
+-            }
+-            Some(MetricsClient::new(config)?)
+-        };
+-
+-        let log_resource = make_resource(settings, ResourceKind::Logs);
+-        let trace_resource = make_resource(settings, ResourceKind::Traces);
+-        let logger = log_enabled
+-            .then(|| {
+-                build_logger(
+-                    &log_resource,
+-                    &settings.exporter,
+-                    &settings.http_client_factory,
+-                )
+-            })
+-            .transpose()?;
+-
+-        let tracer_provider = trace_enabled
+-            .then(|| {
+-                build_tracer_provider(
+-                    &trace_resource,
+-                    &settings.trace_exporter,
+-                    settings.span_attributes.clone(),
+-                    &settings.http_client_factory,
+-                )
+-            })
+-            .transpose()?;
+-
+-        let tracer = tracer_provider
+-            .as_ref()
+-            .map(|provider| provider.tracer(settings.service_name.clone()));
+-
+-        let mut provider = Self {
+-            logger,
+-            tracer_provider,
+-            tracer,
+-            metrics,
+-            shutdown_started: AtomicBool::default(),
+-            shutdown_worker: None,
+-        };
+-        provider.prepare_shutdown_worker()?;
+-
+-        crate::trace_context::set_tracestate_entries(settings.tracestate.clone())?;
+-        if let Some(tracer_provider) = provider.tracer_provider.clone() {
+-            global::set_tracer_provider(tracer_provider);
+-            global::set_text_map_propagator(TraceContextPropagator::new());
+-        }
+-        if let Some(metrics) = provider.metrics.as_mut() {
+-            *metrics = crate::metrics::install_global(metrics.clone());
+-            if matches!(settings.metrics_exporter, OtelExporter::Statsig) {
+-                crate::metrics::install_global_statsig_settings(StatsigMetricsSettings {
+-                    environment: settings.environment.clone(),
+-                });
+-            }
+-        } else {
+-            crate::metrics::buffered::GLOBAL.disable();
+-        }
+-        Ok(Some(provider))
+-    }
+-
+-    pub fn logger_layer<S>(&self) -> Option<impl Layer<S> + Send + Sync>
+-    where
+-        S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
+-    {
+-        self.logger_export_layer().map(|layer| {
+-            layer.with_filter(tracing_subscriber::filter::filter_fn(
+-                OtelProvider::log_export_filter,
+-            ))
+-        })
++    pub fn logger_layer<S: tracing::Subscriber>(&self) -> Option<impl Layer<S> + Send + Sync> {
++        None::<tracing_subscriber::layer::Identity>
+     }
+ 
+-    /// Returns a log-export bridge that must be installed beneath the log export filter.
+-    pub fn logger_export_layer<S>(&self) -> Option<impl Layer<S> + Send + Sync>
+-    where
+-        S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
+-    {
+-        self.logger.as_ref().map(OpenTelemetryTracingBridge::new)
++    pub fn logger_export_layer<S: tracing::Subscriber>(
++        &self,
++    ) -> Option<impl Layer<S> + Send + Sync> {
++        None::<tracing_subscriber::layer::Identity>
+     }
+ 
+-    pub fn tracing_layer<S>(&self) -> Option<impl Layer<S> + Send + Sync>
+-    where
+-        S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
+-    {
+-        self.tracer.as_ref().map(|tracer| {
+-            tracing_opentelemetry::layer()
+-                .with_tracer(tracer.clone())
+-                .with_filter(tracing_subscriber::filter::filter_fn(
+-                    OtelProvider::trace_export_filter,
+-                ))
+-        })
++    pub fn tracing_layer<S: tracing::Subscriber>(&self) -> Option<impl Layer<S> + Send + Sync> {
++        None::<tracing_subscriber::layer::Identity>
+     }
+ 
+-    /// Returns a permanent trace layer that follows the process-global tracer provider.
+-    pub fn reloadable_tracing_layer<S>(service_name: &'static str) -> impl Layer<S> + Send + Sync
+-    where
+-        S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
+-    {
+-        tracing_opentelemetry::layer()
+-            .with_tracer(GlobalTracer { service_name })
+-            .with_filter(tracing_subscriber::filter::filter_fn(
+-                Self::trace_export_filter,
+-            ))
++    pub fn reloadable_tracing_layer<S: tracing::Subscriber>(
++        _service_name: &'static str,
++    ) -> impl Layer<S> + Send + Sync {
++        tracing_subscriber::layer::Identity::new()
+     }
+ 
+-    pub fn codex_export_filter(meta: &tracing::Metadata<'_>) -> bool {
+-        Self::log_export_filter(meta)
++    pub fn codex_export_filter(_meta: &tracing::Metadata<'_>) -> bool {
++        false
+     }
+-
+-    pub fn log_export_filter(meta: &tracing::Metadata<'_>) -> bool {
+-        is_log_export_target(meta.target())
++    pub fn log_export_filter(_meta: &tracing::Metadata<'_>) -> bool {
++        false
+     }
+-
+-    pub fn trace_export_filter(meta: &tracing::Metadata<'_>) -> bool {
+-        let target = meta.target();
+-        if meta.is_span() {
+-            // The exporter uses h2 and Tokio. Their root spans escape the
+-            // SDK's suppression and would generate further OTLP exports.
+-            !matches!(target.split("::").next(), Some("h2" | "tokio" | "runtime"))
+-        } else {
+-            is_trace_safe_target(target)
+-        }
++    pub fn trace_export_filter(_meta: &tracing::Metadata<'_>) -> bool {
++        false
+     }
+ 
+     pub fn metrics(&self) -> Option<&MetricsClient> {
+         self.metrics.as_ref()
+     }
+ }
+-
+-impl Drop for OtelProvider {
+-    fn drop(&mut self) {
+-        self.shutdown();
+-    }
+-}
+-
+-fn make_resource(settings: &OtelSettings, kind: ResourceKind) -> Resource {
+-    Resource::builder()
+-        .with_service_name(settings.service_name.clone())
+-        .with_attributes(resource_attributes(
+-            settings,
+-            detected_host_name().as_deref(),
+-            kind,
+-        ))
+-        .build()
+-}
+-
+-fn resource_attributes(
+-    settings: &OtelSettings,
+-    host_name: Option<&str>,
+-    kind: ResourceKind,
+-) -> Vec<KeyValue> {
+-    let mut attributes = vec![
+-        KeyValue::new(
+-            semconv::attribute::SERVICE_VERSION,
+-            settings.service_version.clone(),
+-        ),
+-        KeyValue::new(ENV_ATTRIBUTE, settings.environment.clone()),
+-    ];
+-    if kind == ResourceKind::Logs
+-        && let Some(host_name) = host_name.and_then(normalize_host_name)
+-    {
+-        attributes.push(KeyValue::new(HOST_NAME_ATTRIBUTE, host_name));
+-    }
+-    attributes
+-}
+-
+-fn detected_host_name() -> Option<String> {
+-    let host_name = gethostname();
+-    normalize_host_name(host_name.to_string_lossy().as_ref())
+-}
+-
+-fn normalize_host_name(host_name: &str) -> Option<String> {
+-    let host_name = host_name.trim();
+-    (!host_name.is_empty()).then(|| host_name.to_owned())
+-}
+-
+-fn tracer_provider_builder(
+-    resource: &Resource,
+-    span_attributes: BTreeMap<String, String>,
+-) -> TracerProviderBuilder {
+-    let builder = SdkTracerProvider::builder().with_resource(resource.clone());
+-    if span_attributes.is_empty() {
+-        builder
+-    } else {
+-        builder.with_span_processor(SpanAttributesProcessor {
+-            attributes: span_attributes,
+-        })
+-    }
+-}
+-
+-/// Applies configured attributes when spans start.
+-///
+-/// Resource attributes describe the provider process. These attributes are
+-/// per-span metadata, so they need to be attached before each span is exported.
+-#[derive(Debug)]
+-struct SpanAttributesProcessor {
+-    attributes: BTreeMap<String, String>,
+-}
+-
+-impl SpanProcessor for SpanAttributesProcessor {
+-    fn on_start(&self, span: &mut Span, _cx: &Context) {
+-        for (key, value) in self.attributes.iter() {
+-            span.set_attribute(KeyValue::new(key.clone(), value.clone()));
+-        }
+-    }
+-
+-    fn on_end(&self, _span: SpanData) {}
+-
+-    fn force_flush(&self) -> OTelSdkResult {
+-        Ok(())
+-    }
+-
+-    fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
+-        Ok(())
+-    }
+-}
+-
+-fn build_logger(
+-    resource: &Resource,
+-    exporter: &OtelExporter,
+-    factory: &codex_http_client::HttpClientFactory,
+-) -> Result<SdkLoggerProvider, Box<dyn Error>> {
+-    let mut builder = SdkLoggerProvider::builder().with_resource(resource.clone());
+-
+-    match crate::config::resolve_exporter(exporter) {
+-        OtelExporter::None => return Ok(builder.build()),
+-        OtelExporter::Statsig => unreachable!("statsig exporter should be resolved"),
+-        OtelExporter::OtlpGrpc {
+-            endpoint,
+-            headers,
+-            tls,
+-        } => {
+-            debug!("Using OTLP Grpc exporter: {endpoint}");
+-
+-            let header_map = crate::otlp::build_header_map(&headers);
+-
+-            let base_tls_config = ClientTlsConfig::new()
+-                .with_enabled_roots()
+-                .assume_http2(true);
+-
+-            let tls_config = match tls.as_ref() {
+-                Some(tls) => crate::otlp::build_grpc_tls_config(&endpoint, base_tls_config, tls)?,
+-                None => base_tls_config,
+-            };
+-
+-            let exporter = LogExporter::builder()
+-                .with_tonic()
+-                .with_endpoint(endpoint)
+-                .with_metadata(MetadataMap::from_headers(header_map))
+-                .with_tls_config(tls_config)
+-                .build()?;
+-
+-            builder = builder.with_batch_exporter(crate::network_policy::PolicyExporter {
+-                exporter,
+-                policy: factory.network_policy().clone(),
+-            });
+-        }
+-        OtelExporter::OtlpHttp {
+-            endpoint,
+-            headers,
+-            protocol,
+-            tls,
+-        } => {
+-            debug!("Using OTLP Http exporter: {endpoint}");
+-
+-            let protocol = match protocol {
+-                OtelHttpProtocol::Binary => Protocol::HttpBinary,
+-                OtelHttpProtocol::Json => Protocol::HttpJson,
+-            };
+-
+-            let mut exporter_builder = LogExporter::builder()
+-                .with_http()
+-                .with_endpoint(endpoint)
+-                .with_protocol(protocol)
+-                .with_headers(headers);
+-
+-            if factory.network_policy().is_managed() {
+-                let client = crate::otlp::build_async_http_client(
+-                    factory,
+-                    tls.as_ref(),
+-                    OTEL_EXPORTER_OTLP_LOGS_TIMEOUT,
+-                )?;
+-                exporter_builder = exporter_builder.with_http_client(client);
+-            } else if let Some(tls) = tls.as_ref() {
+-                let client = crate::otlp::build_http_client(tls, OTEL_EXPORTER_OTLP_LOGS_TIMEOUT)?;
+-                exporter_builder = exporter_builder.with_http_client(client);
+-            }
+-
+-            let exporter = exporter_builder.build()?;
+-
+-            builder = builder.with_batch_exporter(crate::network_policy::PolicyExporter {
+-                exporter,
+-                policy: factory.network_policy().clone(),
+-            });
+-        }
+-    }
+-
+-    Ok(builder.build())
+-}
+-
+-fn build_tracer_provider(
+-    resource: &Resource,
+-    exporter: &OtelExporter,
+-    span_attributes: BTreeMap<String, String>,
+-    factory: &codex_http_client::HttpClientFactory,
+-) -> Result<SdkTracerProvider, Box<dyn Error>> {
+-    let span_exporter = match crate::config::resolve_exporter(exporter) {
+-        OtelExporter::None => return Ok(tracer_provider_builder(resource, span_attributes).build()),
+-        OtelExporter::Statsig => unreachable!("statsig exporter should be resolved"),
+-        OtelExporter::OtlpGrpc {
+-            endpoint,
+-            headers,
+-            tls,
+-        } => {
+-            debug!("Using OTLP Grpc exporter for traces: {endpoint}");
+-
+-            let header_map = crate::otlp::build_header_map(&headers);
+-
+-            let base_tls_config = ClientTlsConfig::new()
+-                .with_enabled_roots()
+-                .assume_http2(true);
+-
+-            let tls_config = match tls.as_ref() {
+-                Some(tls) => crate::otlp::build_grpc_tls_config(&endpoint, base_tls_config, tls)?,
+-                None => base_tls_config,
+-            };
+-
+-            SpanExporter::builder()
+-                .with_tonic()
+-                .with_endpoint(endpoint)
+-                .with_metadata(MetadataMap::from_headers(header_map))
+-                .with_tls_config(tls_config)
+-                .build()?
+-        }
+-        OtelExporter::OtlpHttp {
+-            endpoint,
+-            headers,
+-            protocol,
+-            tls,
+-        } => {
+-            debug!("Using OTLP Http exporter for traces: {endpoint}");
+-
+-            if crate::otlp::current_tokio_runtime_is_multi_thread() {
+-                let protocol = match protocol {
+-                    OtelHttpProtocol::Binary => Protocol::HttpBinary,
+-                    OtelHttpProtocol::Json => Protocol::HttpJson,
+-                };
+-
+-                let mut exporter_builder = SpanExporter::builder()
+-                    .with_http()
+-                    .with_endpoint(endpoint)
+-                    .with_protocol(protocol)
+-                    .with_headers(headers);
+-
+-                let client = crate::otlp::build_async_http_client(
+-                    factory,
+-                    tls.as_ref(),
+-                    OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
+-                )?;
+-                exporter_builder = exporter_builder.with_http_client(client);
+-
+-                let processor = TokioBatchSpanProcessor::builder(
+-                    crate::network_policy::PolicyExporter {
+-                        exporter: exporter_builder.build()?,
+-                        policy: factory.network_policy().clone(),
+-                    },
+-                    runtime::Tokio,
+-                )
+-                .build();
+-
+-                return Ok(tracer_provider_builder(resource, span_attributes)
+-                    .with_span_processor(processor)
+-                    .build());
+-            }
+-
+-            let protocol = match protocol {
+-                OtelHttpProtocol::Binary => Protocol::HttpBinary,
+-                OtelHttpProtocol::Json => Protocol::HttpJson,
+-            };
+-
+-            let mut exporter_builder = SpanExporter::builder()
+-                .with_http()
+-                .with_endpoint(endpoint)
+-                .with_protocol(protocol)
+-                .with_headers(headers);
+-
+-            if factory.network_policy().is_managed() {
+-                let client = crate::otlp::build_async_http_client(
+-                    factory,
+-                    tls.as_ref(),
+-                    OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
+-                )?;
+-                exporter_builder = exporter_builder.with_http_client(client);
+-            } else if let Some(tls) = tls.as_ref() {
+-                let client =
+-                    crate::otlp::build_http_client(tls, OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)?;
+-                exporter_builder = exporter_builder.with_http_client(client);
+-            }
+-
+-            exporter_builder.build()?
+-        }
+-    };
+-
+-    let processor = BatchSpanProcessor::builder(crate::network_policy::PolicyExporter {
+-        exporter: span_exporter,
+-        policy: factory.network_policy().clone(),
+-    })
+-    .build();
+-
+-    Ok(tracer_provider_builder(resource, span_attributes)
+-        .with_span_processor(processor)
+-        .build())
+-}
+-
+-#[cfg(test)]
+-#[path = "provider_shutdown_tests.rs"]
+-mod shutdown_tests;
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-    use crate::metrics::API_CALL_COUNT_METRIC;
+-    use crate::metrics::API_CALL_DURATION_METRIC;
+-    use crate::metrics::EXEC_SERVER_CLIENT_REQUEST_COUNT_METRIC;
+-    use crate::metrics::MetricsExporter;
+-    use crate::metrics::RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC;
+-    use crate::metrics::RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC;
+-    use crate::metrics::RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC;
+-    use crate::metrics::TOOL_CALL_COUNT_METRIC;
+-    use crate::metrics::TOOL_CALL_DURATION_METRIC;
+-    use crate::metrics::TURN_COST_MICROUSD_METRIC;
+-    use crate::metrics::TURN_TOKEN_USAGE_METRIC;
+-    use codex_http_client::HttpClientFactory;
+-    use codex_http_client::OutboundProxyPolicy;
+-    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+-    use pretty_assertions::assert_eq;
+-    use std::path::PathBuf;
+-
+-    #[test]
+-    fn resource_attributes_include_host_name_when_present() {
+-        let attrs = resource_attributes(
+-            &test_otel_settings(),
+-            Some("opentelemetry-test"),
+-            ResourceKind::Logs,
+-        );
+-
+-        let host_name = attrs
+-            .iter()
+-            .find(|kv| kv.key.as_str() == HOST_NAME_ATTRIBUTE)
+-            .map(|kv| kv.value.as_str().to_string());
+-
+-        assert_eq!(host_name, Some("opentelemetry-test".to_string()));
+-    }
+-
+-    #[test]
+-    fn resource_attributes_omit_host_name_when_missing_or_empty() {
+-        let missing = resource_attributes(
+-            &test_otel_settings(),
+-            /*host_name*/ None,
+-            ResourceKind::Logs,
+-        );
+-        let empty = resource_attributes(&test_otel_settings(), Some("   "), ResourceKind::Logs);
+-        let trace_attrs = resource_attributes(
+-            &test_otel_settings(),
+-            Some("opentelemetry-test"),
+-            ResourceKind::Traces,
+-        );
+-
+-        assert!(
+-            !missing
+-                .iter()
+-                .any(|kv| kv.key.as_str() == HOST_NAME_ATTRIBUTE)
+-        );
+-        assert!(
+-            !empty
+-                .iter()
+-                .any(|kv| kv.key.as_str() == HOST_NAME_ATTRIBUTE)
+-        );
+-        assert!(
+-            !trace_attrs
+-                .iter()
+-                .any(|kv| kv.key.as_str() == HOST_NAME_ATTRIBUTE)
+-        );
+-    }
+-
+-    #[test]
+-    fn log_export_target_excludes_trace_safe_events() {
+-        assert!(is_log_export_target("codex_otel.log_only"));
+-        assert!(is_log_export_target("codex_otel.network_proxy"));
+-        assert!(!is_log_export_target("codex_otel.trace_safe"));
+-        assert!(!is_log_export_target("codex_otel.trace_safe.debug"));
+-    }
+-
+-    #[test]
+-    fn trace_export_target_only_includes_trace_safe_prefix() {
+-        assert!(is_trace_safe_target("codex_otel.trace_safe"));
+-        assert!(is_trace_safe_target("codex_otel.trace_safe.summary"));
+-        assert!(!is_trace_safe_target("codex_otel.log_only"));
+-        assert!(!is_trace_safe_target("codex_otel.network_proxy"));
+-    }
+-
+-    #[test]
+-    fn cached_global_metrics_follow_reinstalled_provider() -> Result<(), Box<dyn Error>> {
+-        let initial =
+-            crate::metrics::install_global(MetricsClient::new(MetricsConfig::in_memory(
+-                "test",
+-                "codex-test",
+-                env!("CARGO_PKG_VERSION"),
+-                InMemoryMetricExporter::default(),
+-            ))?);
+-        crate::metrics::install_global_statsig_settings(StatsigMetricsSettings {
+-            environment: "test".to_string(),
+-        });
+-        assert!(crate::metrics::global_statsig_settings().is_some());
+-        let controller = codex_http_client::NetworkPolicyController::default();
+-        let policy = controller.policy();
+-        controller.publish(
+-            policy.revision(),
+-            codex_http_client::DestinationPolicy::Unrestricted,
+-        );
+-        let cached = crate::metrics::global().expect("initial global metrics client");
+-
+-        let exporter = InMemoryMetricExporter::default();
+-        let replacement = crate::metrics::install_global(MetricsClient::new(
+-            MetricsConfig::in_memory(
+-                "test",
+-                "codex-test",
+-                env!("CARGO_PKG_VERSION"),
+-                exporter.clone(),
+-            )
+-            .with_http_client_factory(
+-                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+-                    .with_network_policy(policy),
+-            ),
+-        )?);
+-        assert!(crate::metrics::global_statsig_settings().is_none());
+-        cached.counter("codex.after_transition", /*inc*/ 1, &[])?;
+-        initial.shutdown()?;
+-        replacement.shutdown()?;
+-
+-        let exported_metrics = exporter.get_finished_metrics()?;
+-        let mut names: Vec<_> = exported_metrics
+-            .iter()
+-            .flat_map(opentelemetry_sdk::metrics::data::ResourceMetrics::scope_metrics)
+-            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+-            .map(opentelemetry_sdk::metrics::data::Metric::name)
+-            .collect();
+-        names.sort_unstable();
+-        names.dedup();
+-        assert_eq!(names, vec!["codex.after_transition"]);
+-
+-        Ok(())
+-    }
+-
+-    #[test]
+-    fn statsig_disabled_metrics_are_not_exported() -> Result<(), Box<dyn Error>> {
+-        let exporter = InMemoryMetricExporter::default();
+-        let mut config = MetricsConfig::otlp(
+-            "test",
+-            "codex-cli",
+-            env!("CARGO_PKG_VERSION"),
+-            OtelExporter::Statsig,
+-        );
+-        config.exporter = MetricsExporter::InMemory(exporter.clone());
+-        let metrics = MetricsClient::new(config)?;
+-
+-        metrics.counter(API_CALL_COUNT_METRIC, /*inc*/ 1, &[])?;
+-        metrics.record_duration(API_CALL_DURATION_METRIC, Duration::from_millis(100), &[])?;
+-        metrics.counter_with_description(
+-            EXEC_SERVER_CLIENT_REQUEST_COUNT_METRIC,
+-            "Client-side exec-server RPC attempts.",
+-            /*inc*/ 1,
+-            &[("method", "fs/readFile")],
+-        )?;
+-        metrics.counter("codex.conversation.turn.count", /*inc*/ 1, &[])?;
+-        metrics.record_duration(
+-            RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC,
+-            Duration::from_millis(100),
+-            &[],
+-        )?;
+-        metrics.record_duration(
+-            RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC,
+-            Duration::from_millis(100),
+-            &[],
+-        )?;
+-        metrics.record_duration(
+-            RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC,
+-            Duration::from_millis(100),
+-            &[],
+-        )?;
+-        metrics.counter(TOOL_CALL_COUNT_METRIC, /*inc*/ 1, &[])?;
+-        metrics.record_duration(TOOL_CALL_DURATION_METRIC, Duration::from_millis(25), &[])?;
+-        metrics.counter(TURN_COST_MICROUSD_METRIC, /*inc*/ 1, &[])?;
+-        metrics.histogram(TURN_TOKEN_USAGE_METRIC, /*value*/ 100, &[])?;
+-        metrics.counter("codex.turns", /*inc*/ 1, &[])?;
+-        metrics.shutdown()?;
+-
+-        let exported_metrics = exporter.get_finished_metrics()?;
+-        let mut names: Vec<_> = exported_metrics
+-            .iter()
+-            .flat_map(opentelemetry_sdk::metrics::data::ResourceMetrics::scope_metrics)
+-            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+-            .map(opentelemetry_sdk::metrics::data::Metric::name)
+-            .collect();
+-        names.sort_unstable();
+-        names.dedup();
+-        assert_eq!(names, vec!["codex.turns"]);
+-
+-        Ok(())
+-    }
+-
+-    fn test_otel_settings() -> OtelSettings {
+-        OtelSettings {
+-            http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+-            environment: "test".to_string(),
+-            service_name: "codex-test".to_string(),
+-            service_version: "0.0.0".to_string(),
+-            codex_home: PathBuf::from("."),
+-            exporter: OtelExporter::None,
+-            trace_exporter: OtelExporter::None,
+-            metrics_exporter: OtelExporter::None,
+-            runtime_metrics: false,
+-            span_attributes: BTreeMap::new(),
+-            tracestate: BTreeMap::new(),
+-        }
+-    }
+-}

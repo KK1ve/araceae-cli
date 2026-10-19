@@ -1,0 +1,255 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Sat, 17 Oct 2026 11:55:18 +0800
+Subject: [PATCH] Add a dedicated app-server runtime entrypoint
+
+---
+ codex-rs/Cargo.lock              |  16 +++
+ codex-rs/Cargo.toml              |   1 +
+ codex-rs/runtime-cli/Cargo.toml  |  26 +++++
+ codex-rs/runtime-cli/src/main.rs | 164 +++++++++++++++++++++++++++++++
+ 4 files changed, 207 insertions(+)
+ create mode 100644 codex-rs/runtime-cli/Cargo.toml
+ create mode 100644 codex-rs/runtime-cli/src/main.rs
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index dfb17c17c723c6f70afbf2a9199a361465c768e2..0c649019af7c83049fe43f7e8a62d6d129ad93af 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -333,6 +333,22 @@ dependencies = [
+  "num-traits",
+ ]
+ 
++[[package]]
++name = "araceae-codex-runtime"
++version = "0.163.0"
++dependencies = [
++ "anyhow",
++ "clap",
++ "codex-app-server",
++ "codex-app-server-protocol",
++ "codex-arg0",
++ "codex-config",
++ "codex-protocol",
++ "codex-utils-cli",
++ "codex-websocket-auth",
++ "tikv-jemallocator",
++]
++
+ [[package]]
+ name = "arbitrary"
+ version = "1.4.2"
+diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
+index e84b9776a1a7b161a522773686888e10e248756c..d8617c9f0a4e929729c1a1fed4041cf2d4b13916 100644
+--- a/codex-rs/Cargo.toml
++++ b/codex-rs/Cargo.toml
+@@ -14,6 +14,7 @@ members = [
+     "attachment-store",
+     "async-utils",
+     "app-server",
++    "runtime-cli",
+     "app-server-transport",
+     "app-server-daemon",
+     "app-server-client",
+diff --git a/codex-rs/runtime-cli/Cargo.toml b/codex-rs/runtime-cli/Cargo.toml
+new file mode 100644
+index 0000000000000000000000000000000000000000..38bc1c5412c0f4568d50cedf82545306d42e8c7d
+--- /dev/null
++++ b/codex-rs/runtime-cli/Cargo.toml
+@@ -0,0 +1,26 @@
++[package]
++name = "araceae-codex-runtime"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++
++[[bin]]
++name = "araceae-codex-runtime"
++path = "src/main.rs"
++
++[lints]
++workspace = true
++
++[dependencies]
++anyhow = { workspace = true }
++clap = { workspace = true, features = ["derive"] }
++codex-app-server = { workspace = true }
++codex-app-server-protocol = { workspace = true }
++codex-arg0 = { workspace = true }
++codex-config = { workspace = true }
++codex-protocol = { workspace = true }
++codex-utils-cli = { workspace = true }
++codex-websocket-auth = { workspace = true }
++
++[target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
++tikv-jemallocator = { workspace = true }
+diff --git a/codex-rs/runtime-cli/src/main.rs b/codex-rs/runtime-cli/src/main.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f69258b78413b22d110bd503aadc2f81a861cc5d
+--- /dev/null
++++ b/codex-rs/runtime-cli/src/main.rs
+@@ -0,0 +1,164 @@
++#![recursion_limit = "256"]
++
++use clap::Args;
++use clap::Parser;
++use clap::Subcommand;
++use codex_app_server::AppServerCodeModeHostArgs;
++use codex_app_server::AppServerExit;
++use codex_app_server::AppServerRuntimeOptions;
++use codex_app_server::AppServerTransport;
++use codex_app_server::RemoteControlStartupMode;
++use codex_arg0::arg0_dispatch_or_else;
++use codex_config::LoaderOverrides;
++use codex_protocol::protocol::SessionSource;
++use codex_utils_cli::CliConfigOverrides;
++use codex_websocket_auth::WebsocketAuthArgs;
++use std::path::PathBuf;
++
++#[cfg(all(
++    target_os = "linux",
++    target_env = "musl",
++    any(target_arch = "x86_64", target_arch = "aarch64")
++))]
++#[global_allocator]
++static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
++
++#[derive(Debug, Parser)]
++#[command(name = "codex", version, about = "Codex app-server runtime")]
++struct Cli {
++    #[command(flatten)]
++    config_overrides: CliConfigOverrides,
++
++    /// Reject unknown configuration fields.
++    #[arg(long, global = true)]
++    strict_config: bool,
++
++    #[command(subcommand)]
++    command: Command,
++}
++
++#[derive(Debug, Subcommand)]
++enum Command {
++    /// Run the application server or generate its protocol schema.
++    AppServer(AppServerCommand),
++}
++
++#[derive(Debug, Args)]
++struct AppServerCommand {
++    #[command(subcommand)]
++    command: Option<ProtocolCommand>,
++
++    #[command(flatten)]
++    code_mode_host: AppServerCodeModeHostArgs,
++
++    /// Transport endpoint URL.
++    #[arg(long, value_name = "URL", default_value = AppServerTransport::DEFAULT_LISTEN_URL)]
++    listen: AppServerTransport,
++
++    /// Use the stdio transport.
++    #[arg(long, conflicts_with = "listen")]
++    stdio: bool,
++
++    #[command(flatten)]
++    auth: WebsocketAuthArgs,
++
++    /// Enable analytics unless disabled in configuration.
++    #[arg(long)]
++    analytics_default_enabled: bool,
++
++    #[arg(long, hide = true)]
++    remote_control: bool,
++
++    #[arg(long, hide = true)]
++    managed_daemon: bool,
++}
++
++#[derive(Debug, Subcommand)]
++enum ProtocolCommand {
++    /// Generate JSON Schema for the application protocol.
++    GenerateJsonSchema(SchemaArgs),
++    /// Generate TypeScript bindings for the application protocol.
++    GenerateTs {
++        #[command(flatten)]
++        schema: SchemaArgs,
++        #[arg(long)]
++        prettier: Option<PathBuf>,
++    },
++}
++
++#[derive(Debug, Args)]
++struct SchemaArgs {
++    #[arg(long = "out", value_name = "DIR")]
++    out_dir: PathBuf,
++    #[arg(long)]
++    experimental: bool,
++}
++
++fn main() -> anyhow::Result<()> {
++    let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
++    arg0_dispatch_or_else(move |arg0_paths| async move {
++        let Cli {
++            config_overrides,
++            strict_config,
++            command: Command::AppServer(server),
++        } = Cli::parse();
++        if strict_config && server.command.is_some() {
++            anyhow::bail!("--strict-config is only supported when running app-server");
++        }
++        match server.command {
++            Some(ProtocolCommand::GenerateJsonSchema(schema)) => {
++                codex_app_server_protocol::generate_json_with_experimental(
++                    &schema.out_dir,
++                    schema.experimental,
++                )?;
++            }
++            Some(ProtocolCommand::GenerateTs { schema, prettier }) => {
++                codex_app_server_protocol::generate_ts_with_options(
++                    &schema.out_dir,
++                    prettier.as_deref(),
++                    codex_app_server_protocol::GenerateTsOptions {
++                        experimental_api: schema.experimental,
++                        ..Default::default()
++                    },
++                )?;
++            }
++            None => {
++                let transport = if server.stdio {
++                    AppServerTransport::Stdio
++                } else {
++                    server.listen
++                };
++                let options = AppServerRuntimeOptions {
++                    code_mode_host_transport: server.code_mode_host.into(),
++                    managed_daemon: server.managed_daemon,
++                    remote_control_startup_mode: match (
++                        server.remote_control,
++                        remote_control_disabled,
++                    ) {
++                        (true, _) => RemoteControlStartupMode::EnabledEphemeral,
++                        (false, true) => RemoteControlStartupMode::DisabledEphemeral,
++                        (false, false) => RemoteControlStartupMode::ResolvePersisted,
++                    },
++                    ..Default::default()
++                };
++                let exit = codex_app_server::run_main_with_transport_options(
++                    arg0_paths,
++                    config_overrides,
++                    LoaderOverrides::default(),
++                    strict_config,
++                    server.analytics_default_enabled,
++                    transport,
++                    SessionSource::VSCode,
++                    server.auth.try_into_settings()?,
++                    options,
++                )
++                .await?;
++                if exit == AppServerExit::Forced {
++                    // Forced shutdown must not wait for blocked rollout I/O during runtime teardown.
++                    std::process::exit(0);
++                }
++            }
++        }
++        Ok(())
++    })
++}

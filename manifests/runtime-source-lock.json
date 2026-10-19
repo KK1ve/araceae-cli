@@ -1,0 +1,43 @@
+{
+  "format": 1,
+  "upstream": {
+    "url": "https://github.com/openai/codex.git",
+    "tag": "rust-v0.163.0",
+    "commit": "83086188ae0614bd882818ff1aa23f3194962012",
+    "version": "0.163.0"
+  },
+  "rust_toolchain": "1.95.0",
+  "runtime": {
+    "package": "araceae-codex-runtime",
+    "binary": "araceae-codex-runtime",
+    "variant": "araceae",
+    "executables": {
+      "entrypoint": "araceae",
+      "code_mode_host": "araceae-code-mode-host",
+      "command_runner": "araceae-command-runner",
+      "windows_sandbox_setup": "araceae-windows-sandbox-setup"
+    },
+    "layout": {
+      "manifest": "araceae-package.json",
+      "resources": "araceae-resources",
+      "path": "araceae-path"
+    }
+  },
+  "baseline": {
+    "package": "codex-cli",
+    "binary": "codex",
+    "variant": "codex",
+    "executables": {
+      "entrypoint": "codex",
+      "code_mode_host": "codex-code-mode-host",
+      "command_runner": "codex-command-runner",
+      "windows_sandbox_setup": "codex-windows-sandbox-setup"
+    },
+    "layout": {
+      "manifest": "codex-package.json",
+      "resources": "codex-resources",
+      "path": "codex-path"
+    },
+    "patches": ["align-workspace-lock.patch"]
+  }
+}

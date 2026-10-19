@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Mon, 19 Oct 2026 15:49:03 +1100
+Subject: [PATCH] Default the Codex home directory to ~/.araceae
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ codex-rs/core/src/config/mod.rs                               | 4 ++--
+ codex-rs/sandboxing/src/seatbelt.rs                           | 2 +-
+ codex-rs/utils/cli/src/config_override.rs                     | 2 +-
+ codex-rs/utils/home-dir/src/lib.rs                            | 4 ++--
+ .../src/bin/command_runner/win/cwd_junction.rs                | 2 +-
+ 5 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index 9b48cff4dec83282c05cceda495bb6985eee4b52..aebdec760f823ce91f907175ba1a01ea0097ed8b 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -984,7 +984,7 @@ pub struct Config {
+     /// Memories subsystem settings.
+     pub memories: MemoriesConfig,
+ 
+-    /// Directory containing all Codex state (defaults to `~/.codex` but can be
++    /// Directory containing all Codex state (defaults to `~/.araceae` but can be
+     /// overridden by the `CODEX_HOME` environment variable).
+     pub codex_home: AbsolutePathBuf,
+ 
+@@ -5124,7 +5124,7 @@ fn normalize_guardian_policy_config(value: Option<&str>) -> Option<String> {
+ 
+ /// Returns the path to the Codex configuration directory, which can be
+ /// specified by the `CODEX_HOME` environment variable. If not set, defaults to
+-/// `~/.codex`.
++/// `~/.araceae`.
+ ///
+ /// - If `CODEX_HOME` is set, the value must exist and be a directory. The
+ ///   value will be canonicalized and this function will Err otherwise.
+diff --git a/codex-rs/sandboxing/src/seatbelt.rs b/codex-rs/sandboxing/src/seatbelt.rs
+index 0f8701a167117562d41fc372f63f4daee630cf73..8ab5cee198ab1edca8a7c8682479215e0b414ed1 100644
+--- a/codex-rs/sandboxing/src/seatbelt.rs
++++ b/codex-rs/sandboxing/src/seatbelt.rs
+@@ -447,7 +447,7 @@ fn normalize_writable_root_for_sandbox(
+             "writable root {} contains symlink component {}; symlinked writable roots are not supported.\n\
+              If this writable root is at or beneath CODEX_HOME and you trust its symlink targets, \
+              set `allow_symlinked_codex_home = true` at the top level of `$CODEX_HOME/config.toml` \
+-             (normally `~/.codex/config.toml`) on the execution host, then restart Codex or its executor. \
++             (normally `~/.araceae/config.toml`) on the execution host, then restart Codex or its executor. \
+              This opt-out trusts targets outside CODEX_HOME and targets changed between commands. \
+              It does not apply to other writable roots.",
+             root.display(),
+diff --git a/codex-rs/utils/cli/src/config_override.rs b/codex-rs/utils/cli/src/config_override.rs
+index 61177dd76567f347ee4509da27722c27a459b6bd..9e1e0f509a3cc3ae09360a648de8b0ef3d41d8e1 100644
+--- a/codex-rs/utils/cli/src/config_override.rs
++++ b/codex-rs/utils/cli/src/config_override.rs
+@@ -18,7 +18,7 @@ use toml::Value;
+ #[derive(Parser, Debug, Default, Clone)]
+ pub struct CliConfigOverrides {
+     /// Override a configuration value that would otherwise be loaded from
+-    /// `~/.codex/config.toml`. Use a dotted path (`foo.bar.baz`) to override
++    /// `~/.araceae/config.toml`. Use a dotted path (`foo.bar.baz`) to override
+     /// nested values. The `value` portion is parsed as TOML. If it fails to
+     /// parse as TOML, the raw string is used as a literal.
+     ///
+diff --git a/codex-rs/utils/home-dir/src/lib.rs b/codex-rs/utils/home-dir/src/lib.rs
+index caa43569c78bae9f5cc875092f378f4d935b8063..2aa48439b8960d941aff64f04b8630abf766e7ca 100644
+--- a/codex-rs/utils/home-dir/src/lib.rs
++++ b/codex-rs/utils/home-dir/src/lib.rs
+@@ -4,7 +4,7 @@ use std::path::PathBuf;
+ 
+ /// Returns the path to the Codex configuration directory, which can be
+ /// specified by the `CODEX_HOME` environment variable. If not set, defaults to
+-/// `~/.codex`.
++/// `~/.araceae`.
+ ///
+ /// - If `CODEX_HOME` is set, the value must exist and be a directory. The
+ ///   value will be canonicalized and this function will Err otherwise.
+@@ -56,7 +56,7 @@ fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<Abs
+                     "Could not find home directory",
+                 )
+             })?;
+-            p.push(".codex");
++            p.push(".araceae");
+             AbsolutePathBuf::from_absolute_path(p)
+         }
+     }
+diff --git a/codex-rs/windows-sandbox-rs/src/bin/command_runner/win/cwd_junction.rs b/codex-rs/windows-sandbox-rs/src/bin/command_runner/win/cwd_junction.rs
+index 9243cc67aa76af4f305595463ce8adb1bf868f19..be4a824c4b284a91c20b6e5f7f674d02bef50c1b 100644
+--- a/codex-rs/windows-sandbox-rs/src/bin/command_runner/win/cwd_junction.rs
++++ b/codex-rs/windows-sandbox-rs/src/bin/command_runner/win/cwd_junction.rs
+@@ -16,7 +16,7 @@ fn junction_name_for_path(path: &Path) -> String {
+ 
+ fn junction_root_for_userprofile(userprofile: &str) -> PathBuf {
+     PathBuf::from(userprofile)
+-        .join(".codex")
++        .join(".araceae")
+         .join(".sandbox")
+         .join("cwd")
+ }

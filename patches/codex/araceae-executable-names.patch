@@ -1,0 +1,437 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Mon, 19 Oct 2026 14:36:52 +1100
+Subject: [PATCH] Use araceae names for the runtime entrypoint and helper
+ executables
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ codex-rs/code-mode-host/Cargo.toml            |  2 +-
+ codex-rs/core/src/tools/code_mode/mod.rs      |  2 +-
+ codex-rs/install-context/src/lib.rs           |  4 ++--
+ codex-rs/linux-sandbox/src/lib.rs             |  2 +-
+ codex-rs/linux-sandbox/src/linux_run_main.rs  |  1 +
+ codex-rs/protocol/src/error.rs                |  2 +-
+ codex-rs/runtime-cli/src/main.rs              |  2 +-
+ codex-rs/sandboxing/src/landlock.rs           |  2 +-
+ codex-rs/sandboxing/src/manager.rs            |  2 +-
+ codex-rs/windows-sandbox-rs/Cargo.toml        |  4 ++--
+ codex-rs/windows-sandbox-rs/build.rs          |  2 +-
+ .../windows-sandbox-rs/src/app_package.rs     |  3 ++-
+ .../src/elevated/runner_client.rs             |  3 ++-
+ .../src/helper_materialization.rs             |  4 ++--
+ codex-rs/windows-sandbox-rs/src/setup.rs      |  2 +-
+ codex-rs/windows-sandbox-rs/src/wfp_setup.rs  |  2 +-
+ scripts/codex_package/cargo.py                | 19 +++++++++++++------
+ scripts/codex_package/cli.py                  |  2 +-
+ scripts/codex_package/layout.py               | 14 ++++++++------
+ scripts/codex_package/targets.py              | 13 +++++++++++++
+ 20 files changed, 56 insertions(+), 31 deletions(-)
+
+diff --git a/codex-rs/code-mode-host/Cargo.toml b/codex-rs/code-mode-host/Cargo.toml
+index d56661f7d0ad2ac661ae788812a23190241b2569..799521830eb19f06688d01659c827441a2ee62b2 100644
+--- a/codex-rs/code-mode-host/Cargo.toml
++++ b/codex-rs/code-mode-host/Cargo.toml
+@@ -5,7 +5,7 @@ edition.workspace = true
+ license.workspace = true
+ 
+ [[bin]]
+-name = "codex-code-mode-host"
++name = "araceae-code-mode-host"
+ path = "src/main.rs"
+ 
+ [lib]
+diff --git a/codex-rs/core/src/tools/code_mode/mod.rs b/codex-rs/core/src/tools/code_mode/mod.rs
+index 2b241ffc7d0351bdea5c18089b63db17dce7577c..b07a87551ca1ddb0ecc018c4a0009d82568f2443 100644
+--- a/codex-rs/core/src/tools/code_mode/mod.rs
++++ b/codex-rs/core/src/tools/code_mode/mod.rs
+@@ -118,7 +118,7 @@ impl CodeModeService {
+             .swap(true, Ordering::Relaxed))
+         .then(|| {
+             format!(
+-                "Code Mode is unavailable because {error}. {behavior}; enable `features.code_mode_host` and install `codex-code-mode-host`."
++                "Code Mode is unavailable because {error}. {behavior}; enable `features.code_mode_host` and install `araceae-code-mode-host`."
+             )
+         })
+     }
+diff --git a/codex-rs/install-context/src/lib.rs b/codex-rs/install-context/src/lib.rs
+index 899211bcb2f6aca17fe9a838d154b5a8e677c6e8..ac76e09282064630bbf5677d60f63681b26d32aa 100644
+--- a/codex-rs/install-context/src/lib.rs
++++ b/codex-rs/install-context/src/lib.rs
+@@ -9,9 +9,9 @@ use serde::Deserialize;
+ 
+ const BIN_DIRNAME: &str = "bin";
+ const CODE_MODE_HOST_EXECUTABLE_NAME: &str = if cfg!(windows) {
+-    "codex-code-mode-host.exe"
++    "araceae-code-mode-host.exe"
+ } else {
+-    "codex-code-mode-host"
++    "araceae-code-mode-host"
+ };
+ const PACKAGE_METADATA_FILENAME: &str = "codex-package.json";
+ const PATH_DIRNAME: &str = "codex-path";
+diff --git a/codex-rs/linux-sandbox/src/lib.rs b/codex-rs/linux-sandbox/src/lib.rs
+index fa75c702b25565a5f2a69124c650292e6f580805..fd314fe823779731b44a6398fd058b796fff5e58 100644
+--- a/codex-rs/linux-sandbox/src/lib.rs
++++ b/codex-rs/linux-sandbox/src/lib.rs
+@@ -46,5 +46,5 @@ pub fn run_main() -> ! {
+ 
+ #[cfg(not(target_os = "linux"))]
+ pub fn run_main() -> ! {
+-    panic!("codex-linux-sandbox is only supported on Linux");
++    panic!("araceae-linux-sandbox is only supported on Linux");
+ }
+diff --git a/codex-rs/linux-sandbox/src/linux_run_main.rs b/codex-rs/linux-sandbox/src/linux_run_main.rs
+index 85bb0aaa80769ee3557be5f68007a495434307f7..ce6bce9dd449cc26d925df57fc45c97718a04cd3 100644
+--- a/codex-rs/linux-sandbox/src/linux_run_main.rs
++++ b/codex-rs/linux-sandbox/src/linux_run_main.rs
+@@ -87,6 +87,7 @@ enum ProtectedCreateRemoval {
+ /// CLI surface for the Linux sandbox helper.
+ ///
+ /// Uses bubblewrap for filesystem isolation and seccomp for syscall filtering.
++#[command(name = CODEX_LINUX_SANDBOX_ARG0)]
+ pub struct LinuxSandboxCommand {
+     /// It is possible that the cwd used in the context of the sandbox policy
+     /// is different from the cwd of the process to spawn.
+diff --git a/codex-rs/protocol/src/error.rs b/codex-rs/protocol/src/error.rs
+index 8dfe556d94c8300dd10e6f93b10421eb1674567c..b1ea38760c71125b0a0f78db02930f02eee17e48 100644
+--- a/codex-rs/protocol/src/error.rs
++++ b/codex-rs/protocol/src/error.rs
+@@ -195,7 +195,7 @@ pub enum CodexErrorDetails {
+     /// Sandbox error
+     #[error("sandbox error: {0}")]
+     Sandbox(#[from] SandboxErr),
+-    #[error("codex-linux-sandbox was required but not provided")]
++    #[error("araceae-linux-sandbox was required but not provided")]
+     LandlockSandboxExecutableNotProvided,
+     #[error("unsupported operation: {0}")]
+     UnsupportedOperation(String),
+diff --git a/codex-rs/runtime-cli/src/main.rs b/codex-rs/runtime-cli/src/main.rs
+index 0d814a713ba5dc7de03690b1aa0dc918205c189e..78a9e0d656c3dd4de5cf57cf709981d5aea0ed58 100644
+--- a/codex-rs/runtime-cli/src/main.rs
++++ b/codex-rs/runtime-cli/src/main.rs
+@@ -23,7 +23,7 @@ use std::path::PathBuf;
+ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+ 
+ #[derive(Debug, Parser)]
+-#[command(name = "codex", version, about = "Codex app-server runtime")]
++#[command(name = "araceae", version, about = "Codex app-server runtime")]
+ struct Cli {
+     #[command(flatten)]
+     config_overrides: CliConfigOverrides,
+diff --git a/codex-rs/sandboxing/src/landlock.rs b/codex-rs/sandboxing/src/landlock.rs
+index dad16e238c081a36d01914e2847ba16cf67b220b..487d55b2652404594900b1f43adbbc59b6116721 100644
+--- a/codex-rs/sandboxing/src/landlock.rs
++++ b/codex-rs/sandboxing/src/landlock.rs
+@@ -4,7 +4,7 @@ use std::path::Path;
+ 
+ /// Basename used when the Codex executable self-invokes as the Linux sandbox
+ /// helper.
+-pub const CODEX_LINUX_SANDBOX_ARG0: &str = "codex-linux-sandbox";
++pub const CODEX_LINUX_SANDBOX_ARG0: &str = "araceae-linux-sandbox";
+ 
+ pub fn allow_network_for_proxy(enforce_managed_network: bool) -> bool {
+     // When managed network requirements are active, request proxy-only
+diff --git a/codex-rs/sandboxing/src/manager.rs b/codex-rs/sandboxing/src/manager.rs
+index f6c281a061d0af01ddf0ee9d56646ea5c0943ad9..5605fce8b9b3d64966c0d90a6a0dcb4af86c47f1 100644
+--- a/codex-rs/sandboxing/src/manager.rs
++++ b/codex-rs/sandboxing/src/manager.rs
+@@ -224,7 +224,7 @@ impl std::fmt::Display for SandboxTransformError {
+                 "sandbox policy cwd URI `{cwd}` is not valid on this host: {source}"
+             ),
+             Self::MissingLinuxSandboxExecutable => {
+-                write!(f, "missing codex-linux-sandbox executable path")
++                write!(f, "missing {CODEX_LINUX_SANDBOX_ARG0} executable path")
+             }
+             Self::WindowsMxcPreparation(err) => {
+                 write!(f, "failed to prepare MXC sandbox: {err}")
+diff --git a/codex-rs/windows-sandbox-rs/Cargo.toml b/codex-rs/windows-sandbox-rs/Cargo.toml
+index a798fb828d3d064eefdf5d9c90f9e91f15129972..f7194d2f12b33a16b50503d8e9ee7f0a95915506 100644
+--- a/codex-rs/windows-sandbox-rs/Cargo.toml
++++ b/codex-rs/windows-sandbox-rs/Cargo.toml
+@@ -11,11 +11,11 @@ path = "src/lib.rs"
+ doctest = false
+ 
+ [[bin]]
+-name = "codex-windows-sandbox-setup"
++name = "araceae-windows-sandbox-setup"
+ path = "src/bin/setup_main/main.rs"
+ 
+ [[bin]]
+-name = "codex-command-runner"
++name = "araceae-command-runner"
+ path = "src/bin/command_runner/main.rs"
+ 
+ [[bin]]
+diff --git a/codex-rs/windows-sandbox-rs/build.rs b/codex-rs/windows-sandbox-rs/build.rs
+index 6ba79e6c75deb87067ced02e824eaf7faf79346d..080c50df7ff856bf90501adbfc4e791898fa8061 100644
+--- a/codex-rs/windows-sandbox-rs/build.rs
++++ b/codex-rs/windows-sandbox-rs/build.rs
+@@ -1,7 +1,7 @@
+ use std::env;
+ use std::path::PathBuf;
+ 
+-const SETUP_BIN: &str = "codex-windows-sandbox-setup";
++const SETUP_BIN: &str = "araceae-windows-sandbox-setup";
+ const SETUP_MANIFEST: &str = "codex-windows-sandbox-setup.manifest";
+ 
+ fn main() -> Result<(), String> {
+diff --git a/codex-rs/windows-sandbox-rs/src/app_package.rs b/codex-rs/windows-sandbox-rs/src/app_package.rs
+index 50a6e7dbdcfb4c673b44f6f9fc8b64374b61b96c..bd52dc54846484eddd6727398240a2a54c0688e7 100644
+--- a/codex-rs/windows-sandbox-rs/src/app_package.rs
++++ b/codex-rs/windows-sandbox-rs/src/app_package.rs
+@@ -1,6 +1,7 @@
+ //! Select the requested runtime without inferring authority from directory or manifest text.
+ //! Registered runners still require OS package identity and the exact staged runner image.
+ 
++use crate::helper_materialization::COMMAND_RUNNER_EXE;
+ use anyhow::Context;
+ use anyhow::Result;
+ use anyhow::bail;
+@@ -117,7 +118,7 @@ pub(crate) fn verify_registered_core_runner(process: HANDLE, expected_runner: &P
+             staged
+                 .join("app")
+                 .join("resources")
+-                .join("codex-command-runner.exe")
++                .join(COMMAND_RUNNER_EXE)
+                 .as_os_str()
+         ),
+         "registered alias selected a different package identity"
+diff --git a/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs b/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs
+index 3049a8c4cb8efa776185066b0f1798b245d3a26d..a06807faba94f1cc06a1860f4f74a7f21c51b8fb 100644
+--- a/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs
++++ b/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs
+@@ -2,6 +2,7 @@ use crate::app_package::registered_core_requested;
+ use crate::app_package::verify_registered_core_runner;
+ use crate::desktop::DesktopPolicy;
+ use crate::desktop::shared_private_desktop_for_user;
++use crate::helper_materialization::COMMAND_RUNNER_EXE;
+ use crate::identity::SandboxCreds;
+ use crate::ipc_framed::ErrorPayload;
+ use crate::ipc_framed::ErrorStage;
+@@ -390,7 +391,7 @@ pub(crate) fn spawn_runner_transport(
+         .unwrap_or(&runner_exe)
+         .to_str()
+         .map(str::to_owned)
+-        .unwrap_or_else(|| "codex-command-runner.exe".to_string());
++        .unwrap_or_else(|| COMMAND_RUNNER_EXE.to_string());
+     let runner_full_cmd = format!(
+         "{} {} {}",
+         quote_windows_arg(&runner_cmdline),
+diff --git a/codex-rs/windows-sandbox-rs/src/helper_materialization.rs b/codex-rs/windows-sandbox-rs/src/helper_materialization.rs
+index 1d219422daa90071c321476b328b3b5cb739ecef..9050f6124410b00b8a903721df23c4fab6dfe694 100644
+--- a/codex-rs/windows-sandbox-rs/src/helper_materialization.rs
++++ b/codex-rs/windows-sandbox-rs/src/helper_materialization.rs
+@@ -21,7 +21,7 @@ use crate::sandbox_bin_dir;
+ use crate::setup::SetupRuntime;
+ 
+ const DEV_BUILD_VERSION_SENTINEL: &str = "0.0.0";
+-const COMMAND_RUNNER_EXE: &str = "codex-command-runner.exe";
++pub(crate) const COMMAND_RUNNER_EXE: &str = "araceae-command-runner.exe";
+ pub(crate) const BIN_DIRNAME: &str = "bin";
+ pub(crate) const RESOURCES_DIRNAME: &str = "codex-resources";
+ 
+@@ -189,7 +189,7 @@ pub(crate) fn bundled_executable_path_for_exe(exe: &Path, file_name: &str) -> Op
+ }
+ 
+ fn materialized_file_name(suffix: &str) -> String {
+-    format!("codex-command-runner-{suffix}.exe")
++    format!("araceae-command-runner-{suffix}.exe")
+ }
+ 
+ fn helper_version_suffix(source: &Path) -> Result<String> {
+diff --git a/codex-rs/windows-sandbox-rs/src/setup.rs b/codex-rs/windows-sandbox-rs/src/setup.rs
+index 7c9cd6362c58425098f730aa7cdddeb4be403211..df8be9202a7b8ed5bafe6bc168ea5d4e88e8efe7 100644
+--- a/codex-rs/windows-sandbox-rs/src/setup.rs
++++ b/codex-rs/windows-sandbox-rs/src/setup.rs
+@@ -55,7 +55,7 @@ pub const ONLINE_USERNAME: &str = "CodexSandboxOnline";
+ const ERROR_CANCELLED: u32 = 1223;
+ const SECURITY_BUILTIN_DOMAIN_RID: u32 = 0x0000_0020;
+ const DOMAIN_ALIAS_RID_ADMINS: u32 = 0x0000_0220;
+-const SETUP_EXE_FILENAME: &str = "codex-windows-sandbox-setup.exe";
++const SETUP_EXE_FILENAME: &str = "araceae-windows-sandbox-setup.exe";
+ const USERPROFILE_ROOT_EXCLUSIONS: &[&str] = &[
+     ".ssh",
+     ".tsh",
+diff --git a/codex-rs/windows-sandbox-rs/src/wfp_setup.rs b/codex-rs/windows-sandbox-rs/src/wfp_setup.rs
+index 45e8dc238253f1e889c1a9c11e50ef61822a93ca..8e1dc272affa8d26d9ffc10923cc25d3525d508a 100644
+--- a/codex-rs/windows-sandbox-rs/src/wfp_setup.rs
++++ b/codex-rs/windows-sandbox-rs/src/wfp_setup.rs
+@@ -8,7 +8,7 @@ use codex_otel::StatsigMetricsSettings;
+ use std::collections::BTreeMap;
+ use std::path::Path;
+ 
+-const WFP_SETUP_SERVICE_NAME: &str = "codex-windows-sandbox-setup";
++const WFP_SETUP_SERVICE_NAME: &str = "araceae-windows-sandbox-setup";
+ const WFP_SETUP_SUCCESS_METRIC: &str = "codex.windows_sandbox.wfp_setup_success";
+ const WFP_SETUP_FAILURE_METRIC: &str = "codex.windows_sandbox.wfp_setup_failure";
+ 
+diff --git a/scripts/codex_package/cargo.py b/scripts/codex_package/cargo.py
+index f759e447620c62d50ab0441880e3383e335e0648..1d03e3994153773be6b174b0316a135832e287e0 100644
+--- a/scripts/codex_package/cargo.py
++++ b/scripts/codex_package/cargo.py
+@@ -5,7 +5,10 @@ import subprocess
+ from dataclasses import dataclass
+ from pathlib import Path
+ 
++from .targets import CODE_MODE_HOST_BIN
++from .targets import COMMAND_RUNNER_BIN
+ from .targets import REPO_ROOT
++from .targets import WINDOWS_SANDBOX_SETUP_BIN
+ from .targets import PackageVariant
+ from .targets import TargetSpec
+ from .v8 import resolve_codex_v8_cargo_env
+@@ -86,7 +89,7 @@ def build_source_binaries(
+         code_mode_host_bin=(
+             code_mode_host_bin.resolve()
+             if code_mode_host_bin is not None
+-            else output_dir / f"codex-code-mode-host{spec.exe_suffix}"
++            else output_dir / spec.code_mode_host_name
+         ),
+         bwrap_bin=resolve_output_path(
+             bwrap_bin,
+@@ -94,11 +97,15 @@ def build_source_binaries(
+         ),
+         codex_command_runner_bin=resolve_output_path(
+             codex_command_runner_bin,
+-            output_dir / "codex-command-runner.exe" if spec.is_windows else None,
++            output_dir / f"{COMMAND_RUNNER_BIN}.exe" if spec.is_windows else None,
+         ),
+         codex_windows_sandbox_setup_bin=resolve_output_path(
+             codex_windows_sandbox_setup_bin,
+-            output_dir / "codex-windows-sandbox-setup.exe" if spec.is_windows else None,
++            (
++                output_dir / f"{WINDOWS_SANDBOX_SETUP_BIN}.exe"
++                if spec.is_windows
++                else None
++            ),
+         ),
+     )
+     validate_source_outputs(outputs)
+@@ -119,13 +126,13 @@ def source_binaries_for_target(
+     if build_entrypoint:
+         binaries.append(variant.cargo_bin)
+     if build_code_mode_host:
+-        binaries.append("codex-code-mode-host")
++        binaries.append(CODE_MODE_HOST_BIN)
+     if build_bwrap:
+         binaries.append("bwrap")
+     if build_codex_command_runner:
+-        binaries.append("codex-command-runner")
++        binaries.append(COMMAND_RUNNER_BIN)
+     if build_codex_windows_sandbox_setup:
+-        binaries.append("codex-windows-sandbox-setup")
++        binaries.append(WINDOWS_SANDBOX_SETUP_BIN)
+     return binaries
+ 
+ 
+diff --git a/scripts/codex_package/cli.py b/scripts/codex_package/cli.py
+index 6a99ccb91ed07e5c9c2b19fcb24cb2507d408cd4..be082eb9dc6223fc2208208eda2fd55689d363fe 100644
+--- a/scripts/codex_package/cli.py
++++ b/scripts/codex_package/cli.py
+@@ -238,7 +238,7 @@ def assemble_package(args: argparse.Namespace) -> Path:
+     build_package_dir(package_dir, args.package_version, variant, spec, inputs)
+     for filename, prebuilt in (
+         (variant.entrypoint_name(spec), args.entrypoint_bin),
+-        (f"codex-code-mode-host{spec.exe_suffix}", args.code_mode_host_bin),
++        (spec.code_mode_host_name, args.code_mode_host_bin),
+     ):
+         if args.strip == "all" or (
+             args.strip == "auto"
+diff --git a/scripts/codex_package/layout.py b/scripts/codex_package/layout.py
+index f93d8da64cc556b615d37aaf20edec948a8caf66..5da2c85ce29106f829e8aaa9bf78d75dec7ff8eb 100644
+--- a/scripts/codex_package/layout.py
++++ b/scripts/codex_package/layout.py
+@@ -5,6 +5,8 @@ import shutil
+ import stat
+ from pathlib import Path
+ 
++from .targets import COMMAND_RUNNER_BIN
++from .targets import WINDOWS_SANDBOX_SETUP_BIN
+ from .targets import PackageInputs
+ from .targets import PackageVariant
+ from .targets import TargetSpec
+@@ -52,7 +54,7 @@ def build_package_dir(
+     )
+     copy_executable(
+         inputs.code_mode_host_bin,
+-        bin_dir / f"codex-code-mode-host{spec.exe_suffix}",
++        bin_dir / spec.code_mode_host_name,
+         is_windows=spec.is_windows,
+     )
+     copy_executable(inputs.rg_bin, path_dir / spec.rg_name, is_windows=spec.is_windows)
+@@ -63,14 +65,14 @@ def build_package_dir(
+     if inputs.codex_command_runner_bin is not None:
+         copy_executable(
+             inputs.codex_command_runner_bin,
+-            resources_dir / "codex-command-runner.exe",
++            resources_dir / f"{COMMAND_RUNNER_BIN}.exe",
+             is_windows=True,
+         )
+ 
+     if inputs.codex_windows_sandbox_setup_bin is not None:
+         copy_executable(
+             inputs.codex_windows_sandbox_setup_bin,
+-            resources_dir / "codex-windows-sandbox-setup.exe",
++            resources_dir / f"{WINDOWS_SANDBOX_SETUP_BIN}.exe",
+             is_windows=True,
+         )
+ 
+@@ -125,7 +127,7 @@ def validate_package_dir(
+ 
+     required_files = [
+         Path("bin") / variant.entrypoint_name(spec),
+-        Path("bin") / f"codex-code-mode-host{spec.exe_suffix}",
++        Path("bin") / spec.code_mode_host_name,
+         Path("codex-path") / spec.rg_name,
+     ]
+     executable_files = list(required_files)
+@@ -137,8 +139,8 @@ def validate_package_dir(
+     if spec.is_windows:
+         required_files.extend(
+             [
+-                Path("codex-resources") / "codex-command-runner.exe",
+-                Path("codex-resources") / "codex-windows-sandbox-setup.exe",
++                Path("codex-resources") / f"{COMMAND_RUNNER_BIN}.exe",
++                Path("codex-resources") / f"{WINDOWS_SANDBOX_SETUP_BIN}.exe",
+             ]
+         )
+ 
+diff --git a/scripts/codex_package/targets.py b/scripts/codex_package/targets.py
+index eedf7b03b11f9b774cbbf781dd91390b92007383..d536098713813257bf4648d37c34f8c40178e6cb 100644
+--- a/scripts/codex_package/targets.py
++++ b/scripts/codex_package/targets.py
+@@ -14,6 +14,10 @@ if _repo_root is None:
+     )
+ REPO_ROOT = Path(_repo_root)
+ 
++CODE_MODE_HOST_BIN = "araceae-code-mode-host"
++COMMAND_RUNNER_BIN = "araceae-command-runner"
++WINDOWS_SANDBOX_SETUP_BIN = "araceae-windows-sandbox-setup"
++
+ 
+ @dataclass(frozen=True)
+ class TargetSpec:
+@@ -30,6 +34,10 @@ class TargetSpec:
+     def rg_name(self) -> str:
+         return f"rg{self.exe_suffix}"
+ 
++    @property
++    def code_mode_host_name(self) -> str:
++        return f"{CODE_MODE_HOST_BIN}{self.exe_suffix}"
++
+ 
+ @dataclass(frozen=True)
+ class PackageVariant:
+@@ -62,6 +70,11 @@ PACKAGE_VARIANTS: dict[str, PackageVariant] = {
+         cargo_bin="codex-app-server",
+         executable_stem="codex-app-server",
+     ),
++    "araceae": PackageVariant(
++        name="araceae",
++        cargo_bin="araceae-codex-runtime",
++        executable_stem="araceae",
++    ),
+ }
+ 
+ 
