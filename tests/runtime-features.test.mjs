@@ -63,6 +63,7 @@ scenario("raw-usage-notifications", "usage completions reach clients without raw
   const f = await fixture(t, [
     { match: { userMessage: "CHILD_USAGE_TASK" }, response: { content: "CHILD_USAGE_DONE" } },
     { match: { hasToolResult: true }, response: { content: "PARENT_USAGE_DONE" } },
+    { match: { userMessage: "<subagent_notification>" }, response: { content: "PARENT_USAGE_DONE" } },
     { match: { userMessage: "SPAWN_CHILD_FOR_USAGE" }, response: { toolCalls: [{
       name: "spawn_agent", namespace: "multi_agent_v1", arguments: JSON.stringify({ message: "CHILD_USAGE_TASK" }),
     }] } },
@@ -158,6 +159,7 @@ scenario("subagent-model-lock", "a locked subagent keeps the parent model and ef
   const f = await fixture(t, [
     { match: { userMessage: "LOCKED_CHILD_TASK" }, response: { content: "LOCKED_CHILD_DONE" } },
     { match: { hasToolResult: true }, response: { content: "LOCKED_PARENT_DONE" } },
+    { match: { userMessage: "<subagent_notification>" }, response: { content: "LOCKED_PARENT_DONE" } },
     { match: { userMessage: "SPAWN_LOCKED_CHILD" }, response: { toolCalls: [{
       name: "spawn_agent", namespace: "multi_agent_v1",
       arguments: JSON.stringify({ message: "LOCKED_CHILD_TASK", agent_type: "researcher", model: "gpt-5.5", reasoning_effort: "high" }),

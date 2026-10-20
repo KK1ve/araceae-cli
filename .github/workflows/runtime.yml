@@ -133,6 +133,10 @@ jobs:
           workspaces: .worktrees/runtime/codex-rs -> ../../../.cache/cargo-target
           key: ${{ matrix.target }}-${{ env.BUILD_PROFILE }}
           cache-bin: false
+      - name: Force the rusty_v8 build script to rerun
+        # rust-cache keeps build-script state but prunes <profile>/gn_out, where the v8 build script
+        # places librusty_v8; a v8 rebuild against that state cannot find the static library.
+        run: rm -rf .cache/cargo-target/*/build/v8-* .cache/cargo-target/*/*/build/v8-*
       - name: Build the patched runtime package
         run: python scripts/build_runtime.py --target "$BUILD_TARGET" --profile "$BUILD_PROFILE"
       - name: Verify the runtime package and model flows

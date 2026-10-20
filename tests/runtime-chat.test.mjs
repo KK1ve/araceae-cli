@@ -387,6 +387,7 @@ scenario("subagents spawned over chat use the chat provider and report their usa
   const f = await chatFixture(t, [
     { match: { userMessage: "CHAT_CHILD_TASK" }, response: { content: "CHAT_CHILD_DONE" } },
     { match: { hasToolResult: true }, response: { content: "CHAT_PARENT_DONE" } },
+    { match: { userMessage: "<subagent_notification>" }, response: { content: "CHAT_PARENT_DONE" } },
     { match: { userMessage: "SPAWN_CHAT_CHILD" }, response: { toolCalls: [{
       name: "multi_agent_v1__spawn_agent", arguments: JSON.stringify({ message: "CHAT_CHILD_TASK" }),
     }] } },

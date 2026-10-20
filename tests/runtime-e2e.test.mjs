@@ -54,7 +54,8 @@ test("native shell tools dispatch through the packaged runtime", options, async 
   const { thread } = await server.call("thread/start", { cwd: f.cwd, approvalPolicy: "never", sandbox: "danger-full-access" })
   assert.equal(await server.turn(thread.id, "RUN_SHELL_TOOL"), "SHELL_DONE")
   assert.equal(await readFile(join(f.cwd, "shell-marker.txt"), "utf8"), "SHELL_OK")
-  assert.ok(server.events.some(event => event.method === "item/completed" && event.params.item.type === "commandExecution"))
+  // A command still running after the early-exit window completes from a background watcher, possibly after turn/completed.
+  await server.waitFor(event => event.method === "item/completed" && event.params.item.type === "commandExecution")
 })
 
 test("declining an approval prevents the requested command from writing files", options, async t => {

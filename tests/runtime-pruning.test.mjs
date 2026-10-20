@@ -255,6 +255,7 @@ scenario("runtime-e2e", "child agents inherit the configured model provider", as
   const f = await fixture(t, [
     { match: { userMessage: "CHILD_PROVIDER_TASK" }, response: request => { childRequested(request); return { content: "CHILD_PROVIDER_DONE" } } },
     { match: { hasToolResult: true }, response: { content: "PARENT_PROVIDER_DONE" } },
+    { match: { userMessage: "<subagent_notification>" }, response: { content: "PARENT_PROVIDER_DONE" } },
     { match: { hasToolResult: false }, response: request => {
       const tool = request.tools.find(tool => tool.function?.name === "spawn_agent")
       assert.ok(tool, JSON.stringify(request.tools))
