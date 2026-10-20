@@ -1,0 +1,357 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Mon, 19 Oct 2026 20:20:00 +1100
+Subject: [PATCH] Lock spawned subagents to the parent model
+
+Setting [agents] lock_subagent_model = true keeps every spawned subagent on
+the parent's model and reasoning effort:
+
+- the v1 and v2 spawn_agent schemas drop `model` and `reasoning_effort`,
+  and the v1 description no longer refers to the `model` field
+- model and reasoning effort passed to spawn_agent, default_subagent_model,
+  default_subagent_reasoning_effort, and role config files are ignored
+- the model catalog world-state section is not rendered
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ codex-rs/config/src/config_toml.rs            |  4 +++
+ codex-rs/core/config.schema.json              |  4 +++
+ codex-rs/core/src/agent/child_config.rs       |  3 ++
+ codex-rs/core/src/agent/role.rs               |  4 +++
+ codex-rs/core/src/config/config_tests.rs      |  5 +++
+ codex-rs/core/src/config/mod.rs               | 19 +++++++++--
+ codex-rs/core/src/session/world_state.rs      |  6 ++--
+ .../src/tools/handlers/multi_agents/spawn.rs  |  6 +++-
+ .../src/tools/handlers/multi_agents_spec.rs   | 18 +++++++---
+ .../tools/handlers/multi_agents_spec_tests.rs | 34 +++++++++++++++++++
+ codex-rs/core/src/tools/spec_plan.rs          |  4 ++-
+ codex-rs/thread-manager-sample/src/main.rs    |  1 +
+ 12 files changed, 94 insertions(+), 14 deletions(-)
+
+diff --git a/codex-rs/config/src/config_toml.rs b/codex-rs/config/src/config_toml.rs
+index 8c8c66ea1dc45669a3f52e3e0d3f10e633267167..57b5253286a8b2e73eb43160902a34236717ad03 100644
+--- a/codex-rs/config/src/config_toml.rs
++++ b/codex-rs/config/src/config_toml.rs
+@@ -770,6 +770,10 @@ pub struct AgentsToml {
+     pub default_subagent_model: Option<String>,
+     /// Default reasoning effort for spawned subagents when the spawn call does not select one.
+     pub default_subagent_reasoning_effort: Option<ReasoningEffort>,
++    /// Keep spawned subagents on the parent's model and reasoning effort. Spawn tools stop
++    /// offering model overrides, and `default_subagent_model`,
++    /// `default_subagent_reasoning_effort`, and role model settings are ignored.
++    pub lock_subagent_model: Option<bool>,
+     /// Removed agent-job setting retained as a no-op for compatibility.
+     #[schemars(skip)]
+     pub job_max_runtime_seconds: Option<u64>,
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index edded1b2fb7f0f43f765358491994c9534050ca5..34a14438c340659f5c146ee7aeafb133399ec16b 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -65,6 +65,10 @@
+           "description": "Whether to record a model-visible message when an agent turn is interrupted. Defaults to true.",
+           "type": "boolean"
+         },
++        "lock_subagent_model": {
++          "description": "Keep spawned subagents on the parent's model and reasoning effort. Spawn tools stop offering model overrides, and `default_subagent_model`, `default_subagent_reasoning_effort`, and role model settings are ignored.",
++          "type": "boolean"
++        },
+         "max_concurrent_threads_per_session": {
+           "description": "Maximum number of spawned agent threads that can be open concurrently per session. When unset, the selected multi-agent backend uses its default.",
+           "format": "uint",
+diff --git a/codex-rs/core/src/agent/child_config.rs b/codex-rs/core/src/agent/child_config.rs
+index 3d56d7e646e275b6d66b0501d5f7021e1d300bdf..e2e808773e6335b6a214a3149761823cbb8db8a3 100644
+--- a/codex-rs/core/src/agent/child_config.rs
++++ b/codex-rs/core/src/agent/child_config.rs
+@@ -209,6 +209,9 @@ async fn apply_requested_spawn_agent_model_overrides(
+     requested_reasoning_effort: Option<ReasoningEffort>,
+ ) -> Result<(), String> {
+     let turn = step_context.turn.as_ref();
++    if turn.config.agent_lock_subagent_model {
++        return Ok(());
++    }
+     let requested_model = requested_model.or(turn.config.agent_default_subagent_model.as_deref());
+     let requested_reasoning_effort = requested_reasoning_effort
+         .or_else(|| turn.config.agent_default_subagent_reasoning_effort.clone());
+diff --git a/codex-rs/core/src/agent/role.rs b/codex-rs/core/src/agent/role.rs
+index cf43be3b40796264231cc232f7f41387411877a2..57ec8edf652ccdf8f7665a4bc45bdf6c4e36a7f0 100644
+--- a/codex-rs/core/src/agent/role.rs
++++ b/codex-rs/core/src/agent/role.rs
+@@ -87,6 +87,10 @@ async fn apply_role_to_config_inner(
+         service_tier: role_config.service_tier,
+         ..Default::default()
+     };
++    if config.agent_lock_subagent_model {
++        overrides.model = None;
++        overrides.model_reasoning_effort = None;
++    }
+ 
+     if let Some(features) = role_config.features {
+         for (key, enabled) in features.entries() {
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index aaf2165a6b35895e3aba1a933d080809c8317bbf..64294fe46b08a83f7d9423bae1ca33aa25de99c4 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -8660,6 +8660,7 @@ async fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result
+             max_depth: None,
+             default_subagent_model: None,
+             default_subagent_reasoning_effort: None,
++            lock_subagent_model: None,
+             job_max_runtime_seconds: None,
+             interrupt_message: None,
+             roles: BTreeMap::from([(
+@@ -9675,6 +9676,7 @@ async fn load_config_normalizes_agent_role_nickname_candidates() -> std::io::Res
+             max_depth: None,
+             default_subagent_model: None,
+             default_subagent_reasoning_effort: None,
++            lock_subagent_model: None,
+             job_max_runtime_seconds: None,
+             interrupt_message: None,
+             roles: BTreeMap::from([(
+@@ -9721,6 +9723,7 @@ async fn load_config_rejects_empty_agent_role_nickname_candidates() -> std::io::
+             max_depth: None,
+             default_subagent_model: None,
+             default_subagent_reasoning_effort: None,
++            lock_subagent_model: None,
+             job_max_runtime_seconds: None,
+             interrupt_message: None,
+             roles: BTreeMap::from([(
+@@ -9761,6 +9764,7 @@ async fn load_config_rejects_duplicate_agent_role_nickname_candidates() -> std::
+             max_depth: None,
+             default_subagent_model: None,
+             default_subagent_reasoning_effort: None,
++            lock_subagent_model: None,
+             job_max_runtime_seconds: None,
+             interrupt_message: None,
+             roles: BTreeMap::from([(
+@@ -9801,6 +9805,7 @@ async fn load_config_rejects_unsafe_agent_role_nickname_candidates() -> std::io:
+             max_depth: None,
+             default_subagent_model: None,
+             default_subagent_reasoning_effort: None,
++            lock_subagent_model: None,
+             job_max_runtime_seconds: None,
+             interrupt_message: None,
+             roles: BTreeMap::from([(
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index aebdec760f823ce91f907175ba1a01ea0097ed8b..334b9e7d57e56dad4f396effc6f87071eff14d71 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -25,6 +25,7 @@ use codex_config::ResidencyRequirement;
+ use codex_config::SandboxModeRequirement;
+ use codex_config::Sourced;
+ use codex_config::ThreadConfigLoader;
++use codex_config::config_toml::AgentsToml;
+ use codex_config::config_toml::CircuitBreakAction;
+ use codex_config::config_toml::ConfigToml;
+ use codex_config::config_toml::DEFAULT_PROJECT_DOC_MAX_BYTES;
+@@ -969,6 +970,9 @@ pub struct Config {
+     /// Default reasoning effort for spawned subagents when the spawn call does not select one.
+     pub agent_default_subagent_reasoning_effort: Option<ReasoningEffort>,
+ 
++    /// Whether spawned subagents always keep the parent's model and reasoning effort.
++    pub agent_lock_subagent_model: bool,
++
+     /// Whether to record a model-visible message when an agent turn is interrupted.
+     pub agent_interrupt_message_enabled: bool,
+ 
+@@ -2810,6 +2814,12 @@ fn resolve_code_mode_config(config_toml: &ConfigToml) -> CodeModeConfig {
+     }
+ }
+ 
++fn subagent_model_locked(agents: Option<&AgentsToml>) -> bool {
++    agents
++        .and_then(|agents| agents.lock_subagent_model)
++        .unwrap_or(false)
++}
++
+ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config {
+     let base = multi_agent_v2_toml_config(config_toml.features.as_ref());
+     let max_concurrent_threads_per_session = base
+@@ -2840,9 +2850,10 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
+     let hide_spawn_agent_metadata = base
+         .and_then(|config| config.hide_spawn_agent_metadata)
+         .unwrap_or(default.hide_spawn_agent_metadata);
+-    let expose_spawn_agent_model_overrides = base
+-        .and_then(|config| config.expose_spawn_agent_model_overrides)
+-        .unwrap_or(default.expose_spawn_agent_model_overrides);
++    let expose_spawn_agent_model_overrides = !subagent_model_locked(config_toml.agents.as_ref())
++        && base
++            .and_then(|config| config.expose_spawn_agent_model_overrides)
++            .unwrap_or(default.expose_spawn_agent_model_overrides);
+     let root_agent_usage_hint_text = base
+         .and_then(|config| config.root_agent_usage_hint_text.as_ref())
+         .cloned();
+@@ -4033,6 +4044,7 @@ impl Config {
+             .agents
+             .as_ref()
+             .and_then(|agents| agents.default_subagent_reasoning_effort.clone());
++        let agent_lock_subagent_model = subagent_model_locked(cfg.agents.as_ref());
+         let agent_interrupt_message_enabled = cfg
+             .agents
+             .as_ref()
+@@ -4513,6 +4525,7 @@ impl Config {
+             agent_max_threads,
+             agent_default_subagent_model,
+             agent_default_subagent_reasoning_effort,
++            agent_lock_subagent_model,
+             agent_max_depth,
+             agent_roles,
+             max_goal_token_budget: cfg
+diff --git a/codex-rs/core/src/session/world_state.rs b/codex-rs/core/src/session/world_state.rs
+index 37dda837fce0fb6889310105809d86bdfd759f3e..5f30273dae8bf1ece2033f84b9e38fdee11e69e9 100644
+--- a/codex-rs/core/src/session/world_state.rs
++++ b/codex-rs/core/src/session/world_state.rs
+@@ -366,10 +366,8 @@ impl Session {
+         world_state.add_section(multi_agent_mode);
+         let spawn_tool = match turn_context.multi_agent_version {
+             MultiAgentVersion::Disabled => None,
+-            MultiAgentVersion::V1 => Some(ToolName::new(
+-                Some(MULTI_AGENT_V1_NAMESPACE.to_string()),
+-                "spawn_agent",
+-            )),
++            MultiAgentVersion::V1 => (!turn_context.config.agent_lock_subagent_model)
++                .then(|| ToolName::new(Some(MULTI_AGENT_V1_NAMESPACE.to_string()), "spawn_agent")),
+             MultiAgentVersion::V2 => turn_context
+                 .config
+                 .multi_agent_v2
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs b/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs
+index 10c793f5b9e8293c3a0a05a089372619f6689c5e..e1865745e51d4876342aaf3477018b66010b4e60 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs
+@@ -62,7 +62,11 @@ async fn handle_spawn_agent(
+     } = invocation;
+     let turn = &step_context.turn;
+     let arguments = function_arguments(payload)?;
+-    let args: SpawnAgentArgs = parse_arguments(&arguments)?;
++    let mut args: SpawnAgentArgs = parse_arguments(&arguments)?;
++    if turn.config.agent_lock_subagent_model {
++        args.model = None;
++        args.reasoning_effort = None;
++    }
+     let role_name = args
+         .agent_type
+         .as_deref()
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_spec.rs b/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
+index edc9467b4d02cc023d8961373637116cf8ba6f6f..8b9a3e66a6b8eecbb09d9be2a65df3d3bafcbeb6 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
+@@ -68,13 +68,14 @@ impl Default for WaitAgentTimeoutOptions {
+ }
+ 
+ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
+-    let available_models_description = (!options.model_catalog_in_context
+-        && !options.hide_agent_type_model_reasoning)
+-        .then(|| {
++    let model_overrides_visible =
++        options.expose_spawn_agent_model_overrides && !options.hide_agent_type_model_reasoning;
++    let available_models_description =
++        (!options.model_catalog_in_context && model_overrides_visible).then(|| {
+             spawn_agent_models_description(&options.available_models, options.multi_agent_version)
+         });
+     let inherited_model_guidance =
+-        (!options.hide_agent_type_model_reasoning).then_some(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE);
++        model_overrides_visible.then_some(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE);
+     let return_value_description =
+         "Returns the spawned agent id plus the user-facing nickname when available.";
+     let mut properties = spawn_agent_common_properties_v1(&options.agent_type_description);
+@@ -84,6 +85,10 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
+     if options.hide_agent_type_model_reasoning {
+         hide_spawn_agent_metadata_options(&mut properties);
+     }
++    if !options.expose_spawn_agent_model_overrides {
++        properties.remove("model");
++        properties.remove("reasoning_effort");
++    }
+ 
+     ToolSpec::Namespace(ResponsesApiNamespace {
+         name: MULTI_AGENT_V1_NAMESPACE.to_string(),
+@@ -699,6 +704,9 @@ fn spawn_agent_tool_description(
+     let model_catalog_guidance = inherited_model_guidance
+         .map(|_| SPAWN_AGENT_MODEL_CATALOG_GUIDANCE)
+         .unwrap_or_default();
++    let model_field_guidance = inherited_model_guidance
++        .map(|_| " Do not set the `model` field unless the user explicitly asks for a different model.")
++        .unwrap_or_default();
+     let inherited_model_guidance = inherited_model_guidance.unwrap_or_default();
+ 
+     let tool_description = if model_catalog_in_context {
+@@ -733,7 +741,7 @@ fn spawn_agent_tool_description(
+     format!(
+         r#"
+         {tool_description}
+-This spawn_agent tool provides you access to sub-agents that inherit your current model by default. Do not set the `model` field unless the user explicitly asks for a different model. You should follow the rules and guidelines below to use this tool.
++This spawn_agent tool provides you access to sub-agents that inherit your current model by default.{model_field_guidance} You should follow the rules and guidelines below to use this tool.
+ 
+ Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.
+ Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.{agent_role_usage_hint}
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
+index ad685919f91fe7fa3ac9b6ec301a8863898a3515..f783caed21bfec6c0c1b837b4facfbdbf873dc6e 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
+@@ -163,6 +163,40 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
+     assert!(!properties.contains_key("service_tier"));
+ }
+ 
++#[test]
++fn spawn_agent_tool_v1_hides_model_controls_without_override_exposure() {
++    let tool = create_spawn_agent_tool_v1(SpawnAgentToolOptions {
++        agent_type_description: "role help".to_string(),
++        expose_agent_type: true,
++        hide_agent_type_model_reasoning: false,
++        expose_spawn_agent_model_overrides: false,
++        usage_hint_text: None,
++        ..Default::default()
++    });
++
++    let ToolSpec::Namespace(namespace) = tool else {
++        panic!("spawn_agent v1 should be a namespace tool");
++    };
++    let Some(ResponsesApiNamespaceTool::Function(ResponsesApiTool {
++        description,
++        parameters,
++        ..
++    })) = namespace.tools.first()
++    else {
++        panic!("spawn_agent should be a namespace function tool");
++    };
++    let properties = parameters
++        .properties
++        .as_ref()
++        .expect("spawn_agent should use object params");
++
++    assert!(properties.contains_key("agent_type"));
++    assert!(!properties.contains_key("model"));
++    assert!(!properties.contains_key("reasoning_effort"));
++    assert!(!description.contains("`model`"));
++    assert!(!description.contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE));
++}
++
+ #[test_case::test_case(false; "inline_catalog")]
+ #[test_case::test_case(true; "context_catalog")]
+ fn spawn_agent_tool_keeps_model_controls_when_spawn_metadata_is_hidden(
+diff --git a/codex-rs/core/src/tools/spec_plan.rs b/codex-rs/core/src/tools/spec_plan.rs
+index fd5b5e14eeeb57b5be78af53d3f855702167dcc7..d09b93453093546db94d874170894a21a71a6ec5 100644
+--- a/codex-rs/core/src/tools/spec_plan.rs
++++ b/codex-rs/core/src/tools/spec_plan.rs
+@@ -1577,7 +1577,9 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
+                     agent_type_description,
+                     expose_agent_type: !turn_context.config.agent_roles.is_empty(),
+                     hide_agent_type_model_reasoning: false,
+-                    expose_spawn_agent_model_overrides: true,
++                    expose_spawn_agent_model_overrides: !turn_context
++                        .config
++                        .agent_lock_subagent_model,
+                     usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
+                 }),
+                 exposure,
+diff --git a/codex-rs/thread-manager-sample/src/main.rs b/codex-rs/thread-manager-sample/src/main.rs
+index 0d53be0050161aa148fa79032f9d63b72c612536..20402de7233f2a602bd9348d98425384a4341cbd 100644
+--- a/codex-rs/thread-manager-sample/src/main.rs
++++ b/codex-rs/thread-manager-sample/src/main.rs
+@@ -332,6 +332,7 @@ async fn new_config(
+         agent_max_threads: Some(6),
+         agent_default_subagent_model: None,
+         agent_default_subagent_reasoning_effort: None,
++        agent_lock_subagent_model: false,
+         agent_interrupt_message_enabled: false,
+         agent_max_depth: 1,
+         agent_roles: BTreeMap::new(),

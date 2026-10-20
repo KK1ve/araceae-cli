@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Mon, 19 Oct 2026 20:46:42 +1100
+Subject: [PATCH] Deliver usage completions without the raw event opt-in
+
+rawResponse/completed carries the token usage of each model response, but
+it was gated by the thread's raw-events opt-in, which only thread/start can
+request. Threads attached through thread/resume therefore never reported
+usage. The completion notification is now always delivered; full raw
+response items stay behind the opt-in.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../app-server/src/request_processors/thread_lifecycle.rs | 8 +++-----
+ 1 file changed, 3 insertions(+), 5 deletions(-)
+
+diff --git a/codex-rs/app-server/src/request_processors/thread_lifecycle.rs b/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
+index a7754975b5a47ff2b46b818145a5e66d6eccf528..31178e5973afafbe0f6a480557ff0576413852a2 100644
+--- a/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
++++ b/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
+@@ -348,11 +348,9 @@ pub(super) async fn ensure_listener_task_running(
+                             .then(|| thread_state.turn_summary.clone());
+                         (thread_state.experimental_raw_events, terminal)
+                     };
+-                    if matches!(
+-                        &event.msg,
+-                        EventMsg::RawResponseItem(_) | EventMsg::RawResponseCompleted(_)
+-                    ) && !raw_events_enabled
+-                    {
++                    // Usage-only completions stay visible without the opt-in, which
++                    // thread/resume cannot request; full raw items remain opt-in.
++                    if matches!(&event.msg, EventMsg::RawResponseItem(_)) && !raw_events_enabled {
+                         continue;
+                     }
+                     let subscribed_connection_ids = thread_state_manager

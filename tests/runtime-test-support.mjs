@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
+import { createServer, request } from "node:http"
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { isAbsolute, join } from "node:path"
@@ -187,4 +188,39 @@ stream_max_retries = 0
     await server.initialize()
     return server
   } }
+}
+
+export async function listen(t, handler, connect) {
+  const server = createServer(handler)
+  if (connect) server.on("connect", connect)
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve))
+  t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve) }))
+  return `http://127.0.0.1:${server.address().port}`
+}
+
+/** Forwards a request unchanged to `upstream`. */
+export function proxy(upstream, req, res) {
+  const forwarded = request(upstream + req.url, { method: req.method, headers: req.headers }, response => {
+    res.writeHead(response.statusCode, response.headers)
+    response.pipe(res)
+  })
+  forwarded.on("error", error => res.destroy(error))
+  req.pipe(forwarded)
+}
+
+/** Writes a provider auth command that returns an expired token first and logs each refused token. */
+export async function credentialHelper(root, name) {
+  const invocations = join(root, `${name}.jsonl`)
+  const helper = join(root, `${name}.cjs`)
+  await writeFile(helper, [
+    "const fs = require('node:fs')",
+    `const log = ${JSON.stringify(invocations)}`,
+    "const prior = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\\n').filter(Boolean).length : 0",
+    "fs.appendFileSync(log, JSON.stringify({ rejected: process.env.ARACEAE_PROVIDER_AUTH_REJECTED_TOKEN ?? null }) + '\\n')",
+    "process.stdout.write(prior === 0 ? 'EXPIRED_PROVIDER_TOKEN' : 'FRESH_PROVIDER_TOKEN')",
+  ].join("\n"))
+  return {
+    invocations,
+    config: `\n[model_providers.aimock.auth]\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(helper)}]\nrefresh_interval_ms = 3600000\n`,
+  }
 }

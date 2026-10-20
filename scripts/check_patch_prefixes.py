@@ -50,7 +50,8 @@ def main():
             raise ValueError(f"Unexpected protocol changes: removed {sorted(expected - methods)}, added {sorted(methods - expected)}")
         test_env = {**env, "ARACEAE_CODEX_BIN": str(binary), "ARACEAE_RUNTIME_CHECKS": json.dumps(checks)}
         run(["node", "--test", "tests/runtime-e2e.test.mjs", "tests/runtime-pruning.test.mjs",
-             "tests/runtime-araceae-names.test.mjs"], cwd=root, env=test_env)
+             "tests/runtime-araceae-names.test.mjs", "tests/runtime-features.test.mjs",
+             "tests/runtime-chat.test.mjs"], cwd=root, env=test_env)
         reports.append({"patch": patch["name"], "source_tree": git(source, "rev-parse", "HEAD^{tree}").strip(), "checks": list(checks), "result": "passed"})
         write_json(args.report, {"prefixes": reports})
 

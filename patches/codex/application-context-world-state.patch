@@ -1,0 +1,488 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Mon, 19 Oct 2026 20:33:03 +1100
+Subject: [PATCH] Render application context as a replaceable world-state
+ section
+
+Application additionalContext entries are no longer appended to history as
+one developer message per changed key. A world-state section renders all of
+them as a single <application_context> developer message:
+
+- any value change sends the whole message again with a replacement notice
+- the message is rendered again at each window start and whenever retained
+  history no longer contains it, such as after local compaction
+- turns that omit application context leave the model-visible context
+  unchanged
+- values are no longer truncated to 1,000 tokens; turn/start and turn/steer
+  reject application context that would exceed 10,000 estimated tokens once
+  rendered
+
+Untrusted additionalContext keeps its user-message behavior.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/request_processors/turn_processor.rs  |  12 +-
+ codex-rs/core/src/context/mod.rs              |   2 +-
+ .../world_state/application_context.rs        | 173 ++++++++++++++++++
+ .../world_state/application_context_tests.rs  | 117 ++++++++++++
+ codex-rs/core/src/context/world_state/mod.rs  |   3 +
+ codex-rs/core/src/session/world_state.rs      |   6 +
+ codex-rs/core/src/state/additional_context.rs |  21 ++-
+ 7 files changed, 320 insertions(+), 14 deletions(-)
+ create mode 100644 codex-rs/core/src/context/world_state/application_context.rs
+ create mode 100644 codex-rs/core/src/context/world_state/application_context_tests.rs
+
+diff --git a/codex-rs/app-server/src/request_processors/turn_processor.rs b/codex-rs/app-server/src/request_processors/turn_processor.rs
+index 1b9a253becc97a7a2c1b0de9e92def7c192691c2..7ca179dacbaddb1ea6b06a93f4358ad585ea18d1 100644
+--- a/codex-rs/app-server/src/request_processors/turn_processor.rs
++++ b/codex-rs/app-server/src/request_processors/turn_processor.rs
+@@ -98,8 +98,8 @@ pub(crate) struct TurnRequestProcessor {
+ 
+ fn map_additional_context(
+     additional_context: Option<HashMap<String, AdditionalContextEntry>>,
+-) -> BTreeMap<String, CoreAdditionalContextEntry> {
+-    additional_context
++) -> Result<BTreeMap<String, CoreAdditionalContextEntry>, JSONRPCErrorError> {
++    let entries = additional_context
+         .unwrap_or_default()
+         .into_iter()
+         .map(|(key, entry)| {
+@@ -116,7 +116,9 @@ fn map_additional_context(
+                 },
+             )
+         })
+-        .collect()
++        .collect();
++    codex_core::context::validate_application_context(&entries).map_err(invalid_request)?;
++    Ok(entries)
+ }
+ 
+ #[derive(Default)]
+@@ -595,7 +597,7 @@ impl TurnRequestProcessor {
+         let environment_requests =
+             resolve_turn_environment_requests(self.thread_manager.as_ref(), params.environments)?;
+ 
+-        let additional_context = map_additional_context(params.additional_context);
++        let additional_context = map_additional_context(params.additional_context)?;
+         let turn_has_input = !params.input.is_empty();
+         let input = if let Some(tool_output) = params.tool_output {
+             let item = ResponseItem::FunctionCallOutput {
+@@ -1079,7 +1081,7 @@ impl TurnRequestProcessor {
+             .into_iter()
+             .map(V2UserInput::into_core)
+             .collect();
+-        let additional_context = map_additional_context(params.additional_context);
++        let additional_context = map_additional_context(params.additional_context)?;
+ 
+         let submission = thread
+             .steer_turn(
+diff --git a/codex-rs/core/src/context/mod.rs b/codex-rs/core/src/context/mod.rs
+index 4f2d3f9e2b721b22494bd9e2716698bc0b78c127..b3de0d538bd8ea72d284d088509e23514f914091 100644
+--- a/codex-rs/core/src/context/mod.rs
++++ b/codex-rs/core/src/context/mod.rs
+@@ -62,7 +62,6 @@ pub(crate) use approved_command_prefix_saved::ApprovedCommandPrefixSaved;
+ pub(crate) use apps_instructions::AppsInstructions;
+ pub(crate) use available_plugins_instructions::AvailablePluginsInstructions;
+ pub(crate) use base_instructions::BaseInstructionsFragment;
+-pub(crate) use codex_context_fragments::AdditionalContextDeveloperFragment;
+ pub(crate) use codex_context_fragments::AdditionalContextUserFragment;
+ pub use codex_context_fragments::AnsweredQuestion;
+ pub use codex_context_fragments::ContextualUserFragment;
+@@ -136,3 +135,4 @@ pub(crate) use user_instructions::UserInstructions;
+ pub(crate) use user_shell_command::UserShellCommand;
+ pub(crate) use user_verification_notice::UserVerificationNotice;
+ pub(crate) use world_state::ManagedDeveloperInstructions;
++pub use world_state::validate_application_context;
+diff --git a/codex-rs/core/src/context/world_state/application_context.rs b/codex-rs/core/src/context/world_state/application_context.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f7fe28d0f6120b90d4f397e2badb2feac66a8b79
+--- /dev/null
++++ b/codex-rs/core/src/context/world_state/application_context.rs
+@@ -0,0 +1,173 @@
++//! Application-supplied additional context kept in model history as one replaceable message.
++
++use super::PreviousSectionState;
++use super::SectionTransition;
++use super::WorldStateHash;
++use super::WorldStateSection;
++use super::WorldStateUpdate;
++use crate::context::ContextualUserFragment;
++use codex_protocol::models::ContentItemKind;
++use codex_protocol::protocol::AdditionalContextEntry;
++use codex_protocol::protocol::AdditionalContextKind;
++use codex_utils_string::approx_bytes_for_tokens;
++use codex_utils_string::approx_tokens_from_byte_count;
++use serde::Deserialize;
++use serde::Serialize;
++use std::collections::BTreeMap;
++
++const MAX_APPLICATION_CONTEXT_TOKENS: usize = 10_000;
++const START_MARKER: &str = "<application_context>";
++const END_MARKER: &str = "</application_context>";
++const REPLACEMENT_NOTICE: &str =
++    "This application context replaces all previously provided application context.";
++
++#[derive(Clone, Debug)]
++struct ApplicationContext {
++    entries: BTreeMap<String, String>,
++    notice: Option<&'static str>,
++}
++
++impl ContextualUserFragment for ApplicationContext {
++    fn content_kind(&self) -> ContentItemKind {
++        ContentItemKind("application_context".to_string())
++    }
++
++    fn role(&self) -> &'static str {
++        "developer"
++    }
++
++    fn markers(&self) -> (&'static str, &'static str) {
++        Self::type_markers()
++    }
++
++    fn type_markers() -> (&'static str, &'static str) {
++        (START_MARKER, END_MARKER)
++    }
++
++    fn body(&self) -> String {
++        render_body(
++            self.entries
++                .iter()
++                .map(|(key, value)| (key.as_str(), value.as_str())),
++            self.notice,
++        )
++    }
++}
++
++fn render_body<'a>(
++    entries: impl Iterator<Item = (&'a str, &'a str)>,
++    notice: Option<&str>,
++) -> String {
++    let mut body = String::from("\n");
++    if let Some(notice) = notice {
++        body.push_str(notice);
++        body.push_str("\n\n");
++    }
++    for (key, value) in entries {
++        body.push_str(&format!("<{key}>\n{value}\n</{key}>\n"));
++    }
++    body
++}
++
++fn application_entries(
++    entries: &BTreeMap<String, AdditionalContextEntry>,
++) -> impl Iterator<Item = (&str, &str)> {
++    entries
++        .iter()
++        .filter(|(_, entry)| entry.kind == AdditionalContextKind::Application)
++        .map(|(key, entry)| (key.as_str(), entry.value.as_str()))
++}
++
++/// Rejects application context that would not fit its model-context budget once rendered.
++///
++/// The section is never truncated, so oversized context must be refused before a turn starts.
++pub fn validate_application_context(
++    entries: &BTreeMap<String, AdditionalContextEntry>,
++) -> Result<(), String> {
++    if application_entries(entries).next().is_none() {
++        return Ok(());
++    }
++    // Reserve the notice used when an existing conversation receives new context.
++    let rendered_bytes = START_MARKER.len()
++        + render_body(application_entries(entries), Some(REPLACEMENT_NOTICE)).len()
++        + END_MARKER.len();
++    if rendered_bytes > approx_bytes_for_tokens(MAX_APPLICATION_CONTEXT_TOKENS) {
++        let estimated_tokens = approx_tokens_from_byte_count(rendered_bytes);
++        return Err(format!(
++            "application additionalContext exceeds the model-context limit of {MAX_APPLICATION_CONTEXT_TOKENS} estimated tokens ({estimated_tokens} including context markers)"
++        ));
++    }
++    Ok(())
++}
++
++/// The application context most recently supplied to the session.
++#[derive(Clone, Debug)]
++pub(crate) struct ApplicationContextState {
++    context: Option<ApplicationContext>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub(crate) struct ApplicationContextSnapshot {
++    context: WorldStateHash,
++}
++
++impl ApplicationContextState {
++    pub(crate) fn new(entries: &BTreeMap<String, AdditionalContextEntry>) -> Self {
++        let entries = application_entries(entries)
++            .map(|(key, value)| (key.to_string(), value.to_string()))
++            .collect::<BTreeMap<_, _>>();
++        Self {
++            context: (!entries.is_empty()).then_some(ApplicationContext {
++                entries,
++                notice: None,
++            }),
++        }
++    }
++}
++
++impl WorldStateSection for ApplicationContextState {
++    const ID: &'static str = "application_context";
++    type Snapshot = ApplicationContextSnapshot;
++
++    fn has_retained_fragment_matcher() -> bool {
++        true
++    }
++
++    fn matches_retained_fragment(role: &str, text: &str) -> bool {
++        role == "developer" && ApplicationContext::matches_text(text)
++    }
++
++    fn render_diff(
++        &self,
++        previous: PreviousSectionState<'_, Self::Snapshot>,
++    ) -> SectionTransition<Self::Snapshot> {
++        // Turns that omit application context leave the model-visible context unchanged.
++        let Some(context) = &self.context else {
++            return (None, Vec::new());
++        };
++        let current = ApplicationContextSnapshot {
++            context: WorldStateHash::from_fragment(context),
++        };
++        let notice = match previous {
++            PreviousSectionState::Known(previous) if previous == &current => {
++                return (Some(current), Vec::new());
++            }
++            PreviousSectionState::Absent => None,
++            PreviousSectionState::Known(_) | PreviousSectionState::Unknown => {
++                Some(REPLACEMENT_NOTICE)
++            }
++        };
++        let fragment = ApplicationContext {
++            entries: context.entries.clone(),
++            notice,
++        };
++        (
++            Some(current),
++            vec![WorldStateUpdate::fragment(fragment).standalone()],
++        )
++    }
++}
++
++#[cfg(test)]
++#[path = "application_context_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/context/world_state/application_context_tests.rs b/codex-rs/core/src/context/world_state/application_context_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..7fa1d2f7d4a1aa9cb4c6e60404c2ecba5b77755d
+--- /dev/null
++++ b/codex-rs/core/src/context/world_state/application_context_tests.rs
+@@ -0,0 +1,117 @@
++use super::*;
++use crate::context::world_state::WorldState;
++use codex_protocol::models::ResponseItem;
++use pretty_assertions::assert_eq;
++
++fn supplied(
++    entries: &[(&str, &str, AdditionalContextKind)],
++) -> BTreeMap<String, AdditionalContextEntry> {
++    entries
++        .iter()
++        .map(|(key, value, kind)| {
++            (
++                (*key).to_string(),
++                AdditionalContextEntry {
++                    value: (*value).to_string(),
++                    kind: *kind,
++                },
++            )
++        })
++        .collect()
++}
++
++fn rendered(entries: &[(&str, &str)], notice: Option<&'static str>) -> ResponseItem {
++    ContextualUserFragment::into(ApplicationContext {
++        entries: entries
++            .iter()
++            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
++            .collect(),
++        notice,
++    })
++}
++
++fn render(
++    entries: &[(&str, &str, AdditionalContextKind)],
++    previous: Option<&super::super::WorldStateSnapshot>,
++    history: &[ResponseItem],
++) -> (super::super::WorldStateSnapshot, Vec<ResponseItem>) {
++    let mut world_state = WorldState::default();
++    world_state.add_section(ApplicationContextState::new(&supplied(entries)));
++    let (snapshot, fragments) = world_state.render_history_fragment_diff(previous, history);
++    (
++        snapshot,
++        fragments
++            .into_iter()
++            .map(ContextualUserFragment::into_boxed_response_item)
++            .collect(),
++    )
++}
++
++#[test]
++fn application_context_is_replaced_whole_and_resent_when_history_loses_it() {
++    use AdditionalContextKind::Application;
++    use AdditionalContextKind::Untrusted;
++
++    let mut history: Vec<ResponseItem> = Vec::new();
++    let mut previous = None;
++    for (entries, expected) in [
++        (vec![], None),
++        (
++            vec![
++                ("policy", "one", Application),
++                ("browser", "tab", Untrusted),
++            ],
++            Some(rendered(&[("policy", "one")], None)),
++        ),
++        (vec![("policy", "one", Application)], None),
++        (vec![], None),
++        (
++            vec![
++                ("policy", "two", Application),
++                ("runtime", "idle", Application),
++            ],
++            Some(rendered(
++                &[("policy", "two"), ("runtime", "idle")],
++                Some(REPLACEMENT_NOTICE),
++            )),
++        ),
++    ] {
++        let (snapshot, updates) = render(&entries, previous.as_ref(), &history);
++        assert_eq!(updates, expected.into_iter().collect::<Vec<_>>());
++        history.extend(updates);
++        previous = Some(snapshot);
++    }
++
++    let current = [
++        ("policy", "two", Application),
++        ("runtime", "idle", Application),
++    ];
++    assert_eq!(render(&current, previous.as_ref(), &history).1, Vec::new());
++    assert_eq!(
++        render(&current, previous.as_ref(), &[]).1,
++        vec![rendered(&[("policy", "two"), ("runtime", "idle")], None)]
++    );
++}
++
++#[test]
++fn application_context_limit_includes_replacement_notice_and_markers() {
++    let overhead = ApplicationContext {
++        entries: BTreeMap::from([("policy".to_string(), String::new())]),
++        notice: Some(REPLACEMENT_NOTICE),
++    }
++    .render()
++    .len();
++    let fitting = "x".repeat(approx_bytes_for_tokens(MAX_APPLICATION_CONTEXT_TOKENS) - overhead);
++    let mut entries = supplied(&[
++        ("policy", &fitting, AdditionalContextKind::Application),
++        ("page", &fitting, AdditionalContextKind::Untrusted),
++    ]);
++    assert_eq!(validate_application_context(&entries), Ok(()));
++
++    if let Some(policy) = entries.get_mut("policy") {
++        policy.value.push('x');
++    }
++    let error = validate_application_context(&entries)
++        .expect_err("oversized application context must not be silently truncated");
++    assert!(error.contains("10000 estimated tokens"), "{error}");
++}
+diff --git a/codex-rs/core/src/context/world_state/mod.rs b/codex-rs/core/src/context/world_state/mod.rs
+index 857649f66285b750f8b11476a4c1b67537dfe606..1e7b648b5d09eb2d2153fd03a122654ebac91a0c 100644
+--- a/codex-rs/core/src/context/world_state/mod.rs
++++ b/codex-rs/core/src/context/world_state/mod.rs
+@@ -1,4 +1,5 @@
+ mod agents_md;
++mod application_context;
+ mod apps_instructions;
+ mod base_instructions;
+ mod collaboration_mode;
+@@ -39,6 +40,8 @@ use std::collections::BTreeMap;
+ use std::fmt;
+ 
+ pub(crate) use agents_md::AgentsMdState;
++pub(crate) use application_context::ApplicationContextState;
++pub use application_context::validate_application_context;
+ pub(crate) use apps_instructions::AppsInstructionsState;
+ pub(crate) use base_instructions::BaseInstructionsState;
+ pub(crate) use collaboration_mode::CollaborationModeState;
+diff --git a/codex-rs/core/src/session/world_state.rs b/codex-rs/core/src/session/world_state.rs
+index 5f30273dae8bf1ece2033f84b9e38fdee11e69e9..846a75fa6b0a170e84411467485184c857eba959 100644
+--- a/codex-rs/core/src/session/world_state.rs
++++ b/codex-rs/core/src/session/world_state.rs
+@@ -5,6 +5,7 @@ use super::step_context::StepContext;
+ use crate::connectors;
+ use crate::context::TokenBudgetContext;
+ use crate::context::world_state::AgentsMdState;
++use crate::context::world_state::ApplicationContextState;
+ use crate::context::world_state::AppsInstructionsState;
+ use crate::context::world_state::BaseInstructionsState;
+ use crate::context::world_state::CollaborationModeState;
+@@ -406,6 +407,11 @@ impl Session {
+                     .as_ref(),
+             ));
+         }
++        let application_context = {
++            let state = self.state.lock().await;
++            ApplicationContextState::new(state.additional_context.values())
++        };
++        world_state.add_section(application_context);
+         Ok(world_state)
+     }
+ }
+diff --git a/codex-rs/core/src/state/additional_context.rs b/codex-rs/core/src/state/additional_context.rs
+index 83144f8b9bdb8827ced7d5824a882c92a5ee5c75..291d7ec42e09a1d93c597cbd5c2ff92b13ad97e0 100644
+--- a/codex-rs/core/src/state/additional_context.rs
++++ b/codex-rs/core/src/state/additional_context.rs
+@@ -1,6 +1,5 @@
+ use std::collections::BTreeMap;
+ 
+-use crate::context::AdditionalContextDeveloperFragment;
+ use crate::context::AdditionalContextUserFragment;
+ use crate::context::ContextualUserFragment;
+ use codex_protocol::models::ResponseItem;
+@@ -13,23 +12,29 @@ pub(crate) struct AdditionalContextStore {
+ }
+ 
+ impl AdditionalContextStore {
++    /// Replaces the stored values and returns history items for changed untrusted entries.
++    ///
++    /// Application entries are rendered by the application-context world-state section.
+     pub(crate) fn merge(
+         &mut self,
+         values: BTreeMap<String, AdditionalContextEntry>,
+     ) -> Vec<ResponseItem> {
+         let fragments = values
+             .iter()
++            .filter(|(_, entry)| entry.kind == AdditionalContextKind::Untrusted)
+             .filter(|(key, value)| self.values.get(*key) != Some(*value))
+-            .map(|(key, entry)| match entry.kind {
+-                AdditionalContextKind::Untrusted => ContextualUserFragment::into(
+-                    AdditionalContextUserFragment::new(key.clone(), entry.value.clone()),
+-                ),
+-                AdditionalContextKind::Application => ContextualUserFragment::into(
+-                    AdditionalContextDeveloperFragment::new(key.clone(), entry.value.clone()),
+-                ),
++            .map(|(key, entry)| {
++                ContextualUserFragment::into(AdditionalContextUserFragment::new(
++                    key.clone(),
++                    entry.value.clone(),
++                ))
+             })
+             .collect();
+         self.values = values;
+         fragments
+     }
++
++    pub(crate) fn values(&self) -> &BTreeMap<String, AdditionalContextEntry> {
++        &self.values
++    }
+ }

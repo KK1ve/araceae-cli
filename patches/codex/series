@@ -17,3 +17,10 @@ remove-managed-account-flows.patch
 araceae-executable-names.patch
 araceae-package-layout.patch
 araceae-home-directory.patch
+provider-auth-rejected-token.patch
+platform-error-envelope.patch
+subagent-model-lock.patch
+application-context-world-state.patch
+apply-patch-function-tool.patch
+raw-usage-notifications.patch
+chat-wire-api.patch

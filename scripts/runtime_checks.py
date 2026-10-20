@@ -28,6 +28,13 @@ CHECKS = {
     "araceae-executable-names": {"references": ["codex-linux-sandbox", "codex-code-mode-host", "codex-command-runner", "codex-windows-sandbox-setup"]},
     "araceae-package-layout": {"references": ["codex-resources", "codex-path", "codex-package.json"]},
     "araceae-home-directory": {"references": ["~/.codex"]},
+    "provider-auth-rejected-token": {},
+    "platform-error-envelope": {},
+    "subagent-model-lock": {},
+    "application-context-world-state": {},
+    "apply-patch-function-tool": {},
+    "raw-usage-notifications": {},
+    "chat-wire-api": {},
 }
 
 

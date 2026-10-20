@@ -27,6 +27,13 @@
 | `araceae-executable-names.patch` | 入口、code-mode host、Linux 沙箱 helper 别名和 Windows 沙箱 helper 改用 `araceae` 前缀；运行时按新名称查找和启动 helper，上游打包器新增 `araceae` variant。 |
 | `araceae-package-layout.patch` | 包内资源目录、PATH 目录和布局清单改为 `araceae-resources/`、`araceae-path/`、`araceae-package.json`；运行时按新名称识别包布局、查找 bwrap 与 Windows helper。 |
 | `araceae-home-directory.patch` | 未设置 `CODEX_HOME` 时默认数据目录改为 `~/.araceae`；Windows 提权沙箱 runner 的 cwd junction 随之移到 `%USERPROFILE%\.araceae\.sandbox\cwd`，`-c` 帮助与 macOS 沙箱报错中的默认配置路径同步。 |
+| `provider-auth-rejected-token.patch` | 每次请求记录实际携带的 bearer 凭证；HTTP 401 触发刷新时，provider `auth.command` 通过环境变量 `ARACEAE_PROVIDER_AUTH_REJECTED_TOKEN` 收到被拒绝的凭证，常规取凭证时不设置该变量。 |
+| `platform-error-envelope.patch` | `[model_providers.<id>.error_envelope]` 声明网关以 HTTP 2xx 返回的 `{code, reason, message}` 错误信封：`auth_failure_reasons`、`auth_failure_message_pattern` 命中时按 401 刷新凭证，`auth_failure_statuses` 追加视为凭证失效的状态码；其余信封作为不重试的请求错误结束本轮。 |
+| `subagent-model-lock.patch` | `[agents] lock_subagent_model = true` 时子 agent 固定使用父任务的模型和推理强度：v1/v2 `spawn_agent` 不再暴露 `model`、`reasoning_effort`，调用参数、`default_subagent_*` 和角色配置中的模型被忽略，模型目录 world-state 分段不再下发。 |
+| `application-context-world-state.patch` | application 类 `additionalContext` 由 world-state 分段渲染为一条 `<application_context>` developer 消息：值变化时整段替换并附替换声明，窗口开始及历史中不再保留该消息时重发；不再截断到 1,000 token，渲染后超过 10,000 估算 token 时 `turn/start`、`turn/steer` 直接报错。 |
+| `apply-patch-function-tool.patch` | 顶层 `apply_patch_tool_type`（`function`、`freeform`、`none`）覆盖模型元数据，对未知模型的兜底元数据同样生效；`function` 下 `apply_patch` 为只有 `input` 字符串参数的函数工具，与 freeform 共用解析、审批、hook 和文件变更事件。 |
+| `raw-usage-notifications.patch` | `rawResponse/completed` 用量通知不再受线程 raw events 开关限制，`thread/resume` 挂载的线程和子线程同样下发；完整的 `rawResponseItem/completed` 仍需显式开启。 |
+| `chat-wire-api.patch` | provider 可设 `wire_api = "chat"`，请求发往 `<base_url>/chat/completions`：首个模型输出之前的 developer/system 消息合并为唯一首部消息，之后的指令按 `chat.mid_conversation_instructions` 发送；命名空间工具和 freeform 工具以不超过 64 字符的 `__` 别名暴露为函数并在分发前还原；工具结果紧跟调用，缺失的结果补占位；推理按 `chat.reasoning_replay` 回放。流式回复的工具调用只在回复正常结束后发出，未收到 `finish_reason` 即断开的流不提交任何内容并按可重试错误处理。结构化输出、图片、输出上限和 `extra_body` 由 `[model_providers.<id>.chat]` 配置。上下文超限、额度、限流按状态码和文案识别，2xx 错误信封沿用 `error_envelope`；chat provider 不提供托管工具、tool search 与远程压缩，缺少用量时按估算值触发自动压缩。 |
 
 运行时保留以下入口：
 
@@ -142,13 +149,15 @@ dependencies.txt
 
 `python3 scripts/verify_runtime.py --archive ARCHIVE --e2e` 会读取同名 `.sha256` 文件，在独立目录解压后校验文件并运行协议与 AIMock 验收。Linux 安装 `strace` 后可追加 `--network-trace artifacts/runtime-connect.log`，记录测试进程及其子进程的 `connect` 系统调用，并拒绝非回环 IP 连接。模型、MCP 与 OAuth 测试服务均位于回环地址；这个检查观察测试执行期间的连接，不是运行时的联网限制。只核验其他平台的归档时使用 `--integrity-only`，该模式不表示二进制运行验收通过。
 
-[CI workflow](.github/workflows/runtime.yml) 仅在向 GitHub 推送 `v*` 标签时触发构建，使用 `release` profile。三个构建任务均生成 amd64（x86_64）安装包：
+[CI workflow](.github/workflows/runtime.yml) 仅在向 GitHub 推送 `v*` 标签时触发构建，使用 `release` profile：
 
 | 平台 | Runner | Rust target | Artifact | 归档格式 |
 | --- | --- | --- | --- | --- |
 | Windows | `windows-2025` | `x86_64-pc-windows-msvc` | `araceae-windows-amd64-release` | ZIP |
-| macOS | `macos-15-intel` | `x86_64-apple-darwin` | `araceae-macos-amd64-release` | tar.gz |
-| Linux | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` | `araceae-linux-amd64-release` | tar.gz |
+| macOS（Intel） | `macos-15-intel` | `x86_64-apple-darwin` | `araceae-macos-amd64-release` | tar.gz |
+| macOS（Apple Silicon） | `macos-15` | `aarch64-apple-darwin` | `araceae-macos-arm64-release` | tar.gz |
+| Linux（glibc） | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` | `araceae-linux-amd64-release` | tar.gz |
+| Linux（musl 静态链接） | `ubuntu-24.04` | `x86_64-unknown-linux-musl` | `araceae-linux-musl-amd64-release` | tar.gz |
 
 创建并推送版本标签以触发构建，例如：
 
@@ -159,9 +168,11 @@ git push origin v0.1.0
 
 每个平台在上传前执行补丁工作流测试、归档与协议校验、AIMock 模型端到端验收；Linux 还检查测试期间的网络连接。Rust 依赖缓存按平台、工具链和构建 profile 隔离。基线和逐补丁前缀验收使用“验收”章节中的本地命令运行。
 
-运行成功后，在该次 Actions 运行页面的 **Artifacts** 下载对应平台制品；其中包含安装包归档及同名 `.sha256` 校验文件，保留 30 天。解压安装包后使用 `bin/araceae`（Windows 为 `bin/araceae.exe`），保留同包的 helper 和资源目录。验收报告单独存放在 `verification-<平台>-amd64-<profile>`。Linux 包面向 Ubuntu 24.04 及兼容的 glibc 系统。
+musl 构建沿用上游的工具链脚本 `codex/.github/scripts/install-musl-build-tools.sh` 和 Zig 0.14.0。
 
-该流程不发布 GitHub Release，也不执行 macOS notarization 或 Windows 代码签名。签名会改变文件哈希，签名后的分发流程需要重新生成文件清单和归档哈希。
+全部平台构建与验收通过后，`release` 任务校验各归档的 `.sha256`，以标签名创建 GitHub Release 并附上归档与校验文件。各次运行的 **Artifacts** 中同样保留安装包与校验文件 30 天，验收报告单独存放在 `verification-<平台>-<架构>-<profile>`。解压安装包后使用 `bin/araceae`（Windows 为 `bin/araceae.exe`），保留同包的 helper 和资源目录。glibc 版 Linux 包面向 Ubuntu 24.04 及兼容系统；需要在更旧的 glibc 上运行时使用 musl 版。
+
+该流程不执行 macOS notarization 或 Windows 代码签名。签名会改变文件哈希，签名后的分发流程需要重新生成文件清单和归档哈希。
 
 源码树重放以哈希比较；二进制构建仍受系统编译器、SDK 和链接器影响，不承诺跨宿主逐字节一致。性能与体积比较需要相同 target、profile、符号处理方式，并分别比较入口、helper 和整个安装包。
 

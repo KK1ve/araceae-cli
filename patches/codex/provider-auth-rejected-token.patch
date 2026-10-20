@@ -1,0 +1,416 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Mon, 19 Oct 2026 19:45:20 +1100
+Subject: [PATCH] Hand refused provider credentials to auth command refreshes
+
+Record the bearer credential each request attempt actually carried and pass
+it through unauthorized recovery to the external auth refresh. The provider
+auth command receives it as ARACEAE_PROVIDER_AUTH_REJECTED_TOKEN on refreshes
+only, so a credential source shared by concurrent requests can rotate exactly
+the refused credential and return the current one for stale refusals.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ codex-rs/codex-api/src/endpoint/responses.rs  |  5 +++
+ codex-rs/codex-api/src/endpoint/session.rs    | 27 +++++++++++
+ codex-rs/core/src/client.rs                   |  6 +++
+ codex-rs/core/src/client_tests.rs             |  3 ++
+ codex-rs/login/src/auth/auth_tests.rs         |  2 +
+ codex-rs/login/src/auth/external_bearer.rs    | 23 ++++++++--
+ codex-rs/login/src/auth/manager.rs            | 45 ++++++++++++++++---
+ .../login/src/auth/workload_identity_tests.rs |  2 +
+ 8 files changed, 103 insertions(+), 10 deletions(-)
+
+diff --git a/codex-rs/codex-api/src/endpoint/responses.rs b/codex-rs/codex-api/src/endpoint/responses.rs
+index 9c41a802eadd57cf20ffc733121921d8d3ba9d08..6e5c3abf4c98c690b5554846347e4ae15fb05f8d 100644
+--- a/codex-rs/codex-api/src/endpoint/responses.rs
++++ b/codex-rs/codex-api/src/endpoint/responses.rs
+@@ -57,6 +57,11 @@ impl<T: HttpTransport> ResponsesClient<T> {
+         }
+     }
+ 
++    /// Bearer credential carried by the most recent request attempt.
++    pub fn applied_bearer(&self) -> Option<String> {
++        self.session.applied_bearer()
++    }
++
+     #[instrument(
+         name = "responses.stream_request",
+         level = "info",
+diff --git a/codex-rs/codex-api/src/endpoint/session.rs b/codex-rs/codex-api/src/endpoint/session.rs
+index 7849225b5cbb6c37456d14e85b3fe069d878ada3..c983b248295e9c35787ddc99c8817cf93fbe9c7b 100644
+--- a/codex-rs/codex-api/src/endpoint/session.rs
++++ b/codex-rs/codex-api/src/endpoint/session.rs
+@@ -14,6 +14,7 @@ use http::HeaderMap;
+ use http::Method;
+ use serde_json::Value;
+ use std::sync::Arc;
++use std::sync::Mutex;
+ use tracing::instrument;
+ 
+ pub(crate) struct EndpointSession<T: HttpTransport> {
+@@ -21,6 +22,19 @@ pub(crate) struct EndpointSession<T: HttpTransport> {
+     provider: Provider,
+     auth: SharedAuthProvider,
+     request_telemetry: Option<Arc<dyn RequestTelemetry>>,
++    applied_bearer: Arc<Mutex<Option<String>>>,
++}
++
++/// Remembers the bearer credential a request actually carried after auth was applied.
++fn record_applied_bearer(slot: &Mutex<Option<String>>, headers: &HeaderMap) {
++    let bearer = headers
++        .get(http::header::AUTHORIZATION)
++        .and_then(|value| value.to_str().ok())
++        .and_then(|value| value.strip_prefix("Bearer "))
++        .map(str::to_string);
++    if let Ok(mut slot) = slot.lock() {
++        *slot = bearer;
++    }
+ }
+ 
+ impl<T: HttpTransport> EndpointSession<T> {
+@@ -30,9 +44,18 @@ impl<T: HttpTransport> EndpointSession<T> {
+             provider,
+             auth,
+             request_telemetry: None,
++            applied_bearer: Arc::new(Mutex::new(None)),
+         }
+     }
+ 
++    /// Bearer credential carried by the most recent attempt, if it sent one.
++    pub(crate) fn applied_bearer(&self) -> Option<String> {
++        self.applied_bearer
++            .lock()
++            .ok()
++            .and_then(|slot| slot.clone())
++    }
++
+     pub(crate) fn with_request_telemetry(
+         mut self,
+         request: Option<Arc<dyn RequestTelemetry>>,
+@@ -102,8 +125,10 @@ impl<T: HttpTransport> EndpointSession<T> {
+             |req| {
+                 let auth = self.auth.clone();
+                 let transport = &self.transport;
++                let applied_bearer = Arc::clone(&self.applied_bearer);
+                 async move {
+                     let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
++                    record_applied_bearer(&applied_bearer, &req.headers);
+                     transport.execute(req).await
+                 }
+             },
+@@ -143,8 +168,10 @@ impl<T: HttpTransport> EndpointSession<T> {
+             |req| {
+                 let auth = self.auth.clone();
+                 let transport = &self.transport;
++                let applied_bearer = Arc::clone(&self.applied_bearer);
+                 async move {
+                     let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
++                    record_applied_bearer(&applied_bearer, &req.headers);
+                     transport.stream(req).await
+                 }
+             },
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index 9ef4c0591931e00e9b195f0b47f51b850088c75f..8b57eadf2dd17128487b797addd25d03b5162b8c 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -1630,6 +1630,7 @@ impl ModelClientSession {
+                             &provider,
+                             self.client.event_sender.as_ref(),
+                             responses_metadata.turn_id.as_deref(),
++                            /*rejected_credential*/ None,
+                         )
+                         .await?,
+                     );
+@@ -1919,6 +1920,7 @@ impl ResponsesHttpExecutor<'_> {
+                             &self.client.state.provider,
+                             event_sender,
+                             responses_metadata.turn_id.as_deref(),
++                            client.applied_bearer(),
+                         )
+                         .await?,
+                     );
+@@ -2060,6 +2062,7 @@ impl ModelClientSession {
+                             &provider,
+                             self.client.event_sender.as_ref(),
+                             responses_metadata.turn_id.as_deref(),
++                            /*rejected_credential*/ None,
+                         )
+                         .await?,
+                     );
+@@ -2761,6 +2764,7 @@ fn emit_auth_recovery_event(
+     }
+ }
+ 
++#[allow(clippy::too_many_arguments)]
+ async fn handle_unauthorized(
+     transport: TransportError,
+     auth_recovery: &mut Option<UnauthorizedRecovery>,
+@@ -2769,6 +2773,7 @@ async fn handle_unauthorized(
+     provider: &SharedModelProvider,
+     event_sender: Option<&Sender<ProtocolEvent>>,
+     turn_id: Option<&str>,
++    rejected_credential: Option<String>,
+ ) -> Result<UnauthorizedRecoveryExecution> {
+     let debug = extract_response_debug_context(&transport);
+     if !*provider_auth_recovery_attempted {
+@@ -2821,6 +2826,7 @@ async fn handle_unauthorized(
+     {
+         let mode = recovery.mode_name();
+         let phase = recovery.step_name();
++        recovery.set_rejected_credential(rejected_credential);
+         return match recovery.next().await {
+             Ok(step_result) => {
+                 session_telemetry.record_auth_recovery(
+diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
+index 46ac8953074e2871eebd74e66242111732a0e2ee..7e08579206cfa4fe066028f822e4a392b70e3f57 100644
+--- a/codex-rs/core/src/client_tests.rs
++++ b/codex-rs/core/src/client_tests.rs
+@@ -1730,6 +1730,7 @@ async fn bedrock_unauthorized_error_uses_provider_mapping() {
+         &provider,
+         /*event_sender*/ None,
+         /*turn_id*/ None,
++        /*rejected_credential*/ None,
+     )
+     .await
+     .expect_err("expired Bedrock signature should fail");
+@@ -1827,6 +1828,7 @@ async fn provider_owned_auth_recovery_is_bounded_and_preserves_unauthorized_fail
+             &provider,
+             Some(&event_sender),
+             Some("turn-1"),
++            /*rejected_credential*/ None,
+         )
+         .await;
+ 
+@@ -1846,6 +1848,7 @@ async fn provider_owned_auth_recovery_is_bounded_and_preserves_unauthorized_fail
+                 &provider,
+                 Some(&event_sender),
+                 Some("turn-1"),
++                /*rejected_credential*/ None,
+             )
+             .await
+             .expect_err("provider recovery should not run more than once")
+diff --git a/codex-rs/login/src/auth/auth_tests.rs b/codex-rs/login/src/auth/auth_tests.rs
+index ab15a338718561251a4673c1e53e77b5e68485a8..a18a4bda417662707f311a94f081b7de42fed2a7 100644
+--- a/codex-rs/login/src/auth/auth_tests.rs
++++ b/codex-rs/login/src/auth/auth_tests.rs
+@@ -1157,6 +1157,7 @@ async fn unauthorized_recovery_reports_mode_and_step_names() {
+         step: UnauthorizedRecoveryStep::Reload,
+         expected_account_id: None,
+         mode: UnauthorizedRecoveryMode::Managed,
++        rejected_credential: None,
+     };
+     assert_eq!(managed.mode_name(), "managed");
+     assert_eq!(managed.step_name(), "reload");
+@@ -1166,6 +1167,7 @@ async fn unauthorized_recovery_reports_mode_and_step_names() {
+         step: UnauthorizedRecoveryStep::ExternalRefresh,
+         expected_account_id: None,
+         mode: UnauthorizedRecoveryMode::External,
++        rejected_credential: None,
+     };
+     assert_eq!(external.mode_name(), "external");
+     assert_eq!(external.step_name(), "external_refresh");
+diff --git a/codex-rs/login/src/auth/external_bearer.rs b/codex-rs/login/src/auth/external_bearer.rs
+index b8ad0d0672c6ce749aa6d801c5819588d903cc74..7f1ad52cbf622ebb88eb3cce6594750b4a23a7e7 100644
+--- a/codex-rs/login/src/auth/external_bearer.rs
++++ b/codex-rs/login/src/auth/external_bearer.rs
+@@ -43,7 +43,8 @@ impl BearerTokenRefresher {
+                 }
+             }
+ 
+-            let access_token = run_provider_auth_command(&self.state.config).await?;
++            let access_token =
++                run_provider_auth_command(&self.state.config, /*rejected_credential*/ None).await?;
+             *cached = Some(CachedExternalBearerToken {
+                 access_token: access_token.clone(),
+                 fetched_at: Instant::now(),
+@@ -53,8 +54,10 @@ impl BearerTokenRefresher {
+         Ok(CodexAuth::from_api_key(access_token.as_str()))
+     }
+ 
+-    async fn refresh(&self, _context: ExternalAuthRefreshContext) -> io::Result<CodexAuth> {
+-        let access_token = run_provider_auth_command(&self.state.config).await?;
++    async fn refresh(&self, context: ExternalAuthRefreshContext) -> io::Result<CodexAuth> {
++        let access_token =
++            run_provider_auth_command(&self.state.config, context.rejected_credential.as_deref())
++                .await?;
+         let mut cached = self.state.cached_token.lock().await;
+         *cached = Some(CachedExternalBearerToken {
+             access_token: access_token.clone(),
+@@ -100,7 +103,13 @@ struct CachedExternalBearerToken {
+     fetched_at: Instant,
+ }
+ 
+-async fn run_provider_auth_command(config: &ModelProviderAuthInfo) -> io::Result<String> {
++/// Environment variable carrying the refused credential to the provider auth command.
++const PROVIDER_AUTH_REJECTED_TOKEN_ENV: &str = "ARACEAE_PROVIDER_AUTH_REJECTED_TOKEN";
++
++async fn run_provider_auth_command(
++    config: &ModelProviderAuthInfo,
++    rejected_credential: Option<&str>,
++) -> io::Result<String> {
+     let program = resolve_provider_auth_program(&config.command, &config.cwd)?;
+     let mut command = Command::from(codex_utils_process::background_command(&program));
+     command
+@@ -110,6 +119,12 @@ async fn run_provider_auth_command(config: &ModelProviderAuthInfo) -> io::Result
+         .stdout(Stdio::piped())
+         .stderr(Stdio::piped())
+         .kill_on_drop(true);
++    // Set only for refreshes after a refusal, so the command can rotate exactly the
++    // refused credential; ordinary fetches never carry it.
++    command.env_remove(PROVIDER_AUTH_REJECTED_TOKEN_ENV);
++    if let Some(credential) = rejected_credential {
++        command.env(PROVIDER_AUTH_REJECTED_TOKEN_ENV, credential);
++    }
+ 
+     let output = tokio::time::timeout(config.timeout(), command.output())
+         .await
+diff --git a/codex-rs/login/src/auth/manager.rs b/codex-rs/login/src/auth/manager.rs
+index 5ca81d7f550c86ab9df3266f2816d8dfda47aff4..8b1b4aeef9d82022b9273489685cb9b3693c0d47 100644
+--- a/codex-rs/login/src/auth/manager.rs
++++ b/codex-rs/login/src/auth/manager.rs
+@@ -266,6 +266,8 @@ pub enum ExternalAuthRefreshReason {
+ pub struct ExternalAuthRefreshContext {
+     pub reason: ExternalAuthRefreshReason,
+     pub previous_account_id: Option<String>,
++    /// Credential the upstream refused, when the caller knows which one it sent.
++    pub rejected_credential: Option<String>,
+ }
+ 
+ /// Pluggable auth provider used by `AuthManager` for externally managed auth flows.
+@@ -1769,6 +1771,7 @@ pub struct UnauthorizedRecovery {
+     step: UnauthorizedRecoveryStep,
+     expected_account_id: Option<String>,
+     mode: UnauthorizedRecoveryMode,
++    rejected_credential: Option<String>,
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -1800,9 +1803,15 @@ impl UnauthorizedRecovery {
+             step,
+             expected_account_id,
+             mode,
++            rejected_credential: None,
+         }
+     }
+ 
++    /// Records the credential the failed request carried for the next refresh step.
++    pub fn set_rejected_credential(&mut self, credential: Option<String>) {
++        self.rejected_credential = credential;
++    }
++
+     pub fn has_next(&self) -> bool {
+         if self.manager.has_refreshable_external_auth() {
+             return !matches!(self.step, UnauthorizedRecoveryStep::Done);
+@@ -1915,14 +1924,18 @@ impl UnauthorizedRecovery {
+                 }
+             }
+             UnauthorizedRecoveryStep::RefreshToken => {
+-                self.manager.refresh_token_from_authority().await?;
++                self.manager
++                    .refresh_token_from_authority_rejecting(self.rejected_credential.clone())
++                    .await?;
+                 self.step = UnauthorizedRecoveryStep::Done;
+                 return Ok(UnauthorizedRecoveryStepResult {
+                     auth_state_changed: Some(true),
+                 });
+             }
+             UnauthorizedRecoveryStep::ExternalRefresh => {
+-                self.manager.refresh_token_from_authority().await?;
++                self.manager
++                    .refresh_token_from_authority_rejecting(self.rejected_credential.clone())
++                    .await?;
+                 self.step = UnauthorizedRecoveryStep::Done;
+                 return Ok(UnauthorizedRecoveryStepResult {
+                     auth_state_changed: Some(true),
+@@ -2762,7 +2775,10 @@ impl AuthManager {
+                 tracing::info!("Skipping token refresh because auth changed after guarded reload.");
+                 Ok(())
+             }
+-            ReloadOutcome::ReloadedNoChange => self.refresh_token_from_authority_impl().await,
++            ReloadOutcome::ReloadedNoChange => {
++                self.refresh_token_from_authority_impl(/*rejected_credential*/ None)
++                    .await
++            }
+             ReloadOutcome::Skipped => {
+                 Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                     RefreshTokenFailedReason::Other,
+@@ -2776,16 +2792,31 @@ impl AuthManager {
+     /// it and update the shared cache. If the token refresh fails, returns the
+     /// error to the caller.
+     pub async fn refresh_token_from_authority(&self) -> Result<(), RefreshTokenError> {
++        self.refresh_token_from_authority_rejecting(/*rejected_credential*/ None)
++            .await
++    }
++
++    /// Refreshes after an upstream refused `rejected_credential`. External auth
++    /// receives the refused value, so a credential source shared by concurrent
++    /// requests can tell a stale refusal apart from one that still needs rotation.
++    pub async fn refresh_token_from_authority_rejecting(
++        &self,
++        rejected_credential: Option<String>,
++    ) -> Result<(), RefreshTokenError> {
+         let _refresh_guard = self.refresh_lock.acquire().await.map_err(|_| {
+             RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                 RefreshTokenFailedReason::Other,
+                 REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
+             ))
+         })?;
+-        self.refresh_token_from_authority_impl().await
++        self.refresh_token_from_authority_impl(rejected_credential)
++            .await
+     }
+ 
+-    async fn refresh_token_from_authority_impl(&self) -> Result<(), RefreshTokenError> {
++    async fn refresh_token_from_authority_impl(
++        &self,
++        rejected_credential: Option<String>,
++    ) -> Result<(), RefreshTokenError> {
+         tracing::info!("Refreshing token");
+ 
+         let attempted_auth = self.auth_cached();
+@@ -2797,7 +2828,7 @@ impl AuthManager {
+         }
+ 
+         let result = if self.has_external_auth() {
+-            self.refresh_external_auth(ExternalAuthRefreshReason::Unauthorized)
++            self.refresh_external_auth(ExternalAuthRefreshReason::Unauthorized, rejected_credential)
+                 .await
+         } else {
+             Err(RefreshTokenError::Transient(std::io::Error::other(
+@@ -2901,6 +2932,7 @@ impl AuthManager {
+     async fn refresh_external_auth(
+         &self,
+         reason: ExternalAuthRefreshReason,
++        rejected_credential: Option<String>,
+     ) -> Result<(), RefreshTokenError> {
+         let Some(external_auth) = self.external_auth_provider() else {
+             return Err(RefreshTokenError::Transient(std::io::Error::other(
+@@ -2914,6 +2946,7 @@ impl AuthManager {
+         let context = ExternalAuthRefreshContext {
+             reason,
+             previous_account_id,
++            rejected_credential,
+         };
+ 
+         let refreshed = external_auth
+diff --git a/codex-rs/login/src/auth/workload_identity_tests.rs b/codex-rs/login/src/auth/workload_identity_tests.rs
+index e11eca1116e9400b4e69bb14a811462f7cc30c38..3009cfabc9b52f11941f474c5bc7e2624f8ede15 100644
+--- a/codex-rs/login/src/auth/workload_identity_tests.rs
++++ b/codex-rs/login/src/auth/workload_identity_tests.rs
+@@ -327,6 +327,7 @@ async fn refresh_preserves_identity_and_invalid_tokens_are_reexchanged() {
+         .refresh(ExternalAuthRefreshContext {
+             reason: ExternalAuthRefreshReason::Unauthorized,
+             previous_account_id: Some("account-one".to_string()),
++            rejected_credential: None,
+         })
+         .await
+         .expect_err("identity change must be rejected");
+@@ -383,6 +384,7 @@ async fn concurrent_refreshes_share_one_exchange() {
+     let context = ExternalAuthRefreshContext {
+         reason: ExternalAuthRefreshReason::Unauthorized,
+         previous_account_id: Some("account-one".to_string()),
++        rejected_credential: None,
+     };
+ 
+     let (first_refresh, second_refresh) =

@@ -1,10 +1,10 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
 import { mkdir, readFile, writeFile } from "node:fs/promises"
-import { createServer, request } from "node:http"
+import { request } from "node:http"
 import { join } from "node:path"
 import test from "node:test"
-import { fixture } from "./runtime-test-support.mjs"
+import { fixture, listen } from "./runtime-test-support.mjs"
 
 const checks = JSON.parse(process.env.ARACEAE_RUNTIME_CHECKS ?? "{}")
 const binary = process.env.ARACEAE_CODEX_BIN
@@ -15,13 +15,6 @@ function scenario(check, name, run) {
 async function config(home, update) {
   const path = join(home, "config.toml")
   await writeFile(path, update(await readFile(path, "utf8")))
-}
-async function listen(t, handler, connect) {
-  const server = createServer(handler)
-  if (connect) server.on("connect", connect)
-  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve))
-  t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve) }))
-  return `http://127.0.0.1:${server.address().port}`
 }
 
 for (const [check, contract] of Object.entries(checks)) {
@@ -270,7 +263,8 @@ scenario("runtime-e2e", "child agents inherit the configured model provider", as
   ], { overrides: ["-c", "agents.enabled=true"] })
   const server = await f.connect()
   const { thread } = await server.call("thread/start", { cwd: f.cwd })
-  assert.equal(await server.turn(thread.id, "START_DELEGATION"), "PARENT_PROVIDER_DONE")
+  // A child that finishes before the parent's turn ends reports back, so the parent may answer again.
+  assert.match(await server.turn(thread.id, "START_DELEGATION"), /^(?:PARENT_PROVIDER_DONE)+$/)
   const child = await Promise.race([childSeen, new Promise((_, reject) => { const timer = setTimeout(() => reject(new Error("Child agent did not call the configured provider")), 15000); timer.unref() })])
   assert.equal(child.model, "gpt-5.4")
 })

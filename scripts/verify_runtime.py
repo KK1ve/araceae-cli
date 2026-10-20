@@ -145,7 +145,8 @@ def verify(root, package, execute, report, e2e=False, network_trace=None):
             result.update({"execution": "passed", "version": version, "methods": sorted(methods), "required_fields": sorted(FIELDS)})
         if e2e:
             command = ["node", "--test", str(root / "tests/runtime-e2e.test.mjs"), str(root / "tests/runtime-pruning.test.mjs"),
-                       str(root / "tests/runtime-araceae-names.test.mjs")]
+                       str(root / "tests/runtime-araceae-names.test.mjs"), str(root / "tests/runtime-features.test.mjs"),
+                       str(root / "tests/runtime-chat.test.mjs")]
             if network_trace:
                 if sys.platform != "linux" or not shutil.which("strace"):
                     raise ValueError("--network-trace requires Linux and strace")

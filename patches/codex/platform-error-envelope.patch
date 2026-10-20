@@ -1,0 +1,892 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Mon, 19 Oct 2026 20:05:40 +1100
+Subject: [PATCH] Recognize HTTP 2xx gateway error envelopes
+
+Some model gateways answer a request with HTTP 200 and a JSON body shaped
+like {"code": <non-zero>, "reason": "...", "message": "..."} instead of a
+model response. A provider describes these envelopes under
+[model_providers.<id>.error_envelope]:
+
+- auth_failure_reasons: envelope reasons, compared after their last ".",
+  that mean the credential was refused
+- auth_failure_message_pattern: a regex over the envelope message with the
+  same meaning
+- auth_failure_statuses: additional HTTP statuses that count as refused
+  credentials
+
+Before stream parsing, the Responses endpoint reads a 2xx JSON body of up
+to 1 MiB. A refused credential becomes an HTTP 401 transport error so
+unauthorized recovery refreshes it; any other envelope fails the request
+once as a non-retryable invalid request carrying the gateway reason and
+message. Invalid patterns and statuses are rejected while loading
+configuration.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ codex-rs/Cargo.lock                           |   1 +
+ .../thread_processor_tests.rs                 |   1 +
+ .../codex-api/src/endpoint/error_envelope.rs  | 164 ++++++++++++++++++
+ .../src/endpoint/error_envelope_tests.rs      |  85 +++++++++
+ codex-rs/codex-api/src/endpoint/mod.rs        |   2 +
+ codex-rs/codex-api/src/endpoint/responses.rs  |  15 ++
+ codex-rs/codex-api/src/lib.rs                 |   1 +
+ codex-rs/config/src/thread_config.rs          |   1 +
+ codex-rs/config/src/thread_config/remote.rs   |   3 +
+ codex-rs/core/config.schema.json              |  37 ++++
+ codex-rs/core/src/client.rs                   |  26 ++-
+ codex-rs/core/tests/responses_headers.rs      |   3 +
+ codex-rs/core/tests/suite/client.rs           |   4 +
+ .../core/tests/suite/client_websockets.rs     |   1 +
+ .../suite/stream_error_allows_next_turn.rs    |   1 +
+ .../core/tests/suite/stream_no_completed.rs   |   1 +
+ codex-rs/login/src/auth_env_telemetry.rs      |   1 +
+ codex-rs/model-provider-info/Cargo.toml       |   1 +
+ .../model-provider-info/src/error_envelope.rs |  52 ++++++
+ codex-rs/model-provider-info/src/lib.rs       |  10 ++
+ .../src/model_provider_info_tests.rs          |   4 +
+ codex-rs/model-provider/src/provider.rs       |  13 ++
+ 22 files changed, 426 insertions(+), 1 deletion(-)
+ create mode 100644 codex-rs/codex-api/src/endpoint/error_envelope.rs
+ create mode 100644 codex-rs/codex-api/src/endpoint/error_envelope_tests.rs
+ create mode 100644 codex-rs/model-provider-info/src/error_envelope.rs
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 5b56dd17755442ddd445aa467f56c2087bfa36a9..7b1b0b8129c091e10e693bdfc93bea339edf7022 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -4101,6 +4101,7 @@ dependencies = [
+  "http 1.4.0",
+  "maplit",
+  "pretty_assertions",
++ "regex-lite",
+  "schemars 0.8.22",
+  "serde",
+  "tempfile",
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
+index f1bd1bfe92fe996e39d9c2b333460424bf51f37b..5e0081e5c30b3657b2d5debf5b350098dfcae674 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
+@@ -603,6 +603,7 @@ mod thread_processor_behavior_tests {
+             gateway_oauth: None,
+             aws: None,
+             wire_api: WireApi::Responses,
++            error_envelope: None,
+             query_params: None,
+             http_headers: None,
+             env_http_headers: None,
+diff --git a/codex-rs/codex-api/src/endpoint/error_envelope.rs b/codex-rs/codex-api/src/endpoint/error_envelope.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..76fa83e10a1272c2f1aad6403b2814acdb4cdab0
+--- /dev/null
++++ b/codex-rs/codex-api/src/endpoint/error_envelope.rs
+@@ -0,0 +1,164 @@
++//! Recognizes gateways that answer a model request with an HTTP 2xx JSON error envelope.
++
++use crate::error::ApiError;
++use bytes::Bytes;
++use codex_client::StreamResponse;
++use codex_client::TransportError;
++use futures::StreamExt;
++use http::HeaderMap;
++use http::StatusCode;
++use regex_lite::Regex;
++use serde_json::Value;
++
++/// Largest 2xx JSON body read while looking for an error envelope.
++const MAX_INSPECTED_BODY_BYTES: usize = 1024 * 1024;
++
++/// Detection rules for an HTTP 2xx `{"code": <non-zero>, "reason": "...", "message": "..."}`
++/// body that a gateway returns in place of a model response.
++#[derive(Debug, Clone)]
++pub struct ErrorEnvelopePolicy {
++    auth_failure_reasons: Vec<String>,
++    auth_failure_message: Option<Regex>,
++}
++
++impl ErrorEnvelopePolicy {
++    /// `auth_failure_reasons` are compared with the segment of the envelope reason after its
++    /// last `.`; `auth_failure_message_pattern` is matched against the envelope message.
++    pub fn new(
++        auth_failure_reasons: Vec<String>,
++        auth_failure_message_pattern: Option<&str>,
++    ) -> Result<Self, regex_lite::Error> {
++        Ok(Self {
++            auth_failure_reasons,
++            auth_failure_message: auth_failure_message_pattern.map(Regex::new).transpose()?,
++        })
++    }
++
++    fn refuses_credential(&self, envelope: &ErrorEnvelope) -> bool {
++        let reason = envelope.reason.rsplit('.').next().unwrap_or_default();
++        self.auth_failure_reasons
++            .iter()
++            .any(|candidate| candidate == reason)
++            || self
++                .auth_failure_message
++                .as_ref()
++                .is_some_and(|pattern| pattern.is_match(&envelope.message))
++    }
++}
++
++struct ErrorEnvelope {
++    code: String,
++    reason: String,
++    message: String,
++}
++
++fn parse_envelope(body: &[u8]) -> Option<ErrorEnvelope> {
++    let value: Value = serde_json::from_slice(body).ok()?;
++    let object = value.as_object()?;
++    let code = object.get("code")?;
++    if !code.is_number() || code.as_f64() == Some(0.0) {
++        return None;
++    }
++    Some(ErrorEnvelope {
++        code: code.to_string(),
++        reason: object.get("reason")?.as_str()?.to_string(),
++        message: object.get("message")?.as_str()?.to_string(),
++    })
++}
++
++fn is_json(headers: &HeaderMap) -> bool {
++    headers
++        .get(http::header::CONTENT_TYPE)
++        .and_then(|value| value.to_str().ok())
++        .and_then(|value| value.split(';').next())
++        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
++}
++
++/// A 2xx reply after error-envelope inspection.
++pub(crate) enum SuccessBody {
++    /// A reply that is not JSON, untouched.
++    Stream(StreamResponse),
++    /// A complete JSON body that is not an error envelope.
++    Json {
++        status: StatusCode,
++        headers: HeaderMap,
++        body: Bytes,
++    },
++}
++
++impl SuccessBody {
++    /// Returns the reply as a byte stream for parsers that read events.
++    pub(crate) fn into_stream(self) -> StreamResponse {
++        match self {
++            SuccessBody::Stream(response) => response,
++            SuccessBody::Json {
++                status,
++                headers,
++                body,
++            } => StreamResponse {
++                status,
++                headers,
++                bytes: futures::stream::once(async move { Ok(body) }).boxed(),
++            },
++        }
++    }
++}
++
++/// Converts an error envelope into the error its meaning maps to.
++///
++/// A refused credential becomes an HTTP 401 transport error so unauthorized recovery refreshes
++/// it; any other envelope becomes a non-retryable invalid request carrying the gateway's text.
++pub(crate) async fn inspect_success_response(
++    response: StreamResponse,
++    policy: Option<&ErrorEnvelopePolicy>,
++) -> Result<SuccessBody, ApiError> {
++    let Some(policy) = policy else {
++        return Ok(SuccessBody::Stream(response));
++    };
++    if !is_json(&response.headers) {
++        return Ok(SuccessBody::Stream(response));
++    }
++    let StreamResponse {
++        status,
++        headers,
++        mut bytes,
++    } = response;
++    let mut body = Vec::new();
++    while let Some(chunk) = bytes.next().await {
++        let chunk = chunk.map_err(ApiError::Transport)?;
++        if body.len() + chunk.len() > MAX_INSPECTED_BODY_BYTES {
++            return Err(ApiError::Stream(format!(
++                "model gateway returned a JSON body larger than {MAX_INSPECTED_BODY_BYTES} bytes"
++            )));
++        }
++        body.extend_from_slice(&chunk);
++    }
++    let Some(envelope) = parse_envelope(&body) else {
++        return Ok(SuccessBody::Json {
++            status,
++            headers,
++            body: Bytes::from(body),
++        });
++    };
++    if policy.refuses_credential(&envelope) {
++        return Err(ApiError::Transport(TransportError::Http {
++            status: StatusCode::UNAUTHORIZED,
++            url: None,
++            headers: Some(headers),
++            body: Some(String::from_utf8_lossy(&body).into_owned()),
++            retry_after: None,
++        }));
++    }
++    let label = if envelope.reason.is_empty() {
++        envelope.code
++    } else {
++        envelope.reason
++    };
++    Err(ApiError::InvalidRequest {
++        message: format!("model gateway returned {label}: {}", envelope.message),
++    })
++}
++
++#[cfg(test)]
++#[path = "error_envelope_tests.rs"]
++mod tests;
+diff --git a/codex-rs/codex-api/src/endpoint/error_envelope_tests.rs b/codex-rs/codex-api/src/endpoint/error_envelope_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c0a6d7ad60b9af43e3904e406f30c45e8c4a515
+--- /dev/null
++++ b/codex-rs/codex-api/src/endpoint/error_envelope_tests.rs
+@@ -0,0 +1,85 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++fn json_response(body: &'static str) -> StreamResponse {
++    let mut headers = HeaderMap::new();
++    headers.insert(
++        http::header::CONTENT_TYPE,
++        http::HeaderValue::from_static("application/json; charset=utf-8"),
++    );
++    StreamResponse {
++        status: StatusCode::OK,
++        headers,
++        bytes: futures::stream::once(async move { Ok(Bytes::from_static(body.as_bytes())) })
++            .boxed(),
++    }
++}
++
++fn policy() -> ErrorEnvelopePolicy {
++    ErrorEnvelopePolicy::new(
++        vec!["ERROR_LOGIN_EXPIRED".to_string()],
++        Some("登录已(?:失效|过期)"),
++    )
++    .expect("valid policy")
++}
++
++#[tokio::test]
++async fn refused_credentials_become_unauthorized_transport_errors() {
++    for body in [
++        r#"{"code":16,"reason":"user.v1.ERROR_LOGIN_EXPIRED","message":"expired"}"#,
++        r#"{"code":500,"reason":"","message":"登录已失效，请重新登录"}"#,
++    ] {
++        let error = inspect_success_response(json_response(body), Some(&policy()))
++            .await
++            .err()
++            .expect("envelope must fail");
++        let ApiError::Transport(TransportError::Http {
++            status,
++            body: forwarded,
++            ..
++        }) = error
++        else {
++            panic!("expected an HTTP transport error, got {error:?}");
++        };
++        assert_eq!(status, StatusCode::UNAUTHORIZED);
++        assert_eq!(forwarded.as_deref(), Some(body));
++    }
++}
++
++#[tokio::test]
++async fn other_envelopes_become_invalid_requests() {
++    let error = inspect_success_response(
++        json_response(r#"{"code":7,"reason":"MODEL_DISABLED","message":"模型已停用"}"#),
++        Some(&policy()),
++    )
++    .await
++    .err()
++    .expect("envelope must fail");
++    let ApiError::InvalidRequest { message } = error else {
++        panic!("expected an invalid request, got {error:?}");
++    };
++    assert_eq!(message, "model gateway returned MODEL_DISABLED: 模型已停用");
++}
++
++#[tokio::test]
++async fn ordinary_json_and_streams_pass_through() {
++    let body = r#"{"id":"chatcmpl-1","choices":[]}"#;
++    let SuccessBody::Json { body: bytes, .. } =
++        inspect_success_response(json_response(body), Some(&policy()))
++            .await
++            .expect("plain JSON passes")
++    else {
++        panic!("expected a JSON body");
++    };
++    assert_eq!(bytes, Bytes::from_static(body.as_bytes()));
++
++    let zero_code = r#"{"code":0,"reason":"","message":"ok"}"#;
++    assert!(matches!(
++        inspect_success_response(json_response(zero_code), Some(&policy())).await,
++        Ok(SuccessBody::Json { .. })
++    ));
++    assert!(matches!(
++        inspect_success_response(json_response(zero_code), None).await,
++        Ok(SuccessBody::Stream(_))
++    ));
++}
+diff --git a/codex-rs/codex-api/src/endpoint/mod.rs b/codex-rs/codex-api/src/endpoint/mod.rs
+index 77b3054aeeca459f33b679e3165f12652eaeaf53..0b3d267098780bcc1db4353b8ca3eb9ffadf8572 100644
+--- a/codex-rs/codex-api/src/endpoint/mod.rs
++++ b/codex-rs/codex-api/src/endpoint/mod.rs
+@@ -1,3 +1,4 @@
++pub(crate) mod error_envelope;
+ pub(crate) mod images;
+ pub(crate) mod memories;
+ pub(crate) mod models;
+@@ -8,6 +9,7 @@ pub(crate) mod responses_websocket;
+ pub(crate) mod search;
+ mod session;
+ 
++pub use error_envelope::ErrorEnvelopePolicy;
+ pub use images::ImageRequestError;
+ pub use images::ImagesClient;
+ pub use memories::MemoriesClient;
+diff --git a/codex-rs/codex-api/src/endpoint/responses.rs b/codex-rs/codex-api/src/endpoint/responses.rs
+index 6e5c3abf4c98c690b5554846347e4ae15fb05f8d..74427bd94bca8ee5e54a310a6b3b88e0af482899 100644
+--- a/codex-rs/codex-api/src/endpoint/responses.rs
++++ b/codex-rs/codex-api/src/endpoint/responses.rs
+@@ -1,6 +1,8 @@
+ use crate::auth::SharedAuthProvider;
+ use crate::common::ResponseStream;
+ use crate::common::ResponsesApiRequest;
++use crate::endpoint::error_envelope::ErrorEnvelopePolicy;
++use crate::endpoint::error_envelope::inspect_success_response;
+ use crate::endpoint::session::EndpointSession;
+ use crate::error::ApiError;
+ use crate::provider::Provider;
+@@ -26,6 +28,7 @@ use tracing::instrument;
+ pub struct ResponsesClient<T: HttpTransport> {
+     session: EndpointSession<T>,
+     sse_telemetry: Option<Arc<dyn SseTelemetry>>,
++    error_envelope: Option<Arc<ErrorEnvelopePolicy>>,
+ }
+ 
+ #[derive(Default)]
+@@ -43,6 +46,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
+         Self {
+             session: EndpointSession::new(transport, provider, auth),
+             sse_telemetry: None,
++            error_envelope: None,
+         }
+     }
+ 
+@@ -54,9 +58,16 @@ impl<T: HttpTransport> ResponsesClient<T> {
+         Self {
+             session: self.session.with_request_telemetry(request),
+             sse_telemetry: sse,
++            error_envelope: self.error_envelope,
+         }
+     }
+ 
++    /// Inspects 2xx JSON replies for a gateway error envelope before stream parsing.
++    pub fn with_error_envelope(mut self, policy: Option<Arc<ErrorEnvelopePolicy>>) -> Self {
++        self.error_envelope = policy;
++        self
++    }
++
+     /// Bearer credential carried by the most recent request attempt.
+     pub fn applied_bearer(&self) -> Option<String> {
+         self.session.applied_bearer()
+@@ -153,6 +164,10 @@ impl<T: HttpTransport> ResponsesClient<T> {
+                 },
+             )
+             .await?;
++        let stream_response =
++            inspect_success_response(stream_response, self.error_envelope.as_deref())
++                .await?
++                .into_stream();
+ 
+         Ok(spawn_response_stream(
+             stream_response,
+diff --git a/codex-rs/codex-api/src/lib.rs b/codex-rs/codex-api/src/lib.rs
+index 3afbcc6ef1f1110e426e46c049d9569c25209bc8..35bf84ab7694a35da0d5d24990bca88f2efc6976 100644
+--- a/codex-rs/codex-api/src/lib.rs
++++ b/codex-rs/codex-api/src/lib.rs
+@@ -51,6 +51,7 @@ pub use crate::common::WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY;
+ pub use crate::common::WS_REQUEST_HEADER_TRACESTATE_CLIENT_METADATA_KEY;
+ pub use crate::common::create_text_param_for_request;
+ pub use crate::common::response_create_client_metadata;
++pub use crate::endpoint::ErrorEnvelopePolicy;
+ pub use crate::endpoint::ImageRequestError;
+ pub use crate::endpoint::ImagesClient;
+ pub use crate::endpoint::MemoriesClient;
+diff --git a/codex-rs/config/src/thread_config.rs b/codex-rs/config/src/thread_config.rs
+index 0518ea887b30b950fc9b0bd2573b1e007da13e8b..36bbbb58c302cd4823f2a83b3f2a203e7a0cbee3 100644
+--- a/codex-rs/config/src/thread_config.rs
++++ b/codex-rs/config/src/thread_config.rs
+@@ -306,6 +306,7 @@ mod tests {
+             gateway_oauth: None,
+             aws: None,
+             wire_api: WireApi::Responses,
++            error_envelope: None,
+             query_params: None,
+             http_headers: None,
+             env_http_headers: None,
+diff --git a/codex-rs/config/src/thread_config/remote.rs b/codex-rs/config/src/thread_config/remote.rs
+index da0af3bca082c5b811e4d4bc4d6bfdecbdca427b..b28cefa9cceba327718e9044b0caf3d683eacb8a 100644
+--- a/codex-rs/config/src/thread_config/remote.rs
++++ b/codex-rs/config/src/thread_config/remote.rs
+@@ -184,6 +184,7 @@ fn model_provider_from_proto(
+         gateway_oauth: None,
+         aws: None,
+         wire_api,
++        error_envelope: None,
+         query_params: provider.query_params.map(redacted_string_map),
+         http_headers: provider.http_headers.map(redacted_string_map),
+         env_http_headers: provider.env_http_headers.map(|map| map.values),
+@@ -228,6 +229,7 @@ fn model_provider_to_proto(
+         supports_standalone_web_search,
+         include_internal_metadata: _,
+         capabilities: _,
++        error_envelope: _,
+     } = provider;
+ 
+     proto::ModelProvider {
+@@ -565,6 +567,7 @@ mod tests {
+                 cwd: workspace_dir(),
+             }),
+             wire_api: WireApi::Responses,
++            error_envelope: None,
+             query_params: Some(HashMap::from([(
+                 "api-version".to_string(),
+                 "2026-04-16".into(),
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index 4aba1bab6cd2cbcc179a5de802731f2775c6bc88..edded1b2fb7f0f43f765358491994c9534050ca5 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -2801,6 +2801,35 @@
+       },
+       "type": "object"
+     },
++    "ModelProviderErrorEnvelope": {
++      "additionalProperties": false,
++      "description": "Recognizes an HTTP 2xx `{\"code\": <non-zero>, \"reason\": \"...\", \"message\": \"...\"}` body that a gateway returns in place of a model response, and the replies that refuse a credential.",
++      "properties": {
++        "auth_failure_message_pattern": {
++          "description": "Regular expression matched against the envelope message to recognize a refused credential.",
++          "type": "string"
++        },
++        "auth_failure_reasons": {
++          "default": [],
++          "description": "Envelope reasons that mean the presented credential was refused, compared with the segment of the reason after its last `.`.",
++          "items": {
++            "type": "string"
++          },
++          "type": "array"
++        },
++        "auth_failure_statuses": {
++          "default": [],
++          "description": "HTTP statuses that also mean the presented credential was refused. 401 always does.",
++          "items": {
++            "format": "uint16",
++            "minimum": 0.0,
++            "type": "integer"
++          },
++          "type": "array"
++        }
++      },
++      "type": "object"
++    },
+     "ModelProviderInfo": {
+       "additionalProperties": false,
+       "description": "Serializable representation of a provider definition.",
+@@ -2848,6 +2877,14 @@
+           "description": "Optional instructions to help the user get a valid value for the variable and set it.",
+           "type": "string"
+         },
++        "error_envelope": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/ModelProviderErrorEnvelope"
++            }
++          ],
++          "description": "Recognition of HTTP 2xx JSON error envelopes returned in place of model responses."
++        },
+         "experimental_bearer_token": {
+           "description": "Value to use with `Authorization: Bearer <token>` header. Use of this config is discouraged in favor of `env_key` for security reasons, but this may be necessary when using this programmatically.",
+           "type": "string"
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index 8b57eadf2dd17128487b797addd25d03b5162b8c..773486a3bc5080f5fcfbceb7afb0cb0d613aee50 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -42,6 +42,7 @@ use codex_api::AgentIdentityTelemetry;
+ use codex_api::ApiError;
+ use codex_api::AuthProvider;
+ use codex_api::Compression;
++use codex_api::ErrorEnvelopePolicy;
+ use codex_api::MemoriesClient as ApiMemoriesClient;
+ use codex_api::MemorySummarizeInput as ApiMemorySummarizeInput;
+ use codex_api::MemorySummarizeOutput as ApiMemorySummarizeOutput;
+@@ -221,6 +222,26 @@ struct ModelClientState {
+     cached_websocket_session: StdMutex<WebsocketSession>,
+     /// Last full tool list used for sampling, retained across turns and connection resets.
+     last_inference_tools: StdMutex<Option<Arc<[ToolSpec]>>>,
++    /// Recognition of HTTP 2xx JSON error envelopes configured for the provider.
++    error_envelope: Option<Arc<ErrorEnvelopePolicy>>,
++}
++
++/// Compiles the provider's error-envelope recognition. Configuration loading already rejects
++/// invalid patterns, so a failure here only drops the recognition.
++fn error_envelope_policy(
++    info: &codex_model_provider_info::ModelProviderInfo,
++) -> Option<Arc<ErrorEnvelopePolicy>> {
++    let envelope = info.error_envelope.as_ref()?;
++    match ErrorEnvelopePolicy::new(
++        envelope.auth_failure_reasons.clone(),
++        envelope.auth_failure_message_pattern.as_deref(),
++    ) {
++        Ok(policy) => Some(Arc::new(policy)),
++        Err(error) => {
++            warn!(%error, "ignoring an invalid provider error_envelope pattern");
++            None
++        }
++    }
+ }
+ 
+ enum ClientRouting {
+@@ -577,6 +598,7 @@ impl ModelClient {
+         let reasoning_effort_override_enabled = reasoning_effort_override_enabled
+             && !crate::guardian::is_basic_session_source(&session_source)
+             && !memory_consolidation;
++        let error_envelope = error_envelope_policy(model_provider.info());
+         Self {
+             state: Arc::new(ModelClientState {
+                 thread_id,
+@@ -599,6 +621,7 @@ impl ModelClient {
+                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
+                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
+                 last_inference_tools: StdMutex::new(None),
++                error_envelope,
+             }),
+             agent_identity_policy,
+             prompt_cache_key_override: None,
+@@ -1883,7 +1906,8 @@ impl ResponsesHttpExecutor<'_> {
+                 client_setup.api_provider,
+                 client_setup.api_auth,
+             )
+-            .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
++            .with_telemetry(Some(request_telemetry), Some(sse_telemetry))
++            .with_error_envelope(self.client.state.error_envelope.clone());
+             let stream_result = client.stream_request(request, options).await;
+ 
+             match stream_result {
+diff --git a/codex-rs/core/tests/responses_headers.rs b/codex-rs/core/tests/responses_headers.rs
+index 74b52a3cac27982b6ae93e61d8020ce132016a48..48871ade1ea9ac29747fc673779dd3c38a6e625e 100644
+--- a/codex-rs/core/tests/responses_headers.rs
++++ b/codex-rs/core/tests/responses_headers.rs
+@@ -82,6 +82,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
+         gateway_oauth: None,
+         aws: None,
+         wire_api: WireApi::Responses,
++        error_envelope: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+@@ -229,6 +230,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
+         gateway_oauth: None,
+         aws: None,
+         wire_api: WireApi::Responses,
++        error_envelope: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+@@ -357,6 +359,7 @@ async fn responses_respects_model_info_overrides_from_config() {
+         gateway_oauth: None,
+         aws: None,
+         wire_api: WireApi::Responses,
++        error_envelope: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+diff --git a/codex-rs/core/tests/suite/client.rs b/codex-rs/core/tests/suite/client.rs
+index d443977137fab2d8f6d4a881d335f9cbf72e0c9a..905a0e0d5d5aa46556964dc9cd8c7ea379e2d887 100644
+--- a/codex-rs/core/tests/suite/client.rs
++++ b/codex-rs/core/tests/suite/client.rs
+@@ -1707,6 +1707,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
+         gateway_oauth: None,
+         aws: None,
+         wire_api: WireApi::Responses,
++        error_envelope: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+@@ -3213,6 +3214,7 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
+         gateway_oauth: None,
+         aws: None,
+         wire_api: WireApi::Responses,
++        error_envelope: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+@@ -4053,6 +4055,7 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
+         auth: None,
+         gateway_oauth: None,
+         aws: None,
++        error_envelope: None,
+         query_params: Some(std::collections::HashMap::from([(
+             "api-version".to_string(),
+             "2025-04-01-preview".into(),
+@@ -4137,6 +4140,7 @@ async fn env_var_overrides_loaded_auth() {
+         model_catalog_url: None,
+         // Reuse the existing environment variable to avoid using unsafe code
+         env_key: Some(EXISTING_ENV_VAR_WITH_NON_EMPTY_VALUE.to_string()),
++        error_envelope: None,
+         query_params: Some(std::collections::HashMap::from([(
+             "api-version".to_string(),
+             "2025-04-01-preview".into(),
+diff --git a/codex-rs/core/tests/suite/client_websockets.rs b/codex-rs/core/tests/suite/client_websockets.rs
+index 288b8e208be27b3fb3a14d6b4a74922950a7d8dd..8960e5d687d2ada9e3989f9e634e1ddc0a8d02f4 100755
+--- a/codex-rs/core/tests/suite/client_websockets.rs
++++ b/codex-rs/core/tests/suite/client_websockets.rs
+@@ -2722,6 +2722,7 @@ fn websocket_provider_with_connect_timeout(
+         gateway_oauth: None,
+         aws: None,
+         wire_api: WireApi::Responses,
++        error_envelope: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+diff --git a/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs b/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
+index c381b78cda2ee1f0fdeea3b06e25b9fe1a502748..9103ed84e1e133a2a38386fff011ce8e85a5e609 100644
+--- a/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
++++ b/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
+@@ -74,6 +74,7 @@ async fn continue_after_stream_error() {
+         gateway_oauth: None,
+         aws: None,
+         wire_api: WireApi::Responses,
++        error_envelope: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+diff --git a/codex-rs/core/tests/suite/stream_no_completed.rs b/codex-rs/core/tests/suite/stream_no_completed.rs
+index 1823275ea4e8a690f6b233a934a044d839a5efb6..48cdfdf1f4986bfc90ff9422fb42f3fdb7a2ba94 100644
+--- a/codex-rs/core/tests/suite/stream_no_completed.rs
++++ b/codex-rs/core/tests/suite/stream_no_completed.rs
+@@ -59,6 +59,7 @@ async fn retries_on_early_close() {
+         gateway_oauth: None,
+         aws: None,
+         wire_api: WireApi::Responses,
++        error_envelope: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+diff --git a/codex-rs/login/src/auth_env_telemetry.rs b/codex-rs/login/src/auth_env_telemetry.rs
+index 6ee0c439202d29d5f6a4b72f1bea52485e2125e4..d66ec107a8602dbc0b455069938444733b4b16e7 100644
+--- a/codex-rs/login/src/auth_env_telemetry.rs
++++ b/codex-rs/login/src/auth_env_telemetry.rs
+@@ -69,6 +69,7 @@ mod tests {
+             gateway_oauth: None,
+             aws: None,
+             wire_api: WireApi::Responses,
++            error_envelope: None,
+             query_params: None,
+             http_headers: None,
+             env_http_headers: None,
+diff --git a/codex-rs/model-provider-info/Cargo.toml b/codex-rs/model-provider-info/Cargo.toml
+index e6a740d25ddfc26edffa23a32e6b8f9123eef982..4f67e4d4eccb45e93f66fcf1573dbec790988b98 100644
+--- a/codex-rs/model-provider-info/Cargo.toml
++++ b/codex-rs/model-provider-info/Cargo.toml
+@@ -17,6 +17,7 @@ codex-client = { workspace = true }
+ codex-protocol = { workspace = true }
+ codex-utils-redacted-string = { workspace = true }
+ http = { workspace = true }
++regex-lite = { workspace = true }
+ schemars = { workspace = true }
+ serde = { workspace = true, features = ["derive"] }
+ url = { workspace = true }
+diff --git a/codex-rs/model-provider-info/src/error_envelope.rs b/codex-rs/model-provider-info/src/error_envelope.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..886e96c1d685afa5bdc6f6e9fc676fd10eca435b
+--- /dev/null
++++ b/codex-rs/model-provider-info/src/error_envelope.rs
+@@ -0,0 +1,52 @@
++//! Settings for gateways that report failures as an HTTP 2xx JSON error envelope.
++
++use schemars::JsonSchema;
++use serde::Deserialize;
++use serde::Serialize;
++
++/// Recognizes an HTTP 2xx `{"code": <non-zero>, "reason": "...", "message": "..."}` body that a
++/// gateway returns in place of a model response, and the replies that refuse a credential.
++#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
++#[schemars(deny_unknown_fields)]
++pub struct ModelProviderErrorEnvelope {
++    /// Envelope reasons that mean the presented credential was refused, compared with the
++    /// segment of the reason after its last `.`.
++    #[serde(default)]
++    pub auth_failure_reasons: Vec<String>,
++    /// Regular expression matched against the envelope message to recognize a refused
++    /// credential.
++    pub auth_failure_message_pattern: Option<String>,
++    /// HTTP statuses that also mean the presented credential was refused. 401 always does.
++    #[serde(default)]
++    pub auth_failure_statuses: Vec<u16>,
++}
++
++impl ModelProviderErrorEnvelope {
++    pub(crate) fn validate(&self) -> Result<(), String> {
++        if self
++            .auth_failure_reasons
++            .iter()
++            .any(|reason| reason.trim().is_empty())
++        {
++            return Err(
++                "provider error_envelope.auth_failure_reasons must not contain empty values"
++                    .to_string(),
++            );
++        }
++        if let Some(pattern) = &self.auth_failure_message_pattern {
++            regex_lite::Regex::new(pattern).map_err(|error| {
++                format!("provider error_envelope.auth_failure_message_pattern is invalid: {error}")
++            })?;
++        }
++        if let Some(status) = self
++            .auth_failure_statuses
++            .iter()
++            .find(|status| !(400..=599).contains(*status))
++        {
++            return Err(format!(
++                "provider error_envelope.auth_failure_statuses contains {status}, which is not an HTTP error status"
++            ));
++        }
++        Ok(())
++    }
++}
+diff --git a/codex-rs/model-provider-info/src/lib.rs b/codex-rs/model-provider-info/src/lib.rs
+index f020d34c25413a7ac581dc5ed0a5187be17caa99..21231874ad00b56365a087001844585dbe3f412e 100644
+--- a/codex-rs/model-provider-info/src/lib.rs
++++ b/codex-rs/model-provider-info/src/lib.rs
+@@ -32,9 +32,11 @@ use std::sync::RwLock;
+ use std::time::Duration;
+ 
+ mod capabilities;
++mod error_envelope;
+ mod gateway_oauth;
+ pub use capabilities::ModelProviderCapabilities;
+ pub use capabilities::RemoteCompactionSupport;
++pub use error_envelope::ModelProviderErrorEnvelope;
+ pub use gateway_oauth::GatewayOAuthConfig;
+ pub use gateway_oauth::GatewayOAuthDelivery;
+ 
+@@ -167,6 +169,8 @@ pub struct ModelProviderInfo {
+     /// Optional API capability overrides for a custom Responses-compatible provider.
+     /// Unspecified capabilities retain their existing provider defaults.
+     pub capabilities: Option<ModelProviderCapabilities>,
++    /// Recognition of HTTP 2xx JSON error envelopes returned in place of model responses.
++    pub error_envelope: Option<ModelProviderErrorEnvelope>,
+     /// Optional query parameters to append to the base URL.
+     pub query_params: Option<HashMap<String, RedactedString>>,
+     /// Additional HTTP headers to include in requests to this provider where
+@@ -300,6 +304,9 @@ other non-default provider fields are not supported"
+         if let Some(gateway) = &self.gateway_oauth {
+             gateway.validate(self)?;
+         }
++        if let Some(envelope) = &self.error_envelope {
++            envelope.validate()?;
++        }
+         if let Some(aws) = self.aws.as_ref() {
+             if self.supports_websockets {
+                 // TODO(celia-oai): Support AWS SigV4 signing for WebSocket
+@@ -535,6 +542,7 @@ other non-default provider fields are not supported"
+             gateway_oauth: None,
+             aws: None,
+             wire_api: WireApi::Responses,
++            error_envelope: None,
+             query_params: None,
+             http_headers: Some(
+                 [("version".to_string(), env!("CARGO_PKG_VERSION").into())]
+@@ -587,6 +595,7 @@ other non-default provider fields are not supported"
+                 auth_refresh: None,
+             })),
+             wire_api: WireApi::Responses,
++            error_envelope: None,
+             query_params: None,
+             http_headers: Some(HashMap::from([(
+                 AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string(),
+@@ -764,6 +773,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
+         gateway_oauth: None,
+         aws: None,
+         wire_api,
++        error_envelope: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+diff --git a/codex-rs/model-provider-info/src/model_provider_info_tests.rs b/codex-rs/model-provider-info/src/model_provider_info_tests.rs
+index 9c15c54b70d1c500f07e2432aa1e7d9fada91740..3d64346420ca6c1b34e57c1917fe4cc27bd65774 100644
+--- a/codex-rs/model-provider-info/src/model_provider_info_tests.rs
++++ b/codex-rs/model-provider-info/src/model_provider_info_tests.rs
+@@ -86,6 +86,7 @@ base_url = "http://localhost:11434/v1"
+         gateway_oauth: None,
+         aws: None,
+         wire_api: WireApi::Responses,
++        error_envelope: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+@@ -123,6 +124,7 @@ query_params = { api-version = "2025-04-01-preview" }
+         gateway_oauth: None,
+         aws: None,
+         wire_api: WireApi::Responses,
++        error_envelope: None,
+         query_params: Some(maplit::hashmap! {
+             "api-version".to_string() => "2025-04-01-preview".into(),
+         }),
+@@ -164,6 +166,7 @@ supports_standalone_web_search = true
+         gateway_oauth: None,
+         aws: None,
+         wire_api: WireApi::Responses,
++        error_envelope: None,
+         query_params: None,
+         http_headers: Some(maplit::hashmap! {
+             "X-Example-Header".to_string() => "example-value".into(),
+@@ -355,6 +358,7 @@ fn test_create_amazon_bedrock_provider() {
+                 auth_refresh: None,
+             }),
+             wire_api: WireApi::Responses,
++            error_envelope: None,
+             query_params: None,
+             http_headers: Some(maplit::hashmap! {
+                 AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string() =>
+diff --git a/codex-rs/model-provider/src/provider.rs b/codex-rs/model-provider/src/provider.rs
+index ac7e238b5f6f0aeb62b11ee31e1cfa20721d7052..74e16968e08d21220ca2b68b12cb8df562203dd5 100644
+--- a/codex-rs/model-provider/src/provider.rs
++++ b/codex-rs/model-provider/src/provider.rs
+@@ -430,6 +430,18 @@ impl ModelProvider for ConfiguredModelProvider {
+         &self.info
+     }
+ 
++    fn is_recoverable_auth_error(&self, error: &TransportError) -> bool {
++        let TransportError::Http { status, .. } = error else {
++            return false;
++        };
++        *status == http::StatusCode::UNAUTHORIZED
++            || self
++                .info
++                .error_envelope
++                .as_ref()
++                .is_some_and(|envelope| envelope.auth_failure_statuses.contains(&status.as_u16()))
++    }
++
+     fn capabilities(&self) -> ProviderCapabilities {
+         ProviderCapabilities::from_config(&self.info)
+     }
+@@ -649,6 +661,7 @@ mod tests {
+             gateway_oauth: None,
+             aws: None,
+             wire_api: WireApi::Responses,
++            error_envelope: None,
+             query_params: None,
+             http_headers: None,
+             env_http_headers: None,

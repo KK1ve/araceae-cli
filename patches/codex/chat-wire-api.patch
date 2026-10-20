@@ -1,0 +1,4532 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Araceae Runtime <runtime@araceae.invalid>
+Date: Mon, 19 Oct 2026 21:54:22 +1100
+Subject: [PATCH] Speak the Chat Completions wire protocol
+
+Providers can set wire_api = "chat". Turns are still built as Responses
+requests and converted for each request:
+
+- developer and system messages before the first model output form one
+  leading message; later instructions follow
+  chat.mid_conversation_instructions
+- namespaced and freeform tools become functions under deterministic
+  aliases of at most 64 characters, which are mapped back for dispatch
+- tool results directly follow their calls, and unanswered calls receive a
+  placeholder result
+- reasoning is replayed under chat.reasoning_field for the configured scope
+- structured output, images, output token limits, and extra body fields
+  follow [model_providers.<id>.chat]
+
+Streams emit one open text or reasoning item at a time and the accumulated
+tool calls when the stream ends. Context overflow, quota, and throttling are
+recognized from status codes and wording, and HTTP 2xx error envelopes get
+the same handling as Responses requests. Chat providers expose no hosted
+tools, Responses lite, tool search, or remote compaction, and responses
+without usage fall back to an estimate so auto-compaction keeps working.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../thread_processor_tests.rs                 |   1 +
+ codex-rs/codex-api/src/endpoint/chat.rs       | 148 ++++
+ .../codex-api/src/endpoint/chat_errors.rs     | 164 ++++
+ .../src/endpoint/chat_errors_tests.rs         | 121 +++
+ .../codex-api/src/endpoint/error_envelope.rs  |  17 +-
+ codex-rs/codex-api/src/endpoint/mod.rs        |   3 +
+ codex-rs/codex-api/src/lib.rs                 |   1 +
+ codex-rs/codex-api/src/requests/chat.rs       | 822 ++++++++++++++++++
+ codex-rs/codex-api/src/requests/chat_tests.rs | 565 ++++++++++++
+ codex-rs/codex-api/src/requests/mod.rs        |   2 +
+ codex-rs/codex-api/src/requests/tool_alias.rs | 146 ++++
+ .../src/requests/tool_alias_tests.rs          |  90 ++
+ codex-rs/codex-api/src/sse/chat.rs            | 713 +++++++++++++++
+ codex-rs/codex-api/src/sse/chat_tests.rs      | 382 ++++++++
+ codex-rs/codex-api/src/sse/mod.rs             |   1 +
+ codex-rs/config/src/thread_config.rs          |   1 +
+ codex-rs/config/src/thread_config/remote.rs   |   4 +
+ codex-rs/core/config.schema.json              | 228 +++++
+ codex-rs/core/src/client.rs                   | 176 ++++
+ codex-rs/core/src/session/turn.rs             |   6 +
+ codex-rs/core/tests/responses_headers.rs      |   3 +
+ codex-rs/core/tests/suite/client.rs           |   4 +
+ .../core/tests/suite/client_websockets.rs     |   1 +
+ .../suite/stream_error_allows_next_turn.rs    |   1 +
+ .../core/tests/suite/stream_no_completed.rs   |   1 +
+ codex-rs/login/src/auth_env_telemetry.rs      |   1 +
+ codex-rs/model-provider-info/src/chat.rs      |  71 ++
+ codex-rs/model-provider-info/src/lib.rs       |  19 +-
+ .../src/model_provider_info_tests.rs          |  81 +-
+ codex-rs/model-provider/src/capabilities.rs   |  10 +
+ codex-rs/model-provider/src/provider.rs       |  16 +
+ codex-rs/protocol/src/config_types.rs         | 127 +++
+ 32 files changed, 3914 insertions(+), 12 deletions(-)
+ create mode 100644 codex-rs/codex-api/src/endpoint/chat.rs
+ create mode 100644 codex-rs/codex-api/src/endpoint/chat_errors.rs
+ create mode 100644 codex-rs/codex-api/src/endpoint/chat_errors_tests.rs
+ create mode 100644 codex-rs/codex-api/src/requests/chat.rs
+ create mode 100644 codex-rs/codex-api/src/requests/chat_tests.rs
+ create mode 100644 codex-rs/codex-api/src/requests/tool_alias.rs
+ create mode 100644 codex-rs/codex-api/src/requests/tool_alias_tests.rs
+ create mode 100644 codex-rs/codex-api/src/sse/chat.rs
+ create mode 100644 codex-rs/codex-api/src/sse/chat_tests.rs
+ create mode 100644 codex-rs/model-provider-info/src/chat.rs
+
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
+index 5e0081e5c30b3657b2d5debf5b350098dfcae674..ea2c2ff230f03a80a0369ff6da6a381d8bbfc4c3 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
+@@ -604,6 +604,7 @@ mod thread_processor_behavior_tests {
+             aws: None,
+             wire_api: WireApi::Responses,
+             error_envelope: None,
++            chat: None,
+             query_params: None,
+             http_headers: None,
+             env_http_headers: None,
+diff --git a/codex-rs/codex-api/src/endpoint/chat.rs b/codex-rs/codex-api/src/endpoint/chat.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..392b967fcbb9ef6474eb729d5f37249d4cd58422
+--- /dev/null
++++ b/codex-rs/codex-api/src/endpoint/chat.rs
+@@ -0,0 +1,148 @@
++//! Client for the Chat Completions endpoint of a provider whose `wire_api` is `chat`.
++
++use crate::auth::SharedAuthProvider;
++use crate::common::ResponseStream;
++use crate::common::ResponsesApiRequest;
++use crate::endpoint::chat_errors::ChatErrorClassifier;
++use crate::endpoint::error_envelope::ErrorEnvelopePolicy;
++use crate::endpoint::error_envelope::SuccessBody;
++use crate::endpoint::error_envelope::read_success_response;
++use crate::endpoint::responses::ResponsesOptions;
++use crate::endpoint::session::EndpointSession;
++use crate::error::ApiError;
++use crate::provider::Provider;
++use crate::requests::chat::ChatRequest;
++use crate::requests::chat::build_chat_request;
++use crate::requests::headers::build_session_headers;
++use crate::requests::headers::insert_header;
++use crate::requests::headers::subagent_header;
++use crate::sse::chat::ChatStreamSettings;
++use crate::sse::chat::request_id;
++use crate::sse::chat::spawn_chat_completion;
++use crate::sse::chat::spawn_chat_stream;
++use crate::telemetry::SseTelemetry;
++use codex_client::EncodedJsonBody;
++use codex_client::HttpTransport;
++use codex_client::RequestTelemetry;
++use codex_protocol::config_types::ChatOptions;
++use http::HeaderValue;
++use http::Method;
++use std::sync::Arc;
++use tracing::instrument;
++
++const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
++
++pub struct ChatClient<T: HttpTransport> {
++    session: EndpointSession<T>,
++    options: Arc<ChatOptions>,
++    sse_telemetry: Option<Arc<dyn SseTelemetry>>,
++    error_envelope: Option<Arc<ErrorEnvelopePolicy>>,
++}
++
++impl<T: HttpTransport> ChatClient<T> {
++    pub fn new(
++        transport: T,
++        provider: Provider,
++        auth: SharedAuthProvider,
++        options: Arc<ChatOptions>,
++    ) -> Self {
++        Self {
++            session: EndpointSession::new(transport, provider, auth),
++            options,
++            sse_telemetry: None,
++            error_envelope: None,
++        }
++    }
++
++    pub fn with_telemetry(
++        self,
++        request: Option<Arc<dyn RequestTelemetry>>,
++        sse: Option<Arc<dyn SseTelemetry>>,
++    ) -> Self {
++        Self {
++            session: self.session.with_request_telemetry(request),
++            sse_telemetry: sse,
++            ..self
++        }
++    }
++
++    /// Inspects 2xx JSON replies for a gateway error envelope before parsing them.
++    pub fn with_error_envelope(mut self, policy: Option<Arc<ErrorEnvelopePolicy>>) -> Self {
++        self.error_envelope = policy;
++        self
++    }
++
++    /// Bearer credential carried by the most recent request attempt.
++    pub fn applied_bearer(&self) -> Option<String> {
++        self.session.applied_bearer()
++    }
++
++    /// Sends a Responses request as a Chat Completions request and streams its events.
++    #[instrument(
++        name = "chat.stream_request",
++        level = "info",
++        skip_all,
++        fields(transport = "chat_http", http.method = "POST", api.path = CHAT_COMPLETIONS_PATH)
++    )]
++    pub async fn stream_request(
++        &self,
++        request: &ResponsesApiRequest,
++        options: ResponsesOptions,
++    ) -> Result<ResponseStream, ApiError> {
++        let ChatRequest { body, tools } = build_chat_request(request, &self.options)?;
++        let body = EncodedJsonBody::encode(&body)
++            .map_err(|err| ApiError::Stream(format!("failed to encode chat request: {err}")))?;
++        let ResponsesOptions {
++            session_id,
++            thread_id,
++            session_source,
++            extra_headers,
++            ..
++        } = options;
++        let mut headers = extra_headers;
++        if let Some(thread_id) = thread_id.as_ref() {
++            insert_header(&mut headers, "x-client-request-id", thread_id);
++        }
++        headers.extend(build_session_headers(session_id, thread_id));
++        if let Some(subagent) = subagent_header(&session_source) {
++            insert_header(&mut headers, "x-openai-subagent", &subagent);
++        }
++
++        let classifier = ChatErrorClassifier {
++            context_length_patterns: &self.options.context_length_error_patterns,
++        };
++        let response = self
++            .session
++            .stream_encoded_json_with(
++                Method::POST,
++                CHAT_COMPLETIONS_PATH,
++                headers,
++                Some(body),
++                |req| {
++                    req.headers.insert(
++                        http::header::ACCEPT,
++                        HeaderValue::from_static("text/event-stream"),
++                    );
++                },
++            )
++            .await
++            .map_err(|error| classifier.classify_request_error(error))?;
++        let settings = ChatStreamSettings {
++            tools,
++            options: Arc::clone(&self.options),
++        };
++        Ok(
++            match read_success_response(response, self.error_envelope.as_deref()).await? {
++                SuccessBody::Stream(response) => spawn_chat_stream(
++                    response,
++                    self.session.provider().stream_idle_timeout,
++                    self.sse_telemetry.clone(),
++                    settings,
++                ),
++                SuccessBody::Json { headers, body, .. } => {
++                    spawn_chat_completion(body, request_id(&headers), settings)
++                }
++            },
++        )
++    }
++}
+diff --git a/codex-rs/codex-api/src/endpoint/chat_errors.rs b/codex-rs/codex-api/src/endpoint/chat_errors.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..bef5d67fb3f982f4f5f3872e2eec52ce60616ffb
+--- /dev/null
++++ b/codex-rs/codex-api/src/endpoint/chat_errors.rs
+@@ -0,0 +1,164 @@
++//! Classifies Chat Completions failures into the errors the turn loop acts on.
++//!
++//! Chat providers report context overflow, quota exhaustion, and throttling with free-form
++//! messages, so these are recognized by status and wording instead of Responses error codes.
++
++use crate::error::ApiError;
++use codex_client::TransportError;
++use http::StatusCode;
++use serde_json::Value;
++
++/// Lowercase message fragments that mean the request no longer fits the context window.
++const CONTEXT_LENGTH_FRAGMENTS: &[&str] = &[
++    "context_length_exceeded",
++    "context length",
++    "context window",
++    "maximum context",
++    "too many tokens",
++    "prompt is too long",
++    "input is too long",
++    "reduce the length",
++    "maximum allowed length",
++    "exceeds the model",
++    "token limit",
++    "上下文长度",
++    "上下文过长",
++    "上下文超",
++    "超出最大长度",
++    "超过最大长度",
++    "输入过长",
++    "长度超过",
++    "超过模型",
++    "超出模型",
++    "token数超",
++];
++const QUOTA_FRAGMENTS: &[&str] = &[
++    "quota",
++    "balance",
++    "insufficient_quota",
++    "billing",
++    "余额",
++    "欠费",
++    "额度",
++];
++const RATE_LIMIT_FRAGMENTS: &[&str] = &[
++    "rate limit",
++    "rate_limit",
++    "too many requests",
++    "限流",
++    "频率",
++];
++const CONTENT_FILTER_FRAGMENTS: &[&str] = &[
++    "content_filter",
++    "content filter",
++    "content management policy",
++    "内容审核",
++    "敏感",
++];
++
++/// Error text and classification patterns of one Chat Completions provider.
++pub(crate) struct ChatErrorClassifier<'a> {
++    pub(crate) context_length_patterns: &'a [String],
++}
++
++impl ChatErrorClassifier<'_> {
++    /// Classifies a request that failed before the stream started.
++    pub(crate) fn classify_request_error(&self, error: ApiError) -> ApiError {
++        let ApiError::Transport(TransportError::Http {
++            status,
++            body,
++            retry_after,
++            ..
++        }) = &error
++        else {
++            return error;
++        };
++        let text = body.as_deref().unwrap_or_default();
++        let (message, code) = error_message_and_code(text);
++        match *status {
++            StatusCode::PAYLOAD_TOO_LARGE => ApiError::ContextWindowExceeded,
++            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
++                if self.is_context_overflow(text, code.as_deref()) =>
++            {
++                ApiError::ContextWindowExceeded
++            }
++            StatusCode::PAYMENT_REQUIRED => ApiError::QuotaExceeded,
++            StatusCode::TOO_MANY_REQUESTS if contains_any(text, QUOTA_FRAGMENTS) => {
++                ApiError::QuotaExceeded
++            }
++            // Many Chat Completions providers throttle without a Retry-After header, which
++            // the transport mapping would treat as final.
++            StatusCode::TOO_MANY_REQUESTS => ApiError::RateLimitExceeded {
++                message: message.unwrap_or_else(|| text.to_string()),
++                retry_after: *retry_after,
++            },
++            _ => error,
++        }
++    }
++
++    /// Classifies an `error` object delivered inside the event stream.
++    pub(crate) fn classify_stream_error(&self, error: &Value) -> ApiError {
++        let message = error
++            .get("message")
++            .and_then(Value::as_str)
++            .map(str::to_string)
++            .unwrap_or_else(|| error.to_string());
++        let code = error.get("code").map(|code| {
++            code.as_str()
++                .map_or_else(|| code.to_string(), str::to_string)
++        });
++        let kind = error
++            .get("type")
++            .and_then(Value::as_str)
++            .unwrap_or_default();
++        let text = format!("{message} {} {kind}", code.as_deref().unwrap_or_default());
++        if self.is_context_overflow(&text, code.as_deref()) {
++            ApiError::ContextWindowExceeded
++        } else if contains_any(&text, QUOTA_FRAGMENTS) {
++            ApiError::QuotaExceeded
++        } else if contains_any(&text, RATE_LIMIT_FRAGMENTS) {
++            ApiError::RateLimitExceeded {
++                message,
++                retry_after: None,
++            }
++        } else if contains_any(&text, CONTENT_FILTER_FRAGMENTS) {
++            ApiError::ContentFilter
++        } else {
++            ApiError::Stream(message)
++        }
++    }
++
++    fn is_context_overflow(&self, text: &str, code: Option<&str>) -> bool {
++        code == Some("context_length_exceeded") || contains_any(text, CONTEXT_LENGTH_FRAGMENTS) || {
++            let text = text.to_lowercase();
++            self.context_length_patterns
++                .iter()
++                .any(|pattern| text.contains(&pattern.to_lowercase()))
++        }
++    }
++}
++
++fn error_message_and_code(body: &str) -> (Option<String>, Option<String>) {
++    let Ok(value) = serde_json::from_str::<Value>(body) else {
++        return (None, None);
++    };
++    let error = value.get("error").unwrap_or(&value);
++    let message = error
++        .get("message")
++        .and_then(Value::as_str)
++        .map(str::to_string);
++    let code = error.get("code").map(|code| {
++        code.as_str()
++            .map_or_else(|| code.to_string(), str::to_string)
++    });
++    (message, code)
++}
++
++fn contains_any(text: &str, fragments: &[&str]) -> bool {
++    let text = text.to_lowercase();
++    fragments.iter().any(|fragment| text.contains(fragment))
++}
++
++#[cfg(test)]
++#[path = "chat_errors_tests.rs"]
++mod tests;
+diff --git a/codex-rs/codex-api/src/endpoint/chat_errors_tests.rs b/codex-rs/codex-api/src/endpoint/chat_errors_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..32c6c5ce278d75e45a00030b33629f3fda745284
+--- /dev/null
++++ b/codex-rs/codex-api/src/endpoint/chat_errors_tests.rs
+@@ -0,0 +1,121 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++
++fn http(status: u16, body: &str) -> ApiError {
++    ApiError::Transport(TransportError::Http {
++        status: StatusCode::from_u16(status).expect("status"),
++        url: None,
++        headers: None,
++        body: Some(body.to_string()),
++        retry_after: None,
++    })
++}
++
++fn classify(status: u16, body: &str, patterns: &[String]) -> ApiError {
++    ChatErrorClassifier {
++        context_length_patterns: patterns,
++    }
++    .classify_request_error(http(status, body))
++}
++
++#[test]
++fn context_overflow_is_recognized_in_english_chinese_and_configured_wording() {
++    for (status, body) in [
++        (
++            400,
++            r#"{"error":{"message":"This model's maximum context length is 8192 tokens","code":"context_length_exceeded"}}"#,
++        ),
++        (
++            400,
++            r#"{"error":{"message":"Input tokens exceed the configured limit","code":"context_length_exceeded"}}"#,
++        ),
++        (
++            422,
++            r#"{"error":{"message":"请求的上下文长度超过模型限制"}}"#,
++        ),
++        (413, "payload too large"),
++    ] {
++        assert!(
++            matches!(classify(status, body, &[]), ApiError::ContextWindowExceeded),
++            "{body}"
++        );
++    }
++    let patterns = vec!["Prompt Budget Overrun".to_string()];
++    assert!(matches!(
++        classify(
++            400,
++            r#"{"error":{"message":"prompt budget overrun"}}"#,
++            &patterns
++        ),
++        ApiError::ContextWindowExceeded
++    ));
++    assert!(matches!(
++        classify(
++            400,
++            r#"{"error":{"message":"invalid tool schema"}}"#,
++            &patterns
++        ),
++        ApiError::Transport(TransportError::Http { .. })
++    ));
++}
++
++#[test]
++fn quota_and_throttling_are_separated() {
++    assert!(matches!(
++        classify(429, r#"{"error":{"message":"账户余额不足"}}"#, &[]),
++        ApiError::QuotaExceeded
++    ));
++    assert!(matches!(classify(402, "", &[]), ApiError::QuotaExceeded));
++    let ApiError::RateLimitExceeded {
++        message,
++        retry_after,
++    } = classify(
++        429,
++        r#"{"error":{"message":"请求过于频繁，请稍后再试"}}"#,
++        &[],
++    )
++    else {
++        panic!("expected rate limiting");
++    };
++    assert_eq!(message, "请求过于频繁，请稍后再试");
++    assert!(retry_after.is_none());
++}
++
++#[test]
++fn refused_credentials_and_other_statuses_are_left_for_shared_handling() {
++    for status in [401, 500, 503] {
++        assert!(matches!(
++            classify(status, r#"{"error":{"message":"context length"}}"#, &[]),
++            ApiError::Transport(TransportError::Http { .. })
++        ));
++    }
++}
++
++#[test]
++fn stream_error_chunks_are_classified_by_wording() {
++    let classifier = ChatErrorClassifier {
++        context_length_patterns: &[],
++    };
++    assert!(matches!(
++        classifier.classify_stream_error(
++            &json!({ "message": "context window exceeded", "type": "invalid_request_error" })
++        ),
++        ApiError::ContextWindowExceeded
++    ));
++    assert!(matches!(
++        classifier.classify_stream_error(&json!({ "message": "Rate limit reached", "code": 429 })),
++        ApiError::RateLimitExceeded { .. }
++    ));
++    assert!(matches!(
++        classifier
++            .classify_stream_error(&json!({ "message": "blocked", "code": "content_filter" })),
++        ApiError::ContentFilter
++    ));
++    let ApiError::Stream(message) =
++        classifier.classify_stream_error(&json!({ "message": "upstream reset" }))
++    else {
++        panic!("expected a retryable stream error");
++    };
++    assert_eq!(message, "upstream reset");
++}
+diff --git a/codex-rs/codex-api/src/endpoint/error_envelope.rs b/codex-rs/codex-api/src/endpoint/error_envelope.rs
+index 76fa83e10a1272c2f1aad6403b2814acdb4cdab0..1d2168cd76c05d75103931a9ece441ea8d66b1c2 100644
+--- a/codex-rs/codex-api/src/endpoint/error_envelope.rs
++++ b/codex-rs/codex-api/src/endpoint/error_envelope.rs
+@@ -112,9 +112,20 @@ pub(crate) async fn inspect_success_response(
+     response: StreamResponse,
+     policy: Option<&ErrorEnvelopePolicy>,
+ ) -> Result<SuccessBody, ApiError> {
+-    let Some(policy) = policy else {
++    if policy.is_none() {
+         return Ok(SuccessBody::Stream(response));
+-    };
++    }
++    read_success_response(response, policy).await
++}
++
++/// Buffers a 2xx JSON reply and applies the error envelope policy when one is configured.
++///
++/// Unlike [`inspect_success_response`], JSON bodies are buffered without a policy too, for
++/// endpoints that also accept complete non-streaming replies.
++pub(crate) async fn read_success_response(
++    response: StreamResponse,
++    policy: Option<&ErrorEnvelopePolicy>,
++) -> Result<SuccessBody, ApiError> {
+     if !is_json(&response.headers) {
+         return Ok(SuccessBody::Stream(response));
+     }
+@@ -133,7 +144,7 @@ pub(crate) async fn inspect_success_response(
+         }
+         body.extend_from_slice(&chunk);
+     }
+-    let Some(envelope) = parse_envelope(&body) else {
++    let Some((policy, envelope)) = policy.zip(parse_envelope(&body)) else {
+         return Ok(SuccessBody::Json {
+             status,
+             headers,
+diff --git a/codex-rs/codex-api/src/endpoint/mod.rs b/codex-rs/codex-api/src/endpoint/mod.rs
+index 0b3d267098780bcc1db4353b8ca3eb9ffadf8572..bc38bf7d275a94428c73711ae7e2437424a883e9 100644
+--- a/codex-rs/codex-api/src/endpoint/mod.rs
++++ b/codex-rs/codex-api/src/endpoint/mod.rs
+@@ -1,3 +1,5 @@
++pub(crate) mod chat;
++pub(crate) mod chat_errors;
+ pub(crate) mod error_envelope;
+ pub(crate) mod images;
+ pub(crate) mod memories;
+@@ -9,6 +11,7 @@ pub(crate) mod responses_websocket;
+ pub(crate) mod search;
+ mod session;
+ 
++pub use chat::ChatClient;
+ pub use error_envelope::ErrorEnvelopePolicy;
+ pub use images::ImageRequestError;
+ pub use images::ImagesClient;
+diff --git a/codex-rs/codex-api/src/lib.rs b/codex-rs/codex-api/src/lib.rs
+index 35bf84ab7694a35da0d5d24990bca88f2efc6976..113b0757904b0dbebc2bf9f8f48891bc2371af55 100644
+--- a/codex-rs/codex-api/src/lib.rs
++++ b/codex-rs/codex-api/src/lib.rs
+@@ -51,6 +51,7 @@ pub use crate::common::WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY;
+ pub use crate::common::WS_REQUEST_HEADER_TRACESTATE_CLIENT_METADATA_KEY;
+ pub use crate::common::create_text_param_for_request;
+ pub use crate::common::response_create_client_metadata;
++pub use crate::endpoint::ChatClient;
+ pub use crate::endpoint::ErrorEnvelopePolicy;
+ pub use crate::endpoint::ImageRequestError;
+ pub use crate::endpoint::ImagesClient;
+diff --git a/codex-rs/codex-api/src/requests/chat.rs b/codex-rs/codex-api/src/requests/chat.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d6c713d50e818c8a35ecebcf7f16da7153e86f8f
+--- /dev/null
++++ b/codex-rs/codex-api/src/requests/chat.rs
+@@ -0,0 +1,822 @@
++//! Builds Chat Completions requests from Responses API requests.
++//!
++//! Message layout rules:
++//! - Developer and system messages before the first model output form one leading message,
++//!   followed by the user messages of that prefix. Later requests share the same leading
++//!   message, which keeps provider prefix caches warm.
++//! - Developer messages after the prefix follow `mid_conversation_instructions`.
++//! - Tool results directly follow the assistant message that called them; other messages that
++//!   arrive while calls are unanswered wait until the group closes, and calls without a result
++//!   receive a placeholder.
++
++use crate::common::ResponsesApiRequest;
++use crate::common::TextFormat;
++use crate::error::ApiError;
++use crate::requests::tool_alias::ToolAliasTable;
++use codex_protocol::config_types::ChatMaxTokensField;
++use codex_protocol::config_types::ChatMidConversationInstructions;
++use codex_protocol::config_types::ChatOptions;
++use codex_protocol::config_types::ChatReasoningReplay;
++use codex_protocol::config_types::ChatStructuredOutput;
++use codex_protocol::config_types::ChatSystemRole;
++use codex_protocol::config_types::ChatToolOutputImages;
++use codex_protocol::models::ContentItem;
++use codex_protocol::models::FunctionCallOutputBody;
++use codex_protocol::models::FunctionCallOutputContentItem;
++use codex_protocol::models::FunctionCallOutputPayload;
++use codex_protocol::models::ImageDetail;
++use codex_protocol::models::ImageReference;
++use codex_protocol::models::ReasoningItemContent;
++use codex_protocol::models::ReasoningItemReasoningSummary;
++use codex_protocol::models::ResponseItem;
++use codex_protocol::models::plaintext_agent_message_content;
++use serde_json::Map;
++use serde_json::Value;
++use serde_json::json;
++use std::collections::HashSet;
++use std::sync::Arc;
++
++const MAX_FREEFORM_GRAMMAR_BYTES: usize = 4096;
++const RESERVED_BODY_FIELDS: &[&str] = &[
++    "model",
++    "messages",
++    "stream",
++    "stream_options",
++    "tools",
++    "tool_choice",
++    "parallel_tool_calls",
++    "response_format",
++];
++pub(crate) const INTERRUPTED_TOOL_CALL_OUTPUT: &str =
++    "[tool call was interrupted before it produced a result]";
++const IMAGE_INPUT_UNSUPPORTED: &str = "[image omitted: the model does not accept images]";
++const IMAGE_OMITTED: &str = "[image omitted]";
++const IMAGE_OVER_LIMIT: &str = "[image omitted: only the most recent images are kept]";
++const IMAGE_FILE_REFERENCE: &str = "[image omitted: file references are not supported]";
++const AUDIO_OMITTED: &str = "[audio omitted]";
++const ENCRYPTED_CONTENT_OMITTED: &str = "[encrypted content omitted]";
++const TOOL_OUTPUT_IMAGE_FOLLOWS: &str = "[image attached in the next message]";
++const TOOL_OUTPUT_IMAGES_INTRO: &str = "Images returned by the preceding tool calls:";
++
++/// A Chat Completions request body and the aliases its tools were exposed under.
++pub struct ChatRequest {
++    pub body: Value,
++    pub tools: Arc<ToolAliasTable>,
++}
++
++/// Converts a Responses request into a Chat Completions request.
++pub fn build_chat_request(
++    request: &ResponsesApiRequest,
++    options: &ChatOptions,
++) -> Result<ChatRequest, ApiError> {
++    let mut table = ToolAliasTable::default();
++    let tools = chat_tools(request, &mut table)?;
++    let mut builder = MessageBuilder::new(options, &table, &request.input);
++    for (index, item) in request.input.iter().enumerate() {
++        builder.push_item(index, item);
++    }
++    let structured_output = request.text.as_ref().and_then(|text| text.format.as_ref());
++    let messages = builder.finish(structured_output);
++
++    let mut body = Map::new();
++    body.insert("model".to_string(), json!(request.model));
++    body.insert("messages".to_string(), Value::Array(messages));
++    body.insert("stream".to_string(), json!(true));
++    if options.include_usage {
++        body.insert(
++            "stream_options".to_string(),
++            json!({ "include_usage": true }),
++        );
++    }
++    if !tools.is_empty() {
++        body.insert("tools".to_string(), Value::Array(tools));
++        if !request.parallel_tool_calls {
++            body.insert("parallel_tool_calls".to_string(), json!(false));
++        }
++    }
++    if let Some(format) = structured_output {
++        match options.structured_output {
++            ChatStructuredOutput::JsonSchema => {
++                body.insert(
++                    "response_format".to_string(),
++                    json!({
++                        "type": "json_schema",
++                        "json_schema": {
++                            "name": format.name,
++                            "schema": format.schema,
++                            "strict": format.strict,
++                        },
++                    }),
++                );
++            }
++            ChatStructuredOutput::JsonObject => {
++                body.insert(
++                    "response_format".to_string(),
++                    json!({ "type": "json_object" }),
++                );
++            }
++            ChatStructuredOutput::Prompt => {}
++        }
++    }
++    if options.send_reasoning_effort
++        && let Some(effort) = request
++            .reasoning
++            .as_ref()
++            .and_then(|reasoning| reasoning.effort.as_ref())
++    {
++        body.insert(
++            "reasoning_effort".to_string(),
++            serde_json::to_value(effort).map_err(|err| {
++                ApiError::Stream(format!("failed to encode reasoning effort: {err}"))
++            })?,
++        );
++    }
++    if let Some(max_output_tokens) = options.max_output_tokens {
++        let field = match options.max_tokens_field {
++            ChatMaxTokensField::MaxTokens => "max_tokens",
++            ChatMaxTokensField::MaxCompletionTokens => "max_completion_tokens",
++        };
++        body.insert(field.to_string(), json!(max_output_tokens));
++    }
++    for (key, value) in &options.extra_body {
++        if !RESERVED_BODY_FIELDS.contains(&key.as_str()) {
++            body.insert(key.clone(), value.clone());
++        }
++    }
++    Ok(ChatRequest {
++        body: Value::Object(body),
++        tools: Arc::new(table),
++    })
++}
++
++fn chat_tools(
++    request: &ResponsesApiRequest,
++    table: &mut ToolAliasTable,
++) -> Result<Vec<Value>, ApiError> {
++    let Some(tools) = request.tools.as_ref() else {
++        return Ok(Vec::new());
++    };
++    let tools: Vec<Value> = serde_json::from_str(tools.as_raw_value().get())
++        .map_err(|err| ApiError::Stream(format!("failed to read request tools: {err}")))?;
++    let mut chat_tools = Vec::new();
++    for tool in &tools {
++        match tool.get("type").and_then(Value::as_str) {
++            Some("function") => chat_tools.extend(function_tool(None, tool, table)),
++            Some("custom") => chat_tools.extend(freeform_tool(None, tool, table)),
++            Some("namespace") => {
++                let namespace = tool.get("name").and_then(Value::as_str);
++                for member in tool
++                    .get("tools")
++                    .and_then(Value::as_array)
++                    .into_iter()
++                    .flatten()
++                {
++                    match member.get("type").and_then(Value::as_str) {
++                        Some("function") => {
++                            chat_tools.extend(function_tool(namespace, member, table));
++                        }
++                        Some("custom") => {
++                            chat_tools.extend(freeform_tool(namespace, member, table));
++                        }
++                        _ => {}
++                    }
++                }
++            }
++            // Hosted tools such as web_search and tool_search have no Chat Completions form.
++            _ => {}
++        }
++    }
++    Ok(chat_tools)
++}
++
++fn function_tool(
++    namespace: Option<&str>,
++    tool: &Value,
++    table: &mut ToolAliasTable,
++) -> Option<Value> {
++    let name = tool.get("name").and_then(Value::as_str)?;
++    let mut function = Map::new();
++    function.insert(
++        "name".to_string(),
++        json!(table.insert(namespace, name, /*freeform*/ false)),
++    );
++    if let Some(description) = tool
++        .get("description")
++        .and_then(Value::as_str)
++        .filter(|description| !description.is_empty())
++    {
++        function.insert("description".to_string(), json!(description));
++    }
++    function.insert(
++        "parameters".to_string(),
++        tool.get("parameters")
++            .cloned()
++            .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
++    );
++    if tool.get("strict").and_then(Value::as_bool) == Some(true) {
++        function.insert("strict".to_string(), json!(true));
++    }
++    Some(json!({ "type": "function", "function": function }))
++}
++
++fn freeform_tool(
++    namespace: Option<&str>,
++    tool: &Value,
++    table: &mut ToolAliasTable,
++) -> Option<Value> {
++    let name = tool.get("name").and_then(Value::as_str)?;
++    let mut description = tool
++        .get("description")
++        .and_then(Value::as_str)
++        .unwrap_or_default()
++        .to_string();
++    if let Some(format) = tool.get("format")
++        && let Some(definition) = format.get("definition").and_then(Value::as_str)
++    {
++        let syntax = format
++            .get("syntax")
++            .and_then(Value::as_str)
++            .unwrap_or("text");
++        description.push_str(&format!(
++            "\n\nThe `input` argument must follow this {syntax} grammar:\n{}",
++            truncate_utf8(definition, MAX_FREEFORM_GRAMMAR_BYTES)
++        ));
++    }
++    Some(json!({
++        "type": "function",
++        "function": {
++            "name": table.insert(namespace, name, /*freeform*/ true),
++            "description": description,
++            "parameters": {
++                "type": "object",
++                "properties": {
++                    "input": { "type": "string", "description": "The raw tool input." },
++                },
++                "required": ["input"],
++                "additionalProperties": false,
++            },
++        },
++    }))
++}
++
++fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
++    if value.len() <= max_bytes {
++        return value;
++    }
++    &value[..value.floor_char_boundary(max_bytes)]
++}
++
++/// An assistant tool call message whose results are still being collected.
++struct ToolGroup {
++    message_index: usize,
++    unanswered: Vec<String>,
++    answered: usize,
++    images: Vec<Value>,
++}
++
++struct MessageBuilder<'a> {
++    options: &'a ChatOptions,
++    tools: &'a ToolAliasTable,
++    instructions: Vec<String>,
++    messages: Vec<Value>,
++    prefix_end: usize,
++    replay_from: Option<usize>,
++    pending_reasoning: Vec<String>,
++    pending_instructions: Vec<String>,
++    group: Option<ToolGroup>,
++    deferred: Vec<Value>,
++    dropped_call_ids: HashSet<String>,
++    images_seen: usize,
++    images_dropped: usize,
++}
++
++impl<'a> MessageBuilder<'a> {
++    fn new(options: &'a ChatOptions, tools: &'a ToolAliasTable, input: &[ResponseItem]) -> Self {
++        let prefix_end = input
++            .iter()
++            .position(is_model_output)
++            .unwrap_or(input.len());
++        let replay_from = match options.reasoning_replay {
++            ChatReasoningReplay::None => None,
++            ChatReasoningReplay::All => Some(0),
++            ChatReasoningReplay::CurrentTurn => Some(
++                input
++                    .iter()
++                    .rposition(is_turn_boundary)
++                    .map_or(0, |index| index + 1),
++            ),
++        };
++        let images_dropped = options.max_images.map_or(0, |limit| {
++            count_images(input).saturating_sub(limit as usize)
++        });
++        Self {
++            options,
++            tools,
++            instructions: Vec::new(),
++            messages: Vec::new(),
++            prefix_end,
++            replay_from,
++            pending_reasoning: Vec::new(),
++            pending_instructions: Vec::new(),
++            group: None,
++            deferred: Vec::new(),
++            dropped_call_ids: HashSet::new(),
++            images_seen: 0,
++            images_dropped,
++        }
++    }
++
++    fn push_item(&mut self, index: usize, item: &ResponseItem) {
++        if !matches!(item, ResponseItem::Message { role, .. } if role == "developer" || role == "system")
++        {
++            self.flush_instructions();
++        }
++        match item {
++            ResponseItem::Message { role, content, .. } => match role.as_str() {
++                "developer" | "system" => {
++                    let text = text_content(content);
++                    if text.is_empty() {
++                        return;
++                    }
++                    if index < self.prefix_end {
++                        self.instructions.push(text);
++                    } else {
++                        match self.options.mid_conversation_instructions {
++                            ChatMidConversationInstructions::User => {
++                                self.pending_instructions.push(text);
++                            }
++                            ChatMidConversationInstructions::System => {
++                                self.push_message(json!({ "role": "system", "content": text }));
++                            }
++                        }
++                    }
++                }
++                "assistant" => self.push_assistant_text(text_content(content)),
++                _ => {
++                    let content = self.user_content(content);
++                    self.push_message(json!({ "role": "user", "content": content }));
++                }
++            },
++            ResponseItem::AgentMessage { content, .. } => {
++                if let Some(text) = plaintext_agent_message_content(content) {
++                    self.push_message(json!({ "role": "user", "content": text }));
++                }
++            }
++            ResponseItem::Reasoning {
++                summary, content, ..
++            } => {
++                if self.replay_from.is_some_and(|from| index >= from) {
++                    let text = reasoning_text(summary, content.as_deref());
++                    if !text.is_empty() {
++                        self.pending_reasoning.push(text);
++                    }
++                }
++            }
++            ResponseItem::FunctionCall {
++                name,
++                namespace,
++                arguments,
++                call_id,
++                ..
++            } => {
++                let alias = self.tools.alias_for(namespace.as_deref(), name);
++                self.push_tool_call(call_id, alias, arguments.clone());
++            }
++            ResponseItem::CustomToolCall {
++                name,
++                namespace,
++                input,
++                call_id,
++                ..
++            } => {
++                let alias = self.tools.alias_for(namespace.as_deref(), name);
++                self.push_tool_call(call_id, alias, json!({ "input": input }).to_string());
++            }
++            ResponseItem::FunctionCallOutput {
++                call_id,
++                name,
++                output,
++                ..
++            } => self.push_tool_output(call_id.as_deref(), name.as_deref(), output),
++            ResponseItem::CustomToolCallOutput {
++                call_id,
++                name,
++                output,
++                ..
++            } => self.push_tool_output(Some(call_id), name.as_deref(), output),
++            ResponseItem::LocalShellCall {
++                call_id: Some(call_id),
++                ..
++            } => {
++                self.dropped_call_ids.insert(call_id.clone());
++            }
++            // Responses-only items have no Chat Completions representation.
++            ResponseItem::LocalShellCall { .. }
++            | ResponseItem::AdditionalTools { .. }
++            | ResponseItem::ToolSearchCall { .. }
++            | ResponseItem::ToolSearchOutput { .. }
++            | ResponseItem::WebSearchCall { .. }
++            | ResponseItem::ImageGenerationCall { .. }
++            | ResponseItem::Compaction { .. }
++            | ResponseItem::ConfigurationUpdate { .. }
++            | ResponseItem::CompactionTrigger {}
++            | ResponseItem::ContextCompaction { .. }
++            | ResponseItem::Other => {}
++        }
++    }
++
++    fn finish(mut self, structured_output: Option<&TextFormat>) -> Vec<Value> {
++        self.flush_instructions();
++        self.close_group();
++        if let Some(format) = structured_output
++            && self.options.structured_output != ChatStructuredOutput::JsonSchema
++        {
++            self.instructions.push(format!(
++                "Respond with a single JSON object that matches this JSON schema:\n{}",
++                format.schema
++            ));
++        }
++        let mut messages = Vec::with_capacity(self.messages.len() + 1);
++        if !self.instructions.is_empty() {
++            let role = match self.options.system_role {
++                ChatSystemRole::System => "system",
++                ChatSystemRole::Developer => "developer",
++            };
++            messages.push(json!({ "role": role, "content": self.instructions.join("\n\n") }));
++        }
++        messages.extend(self.messages);
++        messages
++    }
++
++    /// Appends a non-tool message, holding it back while tool results are outstanding.
++    fn push_message(&mut self, message: Value) {
++        if self.group.is_some() {
++            self.deferred.push(message);
++        } else {
++            self.messages.push(message);
++        }
++    }
++
++    fn flush_instructions(&mut self) {
++        if self.pending_instructions.is_empty() {
++            return;
++        }
++        let text = std::mem::take(&mut self.pending_instructions).join("\n\n");
++        self.push_message(json!({
++            "role": "user",
++            "content": format!("<system_instructions>\n{text}\n</system_instructions>"),
++        }));
++    }
++
++    fn take_reasoning(&mut self) -> Option<String> {
++        (!self.pending_reasoning.is_empty())
++            .then(|| std::mem::take(&mut self.pending_reasoning).join("\n\n"))
++    }
++
++    fn push_assistant_text(&mut self, text: String) {
++        self.close_group();
++        if text.is_empty() {
++            return;
++        }
++        let mut message = json!({ "role": "assistant", "content": text });
++        if let Some(reasoning) = self.take_reasoning() {
++            message[self.options.reasoning_field.as_str()] = json!(reasoning);
++        }
++        self.messages.push(message);
++    }
++
++    fn push_tool_call(&mut self, call_id: &str, alias: String, arguments: String) {
++        let call = json!({
++            "id": call_id,
++            "type": "function",
++            "function": { "name": alias, "arguments": arguments },
++        });
++        if let Some(group) = self.group.as_mut()
++            && group.answered == 0
++            && self.deferred.is_empty()
++        {
++            append_tool_call(&mut self.messages[group.message_index], call);
++            group.unanswered.push(call_id.to_string());
++            return;
++        }
++        self.close_group();
++        let reasoning = self.take_reasoning();
++        let attaches_to_text = reasoning.is_none()
++            && self.messages.last().is_some_and(|message| {
++                message["role"] == "assistant" && message.get("tool_calls").is_none()
++            });
++        if !attaches_to_text {
++            let mut message = json!({ "role": "assistant", "content": Value::Null });
++            if let Some(reasoning) = reasoning {
++                message[self.options.reasoning_field.as_str()] = json!(reasoning);
++            }
++            self.messages.push(message);
++        }
++        let message_index = self.messages.len() - 1;
++        append_tool_call(&mut self.messages[message_index], call);
++        self.group = Some(ToolGroup {
++            message_index,
++            unanswered: vec![call_id.to_string()],
++            answered: 0,
++            images: Vec::new(),
++        });
++    }
++
++    fn push_tool_output(
++        &mut self,
++        call_id: Option<&str>,
++        name: Option<&str>,
++        output: &FunctionCallOutputPayload,
++    ) {
++        let call_id = call_id.filter(|call_id| !call_id.is_empty());
++        if call_id.is_some_and(|call_id| self.dropped_call_ids.contains(call_id)) {
++            return;
++        }
++        let matched = match (self.group.as_ref(), call_id) {
++            (Some(group), Some(call_id)) => group
++                .unanswered
++                .iter()
++                .position(|pending| pending == call_id),
++            // A result without a call id belongs to the only call still waiting for one.
++            (Some(group), None) if group.unanswered.len() == 1 => Some(0),
++            _ => None,
++        };
++        let Some(position) = matched else {
++            let text = self.tool_output_text(&output.body, /*images*/ None);
++            let label = name.unwrap_or("tool");
++            self.push_message(json!({
++                "role": "user",
++                "content": format!("Tool output ({label}): {text}"),
++            }));
++            return;
++        };
++        let mut images = Vec::new();
++        let text = self.tool_output_text(&output.body, Some(&mut images));
++        let Some(group) = self.group.as_mut() else {
++            return;
++        };
++        let call_id = group.unanswered.remove(position);
++        group.answered += 1;
++        group.images.extend(images);
++        self.messages.push(json!({
++            "role": "tool",
++            "tool_call_id": call_id,
++            "content": text,
++        }));
++        if group.unanswered.is_empty() {
++            self.close_group();
++        }
++    }
++
++    fn close_group(&mut self) {
++        let Some(group) = self.group.take() else {
++            return;
++        };
++        for call_id in group.unanswered {
++            self.messages.push(json!({
++                "role": "tool",
++                "tool_call_id": call_id,
++                "content": INTERRUPTED_TOOL_CALL_OUTPUT,
++            }));
++        }
++        if !group.images.is_empty() {
++            let mut content = vec![json!({ "type": "text", "text": TOOL_OUTPUT_IMAGES_INTRO })];
++            content.extend(group.images);
++            self.messages
++                .push(json!({ "role": "user", "content": content }));
++        }
++        let deferred = std::mem::take(&mut self.deferred);
++        self.messages.extend(deferred);
++    }
++
++    fn next_image_allowed(&mut self) -> bool {
++        let index = self.images_seen;
++        self.images_seen += 1;
++        index >= self.images_dropped
++    }
++
++    fn image_part(
++        &mut self,
++        image: &ImageReference,
++        detail: Option<ImageDetail>,
++    ) -> Result<Value, &'static str> {
++        if !self.next_image_allowed() {
++            return Err(IMAGE_OVER_LIMIT);
++        }
++        if !self.options.image_input {
++            return Err(IMAGE_INPUT_UNSUPPORTED);
++        }
++        let ImageReference::Inline { image_url } = image else {
++            return Err(IMAGE_FILE_REFERENCE);
++        };
++        let mut url = json!({ "url": image_url });
++        if let Some(detail) = detail {
++            url["detail"] = json!(match detail {
++                ImageDetail::Auto => "auto",
++                ImageDetail::Low => "low",
++                ImageDetail::High | ImageDetail::Original => "high",
++            });
++        }
++        Ok(json!({ "type": "image_url", "image_url": url }))
++    }
++
++    fn user_content(&mut self, content: &[ContentItem]) -> Value {
++        let mut parts = Vec::new();
++        let mut has_image = false;
++        for item in content {
++            match item {
++                ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
++                    parts.push(json!({ "type": "text", "text": text }));
++                }
++                ContentItem::InputImage { image, detail } => {
++                    match self.image_part(image, *detail) {
++                        Ok(part) => {
++                            has_image = true;
++                            parts.push(part);
++                        }
++                        Err(placeholder) => {
++                            parts.push(json!({ "type": "text", "text": placeholder }))
++                        }
++                    }
++                }
++                ContentItem::InputAudio { .. } => {
++                    parts.push(json!({ "type": "text", "text": AUDIO_OMITTED }));
++                }
++            }
++        }
++        if has_image {
++            return Value::Array(parts);
++        }
++        json!(
++            parts
++                .iter()
++                .filter_map(|part| part["text"].as_str())
++                .collect::<Vec<_>>()
++                .join("\n")
++        )
++    }
++
++    fn tool_output_text(
++        &mut self,
++        body: &FunctionCallOutputBody,
++        mut images: Option<&mut Vec<Value>>,
++    ) -> String {
++        let items = match body {
++            FunctionCallOutputBody::Text(text) => return text.clone(),
++            FunctionCallOutputBody::ContentItems(items) => items,
++        };
++        let mut parts = Vec::new();
++        for item in items {
++            match item {
++                FunctionCallOutputContentItem::InputText { text } => parts.push(text.clone()),
++                FunctionCallOutputContentItem::InputImage { image, detail } => {
++                    let follows = images.is_some()
++                        && self.options.tool_output_images == ChatToolOutputImages::UserMessage;
++                    if !follows {
++                        // Keep the image budget aligned with the images counted up front.
++                        self.next_image_allowed();
++                        parts.push(
++                            if self.options.image_input {
++                                IMAGE_OMITTED
++                            } else {
++                                IMAGE_INPUT_UNSUPPORTED
++                            }
++                            .to_string(),
++                        );
++                        continue;
++                    }
++                    match self.image_part(image, *detail) {
++                        Ok(part) => {
++                            if let Some(images) = images.as_deref_mut() {
++                                images.push(part);
++                            }
++                            parts.push(TOOL_OUTPUT_IMAGE_FOLLOWS.to_string());
++                        }
++                        Err(placeholder) => parts.push(placeholder.to_string()),
++                    }
++                }
++                FunctionCallOutputContentItem::InputAudio { .. } => {
++                    parts.push(AUDIO_OMITTED.to_string());
++                }
++                FunctionCallOutputContentItem::EncryptedContent { .. } => {
++                    parts.push(ENCRYPTED_CONTENT_OMITTED.to_string());
++                }
++            }
++        }
++        parts.join("\n")
++    }
++}
++
++fn append_tool_call(message: &mut Value, call: Value) {
++    match message.get_mut("tool_calls").and_then(Value::as_array_mut) {
++        Some(calls) => calls.push(call),
++        None => message["tool_calls"] = json!([call]),
++    }
++}
++
++fn is_model_output(item: &ResponseItem) -> bool {
++    match item {
++        ResponseItem::Message { role, .. } => role == "assistant",
++        ResponseItem::Reasoning { .. }
++        | ResponseItem::FunctionCall { .. }
++        | ResponseItem::CustomToolCall { .. }
++        | ResponseItem::LocalShellCall { .. }
++        | ResponseItem::ToolSearchCall { .. }
++        | ResponseItem::WebSearchCall { .. }
++        | ResponseItem::ImageGenerationCall { .. } => true,
++        _ => false,
++    }
++}
++
++/// A user message that starts a turn, as opposed to context the harness wraps in markers.
++fn is_turn_boundary(item: &ResponseItem) -> bool {
++    let ResponseItem::Message { role, content, .. } = item else {
++        return false;
++    };
++    role == "user"
++        && content.iter().any(|item| match item {
++            ContentItem::InputText { text } => !is_marked_context(text),
++            ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => true,
++            ContentItem::OutputText { .. } => false,
++        })
++}
++
++fn is_marked_context(text: &str) -> bool {
++    let text = text.trim();
++    let Some(rest) = text.strip_prefix('<') else {
++        return false;
++    };
++    let Some(tag_end) = rest.find('>') else {
++        return false;
++    };
++    let tag = &rest[..tag_end];
++    !tag.is_empty()
++        && tag.chars().all(|character| {
++            character.is_ascii_alphanumeric() || character == '_' || character == '-'
++        })
++        && text.ends_with(&format!("</{tag}>"))
++}
++
++fn count_images(input: &[ResponseItem]) -> usize {
++    input
++        .iter()
++        .map(|item| match item {
++            ResponseItem::Message { content, .. } => content
++                .iter()
++                .filter(|item| matches!(item, ContentItem::InputImage { .. }))
++                .count(),
++            ResponseItem::FunctionCallOutput { output, .. }
++            | ResponseItem::CustomToolCallOutput { output, .. } => match &output.body {
++                FunctionCallOutputBody::ContentItems(items) => items
++                    .iter()
++                    .filter(|item| matches!(item, FunctionCallOutputContentItem::InputImage { .. }))
++                    .count(),
++                FunctionCallOutputBody::Text(_) => 0,
++            },
++            _ => 0,
++        })
++        .sum()
++}
++
++fn text_content(content: &[ContentItem]) -> String {
++    content
++        .iter()
++        .filter_map(|item| match item {
++            ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
++                Some(text.as_str())
++            }
++            ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => None,
++        })
++        .collect::<Vec<_>>()
++        .join("")
++}
++
++fn reasoning_text(
++    summary: &[ReasoningItemReasoningSummary],
++    content: Option<&[ReasoningItemContent]>,
++) -> String {
++    let content = content
++        .unwrap_or_default()
++        .iter()
++        .map(|item| match item {
++            ReasoningItemContent::ReasoningText { text } | ReasoningItemContent::Text { text } => {
++                text.as_str()
++            }
++        })
++        .collect::<Vec<_>>()
++        .join("");
++    if !content.is_empty() {
++        return content;
++    }
++    summary
++        .iter()
++        .map(|item| match item {
++            ReasoningItemReasoningSummary::SummaryText { text } => text.as_str(),
++        })
++        .collect::<Vec<_>>()
++        .join("\n\n")
++}
++
++#[cfg(test)]
++#[path = "chat_tests.rs"]
++mod tests;
+diff --git a/codex-rs/codex-api/src/requests/chat_tests.rs b/codex-rs/codex-api/src/requests/chat_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ede05e161ac4513f59643333d3732480a7586af3
+--- /dev/null
++++ b/codex-rs/codex-api/src/requests/chat_tests.rs
+@@ -0,0 +1,565 @@
++use super::*;
++use crate::common::Reasoning;
++use crate::common::TextControls;
++use crate::common::TextFormatType;
++use codex_protocol::openai_models::ReasoningEffort;
++use pretty_assertions::assert_eq;
++use serde_json::value::RawValue;
++
++fn request(input: Vec<ResponseItem>, tools: Value) -> ResponsesApiRequest {
++    let tools: Arc<RawValue> = serde_json::value::to_raw_value(&tools)
++        .expect("tools encode")
++        .into();
++    ResponsesApiRequest {
++        model: "1001".to_string(),
++        stream: true,
++        service_tier: None,
++        input,
++        tools: Some(tools.into()),
++        tool_choice: "auto".to_string(),
++        parallel_tool_calls: true,
++        reasoning: None,
++        store: false,
++        stream_options: None,
++        include: Vec::new(),
++        prompt_cache_key: None,
++        text: None,
++        client_metadata: None,
++        access_programs: None,
++    }
++}
++
++fn message(role: &str, text: &str) -> ResponseItem {
++    ResponseItem::Message {
++        encrypted_content: None,
++        status: None,
++        id: None,
++        role: role.to_string(),
++        content: vec![if role == "assistant" {
++            ContentItem::OutputText {
++                text: text.to_string(),
++                annotations: None,
++                logprobs: None,
++            }
++        } else {
++            ContentItem::InputText {
++                text: text.to_string(),
++            }
++        }],
++        phase: None,
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
++
++fn image_message(urls: &[&str]) -> ResponseItem {
++    ResponseItem::Message {
++        encrypted_content: None,
++        status: None,
++        id: None,
++        role: "user".to_string(),
++        content: urls
++            .iter()
++            .map(|url| ContentItem::InputImage {
++                image: ImageReference::Inline {
++                    image_url: (*url).to_string(),
++                },
++                detail: Some(ImageDetail::High),
++            })
++            .collect(),
++        phase: None,
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
++
++fn call(call_id: &str, namespace: Option<&str>, name: &str, arguments: &str) -> ResponseItem {
++    ResponseItem::FunctionCall {
++        encrypted_content: None,
++        status: None,
++        id: None,
++        name: name.to_string(),
++        namespace: namespace.map(str::to_string),
++        arguments: arguments.to_string(),
++        encrypted_function_args: None,
++        call_id: call_id.to_string(),
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
++
++fn output(call_id: Option<&str>, name: Option<&str>, body: FunctionCallOutputBody) -> ResponseItem {
++    ResponseItem::FunctionCallOutput {
++        id: None,
++        call_id: call_id.map(str::to_string),
++        name: name.map(str::to_string),
++        namespace: None,
++        output: FunctionCallOutputPayload {
++            body,
++            success: None,
++        },
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
++
++fn text_output(call_id: &str, text: &str) -> ResponseItem {
++    output(
++        Some(call_id),
++        None,
++        FunctionCallOutputBody::Text(text.to_string()),
++    )
++}
++
++fn reasoning(text: &str) -> ResponseItem {
++    ResponseItem::Reasoning {
++        id: None,
++        summary: Vec::new(),
++        content: Some(vec![ReasoningItemContent::ReasoningText {
++            text: text.to_string(),
++        }]),
++        encrypted_content: None,
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
++
++fn messages(input: Vec<ResponseItem>, options: &ChatOptions) -> Value {
++    build_chat_request(&request(input, json!([])), options)
++        .expect("chat request")
++        .body["messages"]
++        .clone()
++}
++
++#[test]
++fn prefix_instructions_form_one_leading_message() {
++    let input = vec![
++        message("developer", "BASE_INSTRUCTIONS"),
++        message("user", "<environment_context>cwd</environment_context>"),
++        message(
++            "developer",
++            "<application_context>APP</application_context>",
++        ),
++        message("user", "hello"),
++    ];
++    assert_eq!(
++        messages(input, &ChatOptions::default()),
++        json!([
++            { "role": "system", "content": "BASE_INSTRUCTIONS\n\n<application_context>APP</application_context>" },
++            { "role": "user", "content": "<environment_context>cwd</environment_context>" },
++            { "role": "user", "content": "hello" },
++        ])
++    );
++
++    let developer = ChatOptions {
++        system_role: ChatSystemRole::Developer,
++        ..Default::default()
++    };
++    assert_eq!(
++        messages(vec![message("developer", "BASE")], &developer)[0]["role"],
++        "developer"
++    );
++}
++
++#[test]
++fn mid_conversation_instructions_follow_the_configured_role() {
++    let input = || {
++        vec![
++            message("developer", "BASE"),
++            message("user", "first"),
++            message("assistant", "answer"),
++            message("developer", "UPDATE_ONE"),
++            message("developer", "UPDATE_TWO"),
++            message("user", "second"),
++        ]
++    };
++    assert_eq!(
++        messages(input(), &ChatOptions::default()),
++        json!([
++            { "role": "system", "content": "BASE" },
++            { "role": "user", "content": "first" },
++            { "role": "assistant", "content": "answer" },
++            { "role": "user", "content": "<system_instructions>\nUPDATE_ONE\n\nUPDATE_TWO\n</system_instructions>" },
++            { "role": "user", "content": "second" },
++        ])
++    );
++    let system = ChatOptions {
++        mid_conversation_instructions: ChatMidConversationInstructions::System,
++        ..Default::default()
++    };
++    assert_eq!(
++        messages(input(), &system),
++        json!([
++            { "role": "system", "content": "BASE" },
++            { "role": "user", "content": "first" },
++            { "role": "assistant", "content": "answer" },
++            { "role": "system", "content": "UPDATE_ONE" },
++            { "role": "system", "content": "UPDATE_TWO" },
++            { "role": "user", "content": "second" },
++        ])
++    );
++}
++
++#[test]
++fn tool_results_follow_their_calls_and_missing_results_get_placeholders() {
++    let input = vec![
++        message("developer", "BASE"),
++        message("user", "go"),
++        message("assistant", "Working on it."),
++        call(
++            "call_a",
++            Some("multi_agent_v1"),
++            "spawn_agent",
++            "{\"message\":\"x\"}",
++        ),
++        call("call_b", None, "exec_command", "{\"cmd\":\"ls\"}"),
++        message("developer", "MID_TURN_UPDATE"),
++        text_output("call_b", "listing"),
++        message("user", "later"),
++    ];
++    assert_eq!(
++        messages(input, &ChatOptions::default()),
++        json!([
++            { "role": "system", "content": "BASE" },
++            { "role": "user", "content": "go" },
++            {
++                "role": "assistant",
++                "content": "Working on it.",
++                "tool_calls": [
++                    { "id": "call_a", "type": "function", "function": { "name": "multi_agent_v1__spawn_agent", "arguments": "{\"message\":\"x\"}" } },
++                    { "id": "call_b", "type": "function", "function": { "name": "exec_command", "arguments": "{\"cmd\":\"ls\"}" } },
++                ],
++            },
++            { "role": "tool", "tool_call_id": "call_b", "content": "listing" },
++            { "role": "tool", "tool_call_id": "call_a", "content": INTERRUPTED_TOOL_CALL_OUTPUT },
++            { "role": "user", "content": "<system_instructions>\nMID_TURN_UPDATE\n</system_instructions>" },
++            { "role": "user", "content": "later" },
++        ])
++    );
++}
++
++#[test]
++fn sequential_tool_steps_form_separate_groups() {
++    let input = vec![
++        message("user", "go"),
++        call("call_a", None, "exec_command", "{}"),
++        text_output("call_a", "A"),
++        call("call_b", None, "exec_command", "{}"),
++        text_output("call_b", "B"),
++    ];
++    let messages = messages(input, &ChatOptions::default());
++    let roles = messages
++        .as_array()
++        .expect("messages")
++        .iter()
++        .map(|message| message["role"].as_str().unwrap_or_default())
++        .collect::<Vec<_>>();
++    assert_eq!(roles, ["user", "assistant", "tool", "assistant", "tool"]);
++    assert_eq!(messages[1]["content"], Value::Null);
++}
++
++#[test]
++fn results_without_call_ids_bind_only_to_a_single_waiting_call() {
++    let single = vec![
++        message("user", "go"),
++        call("call_a", None, "echo_marker", "{}"),
++        output(
++            None,
++            Some("echo_marker"),
++            FunctionCallOutputBody::Text("DONE".to_string()),
++        ),
++    ];
++    assert_eq!(
++        messages(single, &ChatOptions::default())[2],
++        json!({ "role": "tool", "tool_call_id": "call_a", "content": "DONE" })
++    );
++
++    let ambiguous = vec![
++        message("user", "go"),
++        call("call_a", None, "echo_marker", "{}"),
++        call("call_b", None, "echo_marker", "{}"),
++        output(
++            None,
++            Some("echo_marker"),
++            FunctionCallOutputBody::Text("DONE".to_string()),
++        ),
++    ];
++    let messages = messages(ambiguous, &ChatOptions::default());
++    assert_eq!(messages[2]["role"], "tool");
++    assert_eq!(messages[3]["role"], "tool");
++    assert_eq!(
++        messages[4],
++        json!({ "role": "user", "content": "Tool output (echo_marker): DONE" })
++    );
++}
++
++#[test]
++fn freeform_tools_are_wrapped_as_input_functions() {
++    let tools = json!([
++        { "type": "custom", "name": "apply_patch", "description": "Edit files.", "format": { "type": "grammar", "syntax": "lark", "definition": "start: patch" } },
++        { "type": "namespace", "name": "mcp__docs", "description": "Docs", "tools": [
++            { "type": "function", "name": "search", "description": "Search docs.", "strict": false, "parameters": { "type": "object", "properties": {} } },
++        ] },
++        { "type": "web_search" },
++        { "type": "tool_search", "execution": "client", "description": "Find tools.", "parameters": {} },
++    ]);
++    let input = vec![
++        message("user", "edit"),
++        ResponseItem::CustomToolCall {
++            encrypted_content: None,
++            id: None,
++            status: None,
++            call_id: "call_patch".to_string(),
++            name: "apply_patch".to_string(),
++            namespace: None,
++            input: "*** Begin Patch\n*** End Patch\n".to_string(),
++            internal_chat_message_metadata_passthrough: None,
++        },
++    ];
++    let request =
++        build_chat_request(&request(input, tools), &ChatOptions::default()).expect("chat request");
++    assert_eq!(
++        request.body["tools"],
++        json!([
++            {
++                "type": "function",
++                "function": {
++                    "name": "apply_patch",
++                    "description": "Edit files.\n\nThe `input` argument must follow this lark grammar:\nstart: patch",
++                    "parameters": {
++                        "type": "object",
++                        "properties": { "input": { "type": "string", "description": "The raw tool input." } },
++                        "required": ["input"],
++                        "additionalProperties": false,
++                    },
++                },
++            },
++            {
++                "type": "function",
++                "function": {
++                    "name": "mcp__docs__search",
++                    "description": "Search docs.",
++                    "parameters": { "type": "object", "properties": {} },
++                },
++            },
++        ])
++    );
++    assert_eq!(
++        request.body["messages"][1]["tool_calls"][0]["function"]["arguments"],
++        json!({ "input": "*** Begin Patch\n*** End Patch\n" }).to_string()
++    );
++    assert_eq!(
++        request
++            .tools
++            .resolve("apply_patch")
++            .map(|target| target.freeform),
++        Some(true)
++    );
++}
++
++#[test]
++fn reasoning_replay_follows_the_configured_scope() {
++    let input = || {
++        vec![
++            message("user", "first question"),
++            reasoning("OLD_REASONING"),
++            message("assistant", "first answer"),
++            message("user", "second question"),
++            reasoning("TOOL_REASONING"),
++            call("call_a", None, "exec_command", "{}"),
++            text_output("call_a", "output"),
++            message("user", "<environment_context>changed</environment_context>"),
++            reasoning("FINAL_REASONING"),
++            message("assistant", "second answer"),
++        ]
++    };
++    let field = |messages: &Value, index: usize| messages[index]["reasoning_content"].clone();
++
++    let current = messages(input(), &ChatOptions::default());
++    assert_eq!(field(&current, 1), Value::Null);
++    assert_eq!(field(&current, 3), json!("TOOL_REASONING"));
++    assert_eq!(field(&current, 6), json!("FINAL_REASONING"));
++
++    let all = messages(
++        input(),
++        &ChatOptions {
++            reasoning_replay: ChatReasoningReplay::All,
++            reasoning_field: "reasoning".to_string(),
++            ..Default::default()
++        },
++    );
++    assert_eq!(all[1]["reasoning"], json!("OLD_REASONING"));
++
++    let none = messages(
++        input(),
++        &ChatOptions {
++            reasoning_replay: ChatReasoningReplay::None,
++            ..Default::default()
++        },
++    );
++    assert!(
++        none.as_array()
++            .expect("messages")
++            .iter()
++            .all(|message| message.get("reasoning_content").is_none())
++    );
++}
++
++#[test]
++fn images_follow_the_configured_policies() {
++    let tool_image = output(
++        Some("call_a"),
++        None,
++        FunctionCallOutputBody::ContentItems(vec![
++            FunctionCallOutputContentItem::InputText {
++                text: "screenshot".to_string(),
++            },
++            FunctionCallOutputContentItem::InputImage {
++                image: ImageReference::Inline {
++                    image_url: "data:image/png;base64,TOOL".to_string(),
++                },
++                detail: None,
++            },
++        ]),
++    );
++    let input = || {
++        vec![
++            image_message(&[
++                "data:image/png;base64,FIRST",
++                "data:image/png;base64,SECOND",
++            ]),
++            call("call_a", None, "view_image", "{}"),
++            tool_image.clone(),
++        ]
++    };
++
++    let messages_with = |options: ChatOptions| messages(input(), &options);
++    let default = messages_with(ChatOptions::default());
++    assert_eq!(
++        default[0]["content"][1],
++        json!({ "type": "image_url", "image_url": { "url": "data:image/png;base64,SECOND", "detail": "high" } })
++    );
++    assert_eq!(
++        default[2],
++        json!({ "role": "tool", "tool_call_id": "call_a", "content": "screenshot\n[image attached in the next message]" })
++    );
++    assert_eq!(
++        default[3]["content"][1]["image_url"]["url"],
++        "data:image/png;base64,TOOL"
++    );
++
++    let limited = messages_with(ChatOptions {
++        max_images: Some(1),
++        ..Default::default()
++    });
++    assert_eq!(
++        limited[0]["content"],
++        json!(format!("{IMAGE_OVER_LIMIT}\n{IMAGE_OVER_LIMIT}"))
++    );
++    assert_eq!(
++        limited[3]["content"][1]["image_url"]["url"],
++        "data:image/png;base64,TOOL"
++    );
++
++    let text_only = messages_with(ChatOptions {
++        image_input: false,
++        ..Default::default()
++    });
++    assert_eq!(
++        text_only[0]["content"],
++        json!(format!(
++            "{IMAGE_INPUT_UNSUPPORTED}\n{IMAGE_INPUT_UNSUPPORTED}"
++        ))
++    );
++    assert_eq!(text_only.as_array().map(Vec::len), Some(3));
++}
++
++#[test]
++fn request_fields_follow_the_options() {
++    let mut request = request(
++        vec![message("user", "go")],
++        json!([
++            { "type": "function", "name": "exec_command", "description": "Run.", "strict": true, "parameters": { "type": "object" } },
++        ]),
++    );
++    request.parallel_tool_calls = false;
++    request.reasoning = Some(Reasoning {
++        effort: Some(ReasoningEffort::High),
++        summary: None,
++        context: None,
++    });
++    request.text = Some(TextControls {
++        verbosity: None,
++        format: Some(TextFormat {
++            r#type: TextFormatType::JsonSchema,
++            strict: true,
++            schema: json!({ "type": "object" }),
++            name: "result".to_string(),
++        }),
++    });
++    let options = ChatOptions {
++        send_reasoning_effort: true,
++        max_output_tokens: Some(4096),
++        max_tokens_field: ChatMaxTokensField::MaxCompletionTokens,
++        extra_body: Map::from_iter([
++            ("enable_thinking".to_string(), json!(true)),
++            ("model".to_string(), json!("ignored")),
++        ]),
++        ..Default::default()
++    };
++    let body = build_chat_request(&request, &options)
++        .expect("chat request")
++        .body;
++    assert_eq!(body["model"], "1001");
++    assert_eq!(body["stream"], true);
++    assert_eq!(body["stream_options"], json!({ "include_usage": true }));
++    assert_eq!(body["parallel_tool_calls"], false);
++    assert_eq!(body["tools"][0]["function"]["strict"], true);
++    assert_eq!(body["reasoning_effort"], "high");
++    assert_eq!(body["max_completion_tokens"], 4096);
++    assert_eq!(body["enable_thinking"], true);
++    assert_eq!(body.get("tool_choice"), None);
++    assert_eq!(
++        body["response_format"],
++        json!({ "type": "json_schema", "json_schema": { "name": "result", "schema": { "type": "object" }, "strict": true } })
++    );
++
++    let json_object = build_chat_request(
++        &request,
++        &ChatOptions {
++            structured_output: ChatStructuredOutput::JsonObject,
++            include_usage: false,
++            ..Default::default()
++        },
++    )
++    .expect("chat request")
++    .body;
++    assert_eq!(
++        json_object["response_format"],
++        json!({ "type": "json_object" })
++    );
++    assert_eq!(json_object.get("stream_options"), None);
++    assert!(
++        json_object["messages"][0]["content"]
++            .as_str()
++            .is_some_and(|content| content.contains("{\"type\":\"object\"}"))
++    );
++}
++
++#[test]
++fn responses_only_items_are_dropped() {
++    let input = vec![
++        message("user", "go"),
++        ResponseItem::WebSearchCall {
++            encrypted_content: None,
++            id: None,
++            status: Some("completed".to_string()),
++            action: None,
++            internal_chat_message_metadata_passthrough: None,
++        },
++        ResponseItem::CompactionTrigger {},
++        message("assistant", "done"),
++    ];
++    assert_eq!(
++        messages(input, &ChatOptions::default()),
++        json!([
++            { "role": "user", "content": "go" },
++            { "role": "assistant", "content": "done" },
++        ])
++    );
++}
+diff --git a/codex-rs/codex-api/src/requests/mod.rs b/codex-rs/codex-api/src/requests/mod.rs
+index abe57a886dce615be7842c9654efcf2d28b4eedc..82b1bfafe853313a776d333ef8db90976dc05e8d 100644
+--- a/codex-rs/codex-api/src/requests/mod.rs
++++ b/codex-rs/codex-api/src/requests/mod.rs
+@@ -1,4 +1,6 @@
++pub(crate) mod chat;
+ pub(crate) mod headers;
+ pub(crate) mod responses;
++pub(crate) mod tool_alias;
+ 
+ pub use responses::Compression;
+diff --git a/codex-rs/codex-api/src/requests/tool_alias.rs b/codex-rs/codex-api/src/requests/tool_alias.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ad8969a359fe4a3ef29a19179bf0b84315431c7b
+--- /dev/null
++++ b/codex-rs/codex-api/src/requests/tool_alias.rs
+@@ -0,0 +1,146 @@
++//! Chat Completions function names for the tools of a Responses request.
++//!
++//! Chat Completions has no tool namespaces and limits function names to 64 characters of
++//! `[A-Za-z0-9_-]`, so every tool is exposed under a deterministic alias and calls are mapped
++//! back through the table built for the request.
++
++use std::collections::HashMap;
++
++const MAX_ALIAS_LEN: usize = 64;
++const HASHED_PREFIX_LEN: usize = 53;
++const HASH_SUFFIX_LEN: usize = 10;
++const NAMESPACE_SEPARATOR: &str = "__";
++const DEFAULT_NAMESPACE: &str = "functions";
++
++/// The tool a chat function name refers to.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct ToolTarget {
++    pub(crate) namespace: Option<String>,
++    pub(crate) name: String,
++    /// Freeform tools are exposed as a function with a single `input` string argument.
++    pub(crate) freeform: bool,
++}
++
++/// Aliases assigned to the tools offered in one request.
++#[derive(Debug, Default)]
++pub struct ToolAliasTable {
++    targets: HashMap<String, ToolTarget>,
++    aliases: HashMap<(Option<String>, String), String>,
++}
++
++impl ToolAliasTable {
++    /// Registers an offered tool and returns its chat function name.
++    pub(crate) fn insert(&mut self, namespace: Option<&str>, name: &str, freeform: bool) -> String {
++        let namespace = normalize_namespace(namespace);
++        let key = (namespace.map(str::to_string), name.to_string());
++        if let Some(alias) = self.aliases.get(&key) {
++            return alias.clone();
++        }
++        let mut alias = tool_alias(namespace, name);
++        if self.targets.contains_key(&alias) {
++            alias = hashed_alias(&sanitize(&joined_name(namespace, name)), namespace, name);
++            let mut attempt = 1;
++            while self.targets.contains_key(&alias) {
++                alias = hashed_alias(
++                    &sanitize(&joined_name(namespace, name)),
++                    namespace,
++                    &format!("{name}\0{attempt}"),
++                );
++                attempt += 1;
++            }
++        }
++        self.targets.insert(
++            alias.clone(),
++            ToolTarget {
++                namespace: key.0.clone(),
++                name: key.1.clone(),
++                freeform,
++            },
++        );
++        self.aliases.insert(key, alias.clone());
++        alias
++    }
++
++    /// Returns the chat function name of a tool call recorded in history.
++    ///
++    /// Tools no longer offered keep the alias computed from their name, which is the name the
++    /// model saw when it made the call.
++    pub(crate) fn alias_for(&self, namespace: Option<&str>, name: &str) -> String {
++        let namespace = normalize_namespace(namespace);
++        self.aliases
++            .get(&(namespace.map(str::to_string), name.to_string()))
++            .cloned()
++            .unwrap_or_else(|| tool_alias(namespace, name))
++    }
++
++    /// Resolves a function name produced by the model.
++    ///
++    /// Besides exact aliases this accepts namespace separators the model may have substituted
++    /// for `__`, and the bare name of a namespaced tool when only one tool has that name.
++    pub(crate) fn resolve(&self, name: &str) -> Option<&ToolTarget> {
++        if let Some(target) = self.targets.get(name) {
++            return Some(target);
++        }
++        let normalized = name.replace(['.', '/', ':'], NAMESPACE_SEPARATOR);
++        if let Some(target) = self.targets.get(&normalized) {
++            return Some(target);
++        }
++        let mut matches = self
++            .targets
++            .values()
++            .filter(|target| target.namespace.is_some() && target.name == name);
++        let first = matches.next()?;
++        matches.next().is_none().then_some(first)
++    }
++}
++
++fn normalize_namespace(namespace: Option<&str>) -> Option<&str> {
++    namespace.filter(|namespace| !namespace.is_empty() && *namespace != DEFAULT_NAMESPACE)
++}
++
++fn joined_name(namespace: Option<&str>, name: &str) -> String {
++    match namespace {
++        Some(namespace) => format!("{namespace}{NAMESPACE_SEPARATOR}{name}"),
++        None => name.to_string(),
++    }
++}
++
++fn sanitize(value: &str) -> String {
++    value
++        .chars()
++        .map(|character| {
++            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
++                character
++            } else {
++                '_'
++            }
++        })
++        .collect()
++}
++
++/// Computes the chat function name of a tool without consulting any table.
++pub(crate) fn tool_alias(namespace: Option<&str>, name: &str) -> String {
++    let namespace = normalize_namespace(namespace);
++    let alias = sanitize(&joined_name(namespace, name));
++    if alias.len() <= MAX_ALIAS_LEN {
++        alias
++    } else {
++        hashed_alias(&alias, namespace, name)
++    }
++}
++
++fn hashed_alias(sanitized: &str, namespace: Option<&str>, name: &str) -> String {
++    let prefix = &sanitized[..sanitized.len().min(HASHED_PREFIX_LEN)];
++    let digest = fnv1a64(format!("{}\0{name}", namespace.unwrap_or_default()).as_bytes());
++    format!("{prefix}_{}", &format!("{digest:016x}")[..HASH_SUFFIX_LEN])
++}
++
++fn fnv1a64(bytes: &[u8]) -> u64 {
++    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
++        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
++    })
++}
++
++#[cfg(test)]
++#[path = "tool_alias_tests.rs"]
++mod tests;
+diff --git a/codex-rs/codex-api/src/requests/tool_alias_tests.rs b/codex-rs/codex-api/src/requests/tool_alias_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6dd3f3de18b9a397b6f471903b681f4ff48c67a
+--- /dev/null
++++ b/codex-rs/codex-api/src/requests/tool_alias_tests.rs
+@@ -0,0 +1,90 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++#[test]
++fn aliases_join_namespaces_and_keep_default_function_names() {
++    let mut table = ToolAliasTable::default();
++    assert_eq!(table.insert(None, "exec_command", false), "exec_command");
++    assert_eq!(
++        table.insert(Some("functions"), "update_plan", false),
++        "update_plan"
++    );
++    assert_eq!(
++        table.insert(Some("mcp__docs"), "search.files", false),
++        "mcp__docs__search_files"
++    );
++    assert_eq!(
++        table.resolve("mcp__docs__search_files"),
++        Some(&ToolTarget {
++            namespace: Some("mcp__docs".to_string()),
++            name: "search.files".to_string(),
++            freeform: false,
++        })
++    );
++}
++
++#[test]
++fn long_aliases_are_truncated_with_a_deterministic_hash() {
++    let namespace = "mcp__an_unusually_long_connector_namespace_for_testing";
++    let name = "create_a_document_with_a_very_long_tool_name";
++    let alias = tool_alias(Some(namespace), name);
++    assert_eq!(alias.len(), MAX_ALIAS_LEN);
++    assert!(alias.starts_with(&joined_name(Some(namespace), name)[..HASHED_PREFIX_LEN]));
++    assert_eq!(alias, tool_alias(Some(namespace), name));
++    assert_ne!(alias, tool_alias(Some(namespace), &format!("{name}_v2")));
++
++    let mut table = ToolAliasTable::default();
++    assert_eq!(table.insert(Some(namespace), name, false), alias);
++    assert_eq!(
++        table.resolve(&alias).map(|target| target.name.as_str()),
++        Some(name)
++    );
++}
++
++#[test]
++fn colliding_aliases_get_distinct_names() {
++    let mut table = ToolAliasTable::default();
++    let first = table.insert(Some("a"), "b__c", false);
++    let second = table.insert(Some("a__b"), "c", false);
++    assert_eq!(first, "a__b__c");
++    assert_ne!(first, second);
++    assert_eq!(
++        table
++            .resolve(&second)
++            .map(|target| target.namespace.as_deref()),
++        Some(Some("a__b"))
++    );
++    assert_eq!(table.insert(Some("a__b"), "c", false), second);
++}
++
++#[test]
++fn resolution_accepts_substituted_separators_and_unique_bare_names() {
++    let mut table = ToolAliasTable::default();
++    table.insert(Some("multi_agent_v1"), "spawn_agent", false);
++    table.insert(Some("mcp__docs"), "search", false);
++    table.insert(Some("mcp__web"), "search", false);
++
++    for name in [
++        "multi_agent_v1.spawn_agent",
++        "multi_agent_v1/spawn_agent",
++        "spawn_agent",
++    ] {
++        assert_eq!(
++            table.resolve(name).map(|target| target.name.as_str()),
++            Some("spawn_agent"),
++            "{name}"
++        );
++    }
++    assert_eq!(table.resolve("search"), None);
++    assert_eq!(table.resolve("unknown_tool"), None);
++}
++
++#[test]
++fn history_aliases_survive_tools_that_are_no_longer_offered() {
++    let table = ToolAliasTable::default();
++    assert_eq!(
++        table.alias_for(Some("mcp__retired"), "lookup"),
++        "mcp__retired__lookup"
++    );
++    assert_eq!(table.alias_for(Some("functions"), "shell"), "shell");
++}
+diff --git a/codex-rs/codex-api/src/sse/chat.rs b/codex-rs/codex-api/src/sse/chat.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b10cc19807f7630331a740eb103c649fea56f80d
+--- /dev/null
++++ b/codex-rs/codex-api/src/sse/chat.rs
+@@ -0,0 +1,713 @@
++//! Converts Chat Completions streams into Responses stream events.
++//!
++//! Text and reasoning stream as one open output item at a time. Tool calls are accumulated
++//! from their deltas and emitted once the stream ends, after names are mapped back through the
++//! request's tool aliases.
++
++use crate::common::ResponseEvent;
++use crate::common::ResponseStream;
++use crate::endpoint::chat_errors::ChatErrorClassifier;
++use crate::error::ApiError;
++use crate::requests::tool_alias::ToolAliasTable;
++use crate::telemetry::SseTelemetry;
++use bytes::Bytes;
++use codex_client::ByteStream;
++use codex_client::StreamResponse;
++use codex_protocol::ResponseItemId;
++use codex_protocol::config_types::ChatOptions;
++use codex_protocol::error::ResponseIncompleteError;
++use codex_protocol::models::ContentItem;
++use codex_protocol::models::ReasoningItemContent;
++use codex_protocol::models::ResponseItem;
++use codex_protocol::protocol::TokenUsage;
++use eventsource_stream::Eventsource;
++use futures::StreamExt;
++use http::HeaderMap;
++use serde_json::Value;
++use std::sync::Arc;
++use std::time::Duration;
++use tokio::sync::mpsc;
++use tokio::time::Instant;
++use tokio::time::timeout;
++use tracing::debug;
++use tracing::trace;
++
++/// Longest wait for `[DONE]` or end of stream after a choice reported its finish reason.
++const FINISH_GRACE: Duration = Duration::from_secs(5);
++const REQUEST_ID_HEADER: &str = "x-request-id";
++const THINK_OPEN: &str = "<think>";
++const THINK_CLOSE: &str = "</think>";
++
++/// Per-request settings of the Chat Completions stream parser.
++#[derive(Clone)]
++pub(crate) struct ChatStreamSettings {
++    pub(crate) tools: Arc<ToolAliasTable>,
++    pub(crate) options: Arc<ChatOptions>,
++}
++
++pub(crate) fn spawn_chat_stream(
++    stream_response: StreamResponse,
++    idle_timeout: Duration,
++    telemetry: Option<Arc<dyn SseTelemetry>>,
++    settings: ChatStreamSettings,
++) -> ResponseStream {
++    let upstream_request_id = request_id(&stream_response.headers);
++    let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
++    tokio::spawn(process_chat_sse(
++        stream_response.bytes,
++        tx_event,
++        idle_timeout,
++        telemetry,
++        settings,
++    ));
++    ResponseStream {
++        rx_event,
++        upstream_request_id,
++        interrupt: None,
++    }
++}
++
++/// Emits the events of a complete, non-streaming chat completion.
++pub(crate) fn spawn_chat_completion(
++    body: Bytes,
++    upstream_request_id: Option<String>,
++    settings: ChatStreamSettings,
++) -> ResponseStream {
++    let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(64);
++    tokio::spawn(async move {
++        let mut state = ChatStreamState::new(settings);
++        let completion = match serde_json::from_slice::<Value>(&body) {
++            Ok(completion) => completion,
++            Err(err) => {
++                let _ = tx_event
++                    .send(Err(ApiError::Stream(format!(
++                        "failed to parse chat completion: {err}"
++                    ))))
++                    .await;
++                return;
++            }
++        };
++        let mut events = Vec::new();
++        state.apply_completion(&completion, &mut events);
++        events.extend(state.finish());
++        for event in events {
++            if tx_event.send(event).await.is_err() {
++                return;
++            }
++        }
++    });
++    ResponseStream {
++        rx_event,
++        upstream_request_id,
++        interrupt: None,
++    }
++}
++
++pub(crate) fn request_id(headers: &HeaderMap) -> Option<String> {
++    headers
++        .get(REQUEST_ID_HEADER)
++        .and_then(|value| value.to_str().ok())
++        .map(str::to_string)
++}
++
++async fn process_chat_sse(
++    stream: ByteStream,
++    tx_event: mpsc::Sender<Result<ResponseEvent, ApiError>>,
++    idle_timeout: Duration,
++    telemetry: Option<Arc<dyn SseTelemetry>>,
++    settings: ChatStreamSettings,
++) {
++    let mut stream = stream.eventsource();
++    let mut state = ChatStreamState::new(settings);
++    loop {
++        let wait = if state.finish_reason.is_some() {
++            idle_timeout.min(FINISH_GRACE)
++        } else {
++            idle_timeout
++        };
++        let start = Instant::now();
++        let response = tokio::select! {
++            biased;
++            _ = tx_event.closed() => return,
++            response = timeout(wait, stream.next()) => response,
++        };
++        if let Some(telemetry) = telemetry.as_ref() {
++            telemetry.on_sse_poll(&response, start.elapsed());
++        }
++        let mut events = Vec::new();
++        let finished = match response {
++            Ok(Some(Ok(sse))) => {
++                trace!("Chat SSE event: {}", &sse.data);
++                if sse.data.trim() == "[DONE]" {
++                    true
++                } else {
++                    match serde_json::from_str::<Value>(&sse.data) {
++                        Ok(chunk) => state.apply_chunk(&chunk, &mut events),
++                        Err(err) => {
++                            debug!(%err, payload_bytes = sse.data.len(), "Failed to parse chat chunk");
++                            false
++                        }
++                    }
++                }
++            }
++            Ok(Some(Err(err))) => {
++                debug!("Chat SSE error: {err:#}");
++                let error = match err {
++                    eventsource_stream::EventStreamError::Transport(
++                        error @ codex_client::TransportError::Policy(_),
++                    ) => ApiError::Transport(error),
++                    error => ApiError::Stream(error.to_string()),
++                };
++                events.push(Err(error));
++                true
++            }
++            Ok(None) => true,
++            // A provider that reported its finish reason may keep the connection open.
++            Err(_) if state.finish_reason.is_some() => true,
++            Err(_) => {
++                events.push(Err(ApiError::Stream(
++                    "idle timeout waiting for chat completion chunks".into(),
++                )));
++                true
++            }
++        };
++        let failed = events.iter().any(Result::is_err);
++        if finished && !failed {
++            events.extend(state.finish());
++        }
++        for event in events {
++            if tx_event.send(event).await.is_err() {
++                return;
++            }
++        }
++        if finished || failed {
++            return;
++        }
++    }
++}
++
++enum OpenItem {
++    Reasoning { id: ResponseItemId, text: String },
++    Message { id: ResponseItemId, text: String },
++}
++
++#[derive(Default)]
++struct ToolCallSlot {
++    index: Option<i64>,
++    id: Option<String>,
++    name: String,
++    arguments: String,
++}
++
++#[derive(PartialEq, Eq)]
++enum ThinkState {
++    /// Content so far could still begin with a think block.
++    Undecided,
++    Thinking,
++    Done,
++}
++
++struct ChatStreamState {
++    settings: ChatStreamSettings,
++    response_id: Option<String>,
++    created: bool,
++    open: Option<OpenItem>,
++    tool_calls: Vec<ToolCallSlot>,
++    finish_reason: Option<String>,
++    usage: Option<TokenUsage>,
++    think: ThinkState,
++    think_buffer: String,
++}
++
++type Events = Vec<Result<ResponseEvent, ApiError>>;
++
++impl ChatStreamState {
++    fn new(settings: ChatStreamSettings) -> Self {
++        let think = if settings.options.think_tags {
++            ThinkState::Undecided
++        } else {
++            ThinkState::Done
++        };
++        Self {
++            settings,
++            response_id: None,
++            created: false,
++            open: None,
++            tool_calls: Vec::new(),
++            finish_reason: None,
++            usage: None,
++            think,
++            think_buffer: String::new(),
++        }
++    }
++
++    /// Applies one stream chunk and reports whether the stream ended with an error.
++    fn apply_chunk(&mut self, chunk: &Value, events: &mut Events) -> bool {
++        if let Some(error) = chunk
++            .get("error")
++            .filter(|_| chunk.get("choices").is_none())
++        {
++            let classifier = ChatErrorClassifier {
++                context_length_patterns: &self.settings.options.context_length_error_patterns,
++            };
++            events.push(Err(classifier.classify_stream_error(error)));
++            return true;
++        }
++        self.note_response(chunk, events);
++        for choice in chunk
++            .get("choices")
++            .and_then(Value::as_array)
++            .into_iter()
++            .flatten()
++        {
++            if let Some(delta) = choice.get("delta") {
++                self.apply_message(delta, events);
++                for call in delta
++                    .get("tool_calls")
++                    .and_then(Value::as_array)
++                    .into_iter()
++                    .flatten()
++                {
++                    self.apply_tool_call_delta(call);
++                }
++            }
++            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
++                self.finish_reason = Some(reason.to_string());
++            }
++        }
++        false
++    }
++
++    /// Applies a complete non-streaming chat completion.
++    fn apply_completion(&mut self, completion: &Value, events: &mut Events) {
++        if let Some(error) = completion
++            .get("error")
++            .filter(|_| completion.get("choices").is_none())
++        {
++            let classifier = ChatErrorClassifier {
++                context_length_patterns: &self.settings.options.context_length_error_patterns,
++            };
++            events.push(Err(classifier.classify_stream_error(error)));
++            return;
++        }
++        self.note_response(completion, events);
++        let Some(choice) = completion
++            .get("choices")
++            .and_then(Value::as_array)
++            .and_then(|choices| choices.first())
++        else {
++            return;
++        };
++        if let Some(message) = choice.get("message") {
++            self.apply_message(message, events);
++            for call in message
++                .get("tool_calls")
++                .and_then(Value::as_array)
++                .into_iter()
++                .flatten()
++            {
++                let mut slot = ToolCallSlot::default();
++                apply_tool_call_fields(&mut slot, call);
++                self.tool_calls.push(slot);
++            }
++        }
++        self.finish_reason = Some(
++            choice
++                .get("finish_reason")
++                .and_then(Value::as_str)
++                .unwrap_or("stop")
++                .to_string(),
++        );
++    }
++
++    fn note_response(&mut self, chunk: &Value, events: &mut Events) {
++        if self.response_id.is_none() {
++            self.response_id = chunk
++                .get("id")
++                .and_then(Value::as_str)
++                .filter(|id| !id.is_empty())
++                .map(str::to_string);
++        }
++        if !self.created {
++            self.created = true;
++            events.push(Ok(ResponseEvent::Created {
++                response_id: self.response_id.clone(),
++            }));
++        }
++        if let Some(usage) = chunk
++            .get("usage")
++            .filter(|usage| usage.is_object())
++            .and_then(token_usage)
++        {
++            self.usage = Some(usage);
++        }
++    }
++
++    fn apply_message(&mut self, message: &Value, events: &mut Events) {
++        // Some providers repeat the same reasoning under both field names.
++        if let Some(text) = ["reasoning_content", "reasoning"].iter().find_map(|field| {
++            message
++                .get(*field)
++                .and_then(Value::as_str)
++                .filter(|text| !text.is_empty())
++        }) {
++            self.push_reasoning(text, events);
++        }
++        for field in ["content", "refusal"] {
++            if let Some(text) = message.get(field).and_then(Value::as_str) {
++                self.push_content(text, events);
++            }
++        }
++    }
++
++    fn push_content(&mut self, text: &str, events: &mut Events) {
++        if text.is_empty() {
++            return;
++        }
++        if self.think == ThinkState::Done {
++            self.push_text(text, events);
++            return;
++        }
++        self.think_buffer.push_str(text);
++        self.drain_think_buffer(events, /*final_flush*/ false);
++    }
++
++    /// Splits buffered content into reasoning and text around a leading think block.
++    fn drain_think_buffer(&mut self, events: &mut Events, final_flush: bool) {
++        loop {
++            match self.think {
++                ThinkState::Undecided => {
++                    let trimmed = self.think_buffer.trim_start();
++                    if let Some(rest) = trimmed.strip_prefix(THINK_OPEN) {
++                        self.think_buffer = rest.to_string();
++                        self.think = ThinkState::Thinking;
++                    } else if !final_flush && THINK_OPEN.starts_with(trimmed) {
++                        return;
++                    } else {
++                        self.think = ThinkState::Done;
++                    }
++                }
++                ThinkState::Thinking => {
++                    if let Some(end) = self.think_buffer.find(THINK_CLOSE) {
++                        let reasoning = self.think_buffer[..end].to_string();
++                        let rest = self.think_buffer[end + THINK_CLOSE.len()..]
++                            .trim_start_matches(['\r', '\n'])
++                            .to_string();
++                        self.push_reasoning(&reasoning, events);
++                        self.think_buffer = rest;
++                        self.think = ThinkState::Done;
++                        continue;
++                    }
++                    let keep = if final_flush {
++                        0
++                    } else {
++                        partial_suffix_len(&self.think_buffer, THINK_CLOSE)
++                    };
++                    let emit = self.think_buffer.len() - keep;
++                    let reasoning = self.think_buffer[..emit].to_string();
++                    self.think_buffer.replace_range(..emit, "");
++                    self.push_reasoning(&reasoning, events);
++                    return;
++                }
++                ThinkState::Done => {
++                    let text = std::mem::take(&mut self.think_buffer);
++                    self.push_text(&text, events);
++                    return;
++                }
++            }
++        }
++    }
++
++    fn push_reasoning(&mut self, text: &str, events: &mut Events) {
++        if text.is_empty() {
++            return;
++        }
++        if matches!(self.open, Some(OpenItem::Message { .. })) {
++            self.close_open(events);
++        }
++        if self.open.is_none() {
++            let id = ResponseItemId::new("rs");
++            events.push(Ok(ResponseEvent::OutputItemAdded(reasoning_item(
++                &id, /*text*/ None,
++            ))));
++            self.open = Some(OpenItem::Reasoning {
++                id,
++                text: String::new(),
++            });
++        }
++        if let Some(OpenItem::Reasoning { text: buffer, .. }) = self.open.as_mut() {
++            buffer.push_str(text);
++        }
++        events.push(Ok(ResponseEvent::ReasoningContentDelta {
++            delta: text.to_string(),
++            content_index: 0,
++        }));
++    }
++
++    fn push_text(&mut self, text: &str, events: &mut Events) {
++        if text.is_empty() {
++            return;
++        }
++        if matches!(self.open, Some(OpenItem::Reasoning { .. })) {
++            self.close_open(events);
++        }
++        if self.open.is_none() {
++            let id = ResponseItemId::new("msg");
++            events.push(Ok(ResponseEvent::OutputItemAdded(message_item(
++                &id, /*text*/ None,
++            ))));
++            self.open = Some(OpenItem::Message {
++                id,
++                text: String::new(),
++            });
++        }
++        if let Some(OpenItem::Message { text: buffer, .. }) = self.open.as_mut() {
++            buffer.push_str(text);
++        }
++        events.push(Ok(ResponseEvent::OutputTextDelta(text.to_string())));
++    }
++
++    fn close_open(&mut self, events: &mut Events) {
++        match self.open.take() {
++            Some(OpenItem::Reasoning { id, text }) => {
++                events.push(Ok(ResponseEvent::OutputItemDone(reasoning_item(
++                    &id,
++                    Some(text),
++                ))));
++            }
++            Some(OpenItem::Message { id, text }) => {
++                events.push(Ok(ResponseEvent::OutputItemDone(message_item(
++                    &id,
++                    Some(text),
++                ))));
++            }
++            None => {}
++        }
++    }
++
++    fn apply_tool_call_delta(&mut self, call: &Value) {
++        let index = call.get("index").and_then(Value::as_i64);
++        let id = call
++            .get("id")
++            .and_then(Value::as_str)
++            .filter(|id| !id.is_empty());
++        let existing = match (index, id) {
++            (Some(index), id) => self
++                .tool_calls
++                .iter()
++                .rposition(|slot| slot.index == Some(index))
++                .filter(|position| {
++                    // Some providers number every parallel call 0; a new id starts a new call.
++                    !matches!(
++                        (self.tool_calls[*position].id.as_deref(), id),
++                        (Some(existing), Some(id)) if existing != id
++                    )
++                }),
++            (None, Some(id)) => self
++                .tool_calls
++                .iter()
++                .position(|slot| slot.id.as_deref() == Some(id)),
++            (None, None) => self.tool_calls.len().checked_sub(1),
++        };
++        let position = existing.unwrap_or_else(|| {
++            self.tool_calls.push(ToolCallSlot {
++                index,
++                ..Default::default()
++            });
++            self.tool_calls.len() - 1
++        });
++        apply_tool_call_fields(&mut self.tool_calls[position], call);
++    }
++
++    /// Closes open items and emits the tool calls followed by the terminal event.
++    ///
++    /// Tool calls run as soon as they are emitted, so only a completion that finished normally
++    /// emits them. A stream that ended before any finish reason commits nothing, as its text and
++    /// tool call arguments may be cut short.
++    fn finish(&mut self) -> Events {
++        let mut events = Vec::new();
++        let Some(reason) = self.finish_reason.clone() else {
++            events.push(Err(ApiError::Stream(
++                "chat completion stream ended before a finish reason".into(),
++            )));
++            return events;
++        };
++        if self.think != ThinkState::Done || !self.think_buffer.is_empty() {
++            self.drain_think_buffer(&mut events, /*final_flush*/ true);
++        }
++        self.close_open(&mut events);
++        let tool_calls = std::mem::take(&mut self.tool_calls);
++        let response_id = self
++            .response_id
++            .clone()
++            .unwrap_or_else(|| ResponseItemId::new("chatcmpl").as_str().to_string());
++        match reason.as_str() {
++            "length" => events.push(Err(ApiError::ResponseIncomplete(Box::new(
++                ResponseIncompleteError {
++                    reason: "max_output_tokens".to_string(),
++                    response_id: Some(response_id),
++                    token_usage: self.usage.clone(),
++                },
++            )))),
++            "content_filter" => events.push(Err(ApiError::ContentFilter)),
++            "insufficient_system_resource" => events.push(Err(ApiError::Retryable {
++                message: "the model provider reported insufficient system resources".to_string(),
++                retry_after: None,
++            })),
++            _ => {
++                for slot in tool_calls {
++                    events.push(Ok(ResponseEvent::OutputItemDone(self.tool_call_item(slot))));
++                }
++                events.push(Ok(ResponseEvent::Completed {
++                    response_id,
++                    token_usage: self.usage.clone(),
++                    usage_metadata: None,
++                    end_turn: None,
++                }));
++            }
++        }
++        events
++    }
++
++    fn tool_call_item(&self, slot: ToolCallSlot) -> ResponseItem {
++        let call_id = slot
++            .id
++            .unwrap_or_else(|| ResponseItemId::new("call").as_str().to_string());
++        let arguments = if slot.arguments.trim().is_empty() {
++            "{}".to_string()
++        } else {
++            slot.arguments
++        };
++        match self.settings.tools.resolve(&slot.name) {
++            Some(target) if target.freeform => ResponseItem::CustomToolCall {
++                encrypted_content: None,
++                id: None,
++                status: None,
++                call_id,
++                name: target.name.clone(),
++                namespace: target.namespace.clone(),
++                input: freeform_input(&arguments),
++                internal_chat_message_metadata_passthrough: None,
++            },
++            target => ResponseItem::FunctionCall {
++                encrypted_content: None,
++                status: None,
++                id: None,
++                name: target.map_or(slot.name, |target| target.name.clone()),
++                namespace: target.and_then(|target| target.namespace.clone()),
++                arguments,
++                encrypted_function_args: None,
++                call_id,
++                internal_chat_message_metadata_passthrough: None,
++            },
++        }
++    }
++}
++
++/// Merges one tool call delta: the first id and name win, argument fragments concatenate.
++fn apply_tool_call_fields(slot: &mut ToolCallSlot, call: &Value) {
++    if slot.id.is_none() {
++        slot.id = call
++            .get("id")
++            .and_then(Value::as_str)
++            .filter(|id| !id.is_empty())
++            .map(str::to_string);
++    }
++    let Some(function) = call.get("function") else {
++        return;
++    };
++    if slot.name.is_empty()
++        && let Some(name) = function.get("name").and_then(Value::as_str)
++    {
++        slot.name = name.to_string();
++    }
++    match function.get("arguments") {
++        Some(Value::String(arguments)) => slot.arguments.push_str(arguments),
++        Some(arguments @ Value::Object(_)) => slot.arguments.push_str(&arguments.to_string()),
++        _ => {}
++    }
++}
++
++/// Unwraps the `input` argument of a freeform tool exposed as a function.
++fn freeform_input(arguments: &str) -> String {
++    serde_json::from_str::<Value>(arguments)
++        .ok()
++        .and_then(|value| {
++            value
++                .get("input")
++                .and_then(Value::as_str)
++                .map(str::to_string)
++        })
++        .unwrap_or_else(|| arguments.to_string())
++}
++
++/// Length of the longest suffix of `text` that is a proper prefix of `marker`.
++fn partial_suffix_len(text: &str, marker: &str) -> usize {
++    (1..marker.len())
++        .rev()
++        .find(|len| text.ends_with(&marker[..*len]))
++        .unwrap_or(0)
++}
++
++fn reasoning_item(id: &ResponseItemId, text: Option<String>) -> ResponseItem {
++    ResponseItem::Reasoning {
++        id: Some(id.clone()),
++        summary: Vec::new(),
++        content: text.map(|text| vec![ReasoningItemContent::ReasoningText { text }]),
++        encrypted_content: None,
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
++
++fn message_item(id: &ResponseItemId, text: Option<String>) -> ResponseItem {
++    ResponseItem::Message {
++        encrypted_content: None,
++        status: None,
++        id: Some(id.clone()),
++        role: "assistant".to_string(),
++        content: text
++            .map(|text| {
++                vec![ContentItem::OutputText {
++                    text,
++                    annotations: None,
++                    logprobs: None,
++                }]
++            })
++            .unwrap_or_default(),
++        phase: None,
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
++
++fn token_usage(usage: &Value) -> Option<TokenUsage> {
++    let number = |value: Option<&Value>| value.and_then(Value::as_i64).unwrap_or(0);
++    let input_tokens = number(usage.get("prompt_tokens"));
++    let output_tokens = number(usage.get("completion_tokens"));
++    if input_tokens == 0 && output_tokens == 0 && usage.get("total_tokens").is_none() {
++        return None;
++    }
++    let cached_input_tokens = usage
++        .pointer("/prompt_tokens_details/cached_tokens")
++        .or_else(|| usage.get("prompt_cache_hit_tokens"))
++        .and_then(Value::as_i64)
++        .unwrap_or(0);
++    let reasoning_output_tokens =
++        number(usage.pointer("/completion_tokens_details/reasoning_tokens"));
++    let total_tokens = usage
++        .get("total_tokens")
++        .and_then(Value::as_i64)
++        .unwrap_or(input_tokens + output_tokens);
++    Some(TokenUsage {
++        input_tokens,
++        cached_input_tokens,
++        cache_write_input_tokens: 0,
++        output_tokens,
++        reasoning_output_tokens,
++        total_tokens,
++        codex_rollout_budget_units: None,
++    })
++}
++
++#[cfg(test)]
++#[path = "chat_tests.rs"]
++mod tests;
+diff --git a/codex-rs/codex-api/src/sse/chat_tests.rs b/codex-rs/codex-api/src/sse/chat_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d96657cda2a5535cee2416a619ed8c0b618dcce
+--- /dev/null
++++ b/codex-rs/codex-api/src/sse/chat_tests.rs
+@@ -0,0 +1,382 @@
++use super::*;
++use futures::stream;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++
++fn settings(think_tags: bool) -> ChatStreamSettings {
++    let mut tools = ToolAliasTable::default();
++    tools.insert(
++        Some("multi_agent_v1"),
++        "spawn_agent",
++        /*freeform*/ false,
++    );
++    tools.insert(None, "exec_command", /*freeform*/ false);
++    tools.insert(None, "apply_patch", /*freeform*/ true);
++    ChatStreamSettings {
++        tools: Arc::new(tools),
++        options: Arc::new(ChatOptions {
++            think_tags,
++            ..Default::default()
++        }),
++    }
++}
++
++fn chunk(delta: Value, finish_reason: Option<&str>) -> Value {
++    json!({
++        "id": "chatcmpl-1",
++        "object": "chat.completion.chunk",
++        "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }],
++    })
++}
++
++async fn run(
++    chunks: &[Value],
++    done: bool,
++    keep_open: bool,
++    settings: ChatStreamSettings,
++) -> Vec<String> {
++    let mut frames = chunks
++        .iter()
++        .map(|chunk| format!("data: {chunk}\n\n"))
++        .collect::<Vec<_>>();
++    if done {
++        frames.push("data: [DONE]\n\n".to_string());
++    }
++    let frames = stream::iter(
++        frames
++            .into_iter()
++            .map(|frame| Ok::<_, codex_client::TransportError>(Bytes::from(frame))),
++    );
++    let bytes: ByteStream = if keep_open {
++        frames.chain(stream::pending()).boxed()
++    } else {
++        frames.boxed()
++    };
++    let (tx_event, mut rx_event) = mpsc::channel(64);
++    process_chat_sse(bytes, tx_event, Duration::from_millis(200), None, settings).await;
++    let mut events = Vec::new();
++    while let Some(event) = rx_event.recv().await {
++        events.push(describe(event));
++    }
++    events
++}
++
++fn describe(event: Result<ResponseEvent, ApiError>) -> String {
++    match event {
++        Ok(ResponseEvent::Created { response_id }) => {
++            format!("created:{}", response_id.unwrap_or_default())
++        }
++        Ok(ResponseEvent::OutputItemAdded(item)) => format!("added:{}", describe_item(item)),
++        Ok(ResponseEvent::OutputItemDone(item)) => format!("done:{}", describe_item(item)),
++        Ok(ResponseEvent::ReasoningContentDelta { delta, .. }) => format!("reasoning:{delta}"),
++        Ok(ResponseEvent::OutputTextDelta(delta)) => format!("text:{delta}"),
++        Ok(ResponseEvent::Completed { token_usage, .. }) => match token_usage {
++            Some(usage) => format!(
++                "completed:{}/{}/{}/{}/{}",
++                usage.input_tokens,
++                usage.cached_input_tokens,
++                usage.output_tokens,
++                usage.reasoning_output_tokens,
++                usage.total_tokens
++            ),
++            None => "completed".to_string(),
++        },
++        Ok(other) => format!("other:{other:?}"),
++        Err(ApiError::ResponseIncomplete(incomplete)) => {
++            format!("error:incomplete:{}", incomplete.reason)
++        }
++        Err(ApiError::ContentFilter) => "error:content_filter".to_string(),
++        Err(ApiError::Retryable { .. }) => "error:retryable".to_string(),
++        Err(ApiError::ContextWindowExceeded) => "error:context_window".to_string(),
++        Err(ApiError::Stream(message)) => format!("error:stream:{message}"),
++        Err(other) => format!("error:{other}"),
++    }
++}
++
++fn describe_item(item: ResponseItem) -> String {
++    match item {
++        ResponseItem::Reasoning { content, .. } => format!(
++            "reasoning:{}",
++            content
++                .unwrap_or_default()
++                .into_iter()
++                .map(|content| match content {
++                    ReasoningItemContent::ReasoningText { text }
++                    | ReasoningItemContent::Text { text } => text,
++                })
++                .collect::<String>()
++        ),
++        ResponseItem::Message { content, .. } => format!(
++            "message:{}",
++            content
++                .into_iter()
++                .map(|content| match content {
++                    ContentItem::OutputText { text, .. } | ContentItem::InputText { text } => text,
++                    _ => String::new(),
++                })
++                .collect::<String>()
++        ),
++        ResponseItem::FunctionCall {
++            name,
++            namespace,
++            arguments,
++            call_id,
++            ..
++        } => format!(
++            "call:{}/{name}:{call_id}:{arguments}",
++            namespace.unwrap_or_default()
++        ),
++        ResponseItem::CustomToolCall {
++            name,
++            input,
++            call_id,
++            ..
++        } => format!("custom:{name}:{call_id}:{input}"),
++        other => format!("{other:?}"),
++    }
++}
++
++#[tokio::test]
++async fn reasoning_and_text_stream_as_one_open_item_at_a_time() {
++    let events = run(
++        &[
++            chunk(json!({ "role": "assistant", "content": "" }), None),
++            chunk(json!({ "reasoning_content": "think " }), None),
++            chunk(json!({ "reasoning_content": "more" }), None),
++            chunk(json!({ "content": "Hello" }), None),
++            chunk(json!({ "reasoning": "again" }), None),
++            chunk(json!({ "content": " world" }), Some("stop")),
++            json!({ "id": "chatcmpl-1", "choices": [], "usage": {
++                "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
++                "prompt_tokens_details": { "cached_tokens": 64 },
++                "completion_tokens_details": { "reasoning_tokens": 12 },
++            } }),
++        ],
++        /*done*/ true,
++        /*keep_open*/ false,
++        settings(false),
++    )
++    .await;
++    assert_eq!(
++        events,
++        [
++            "created:chatcmpl-1",
++            "added:reasoning:",
++            "reasoning:think ",
++            "reasoning:more",
++            "done:reasoning:think more",
++            "added:message:",
++            "text:Hello",
++            "done:message:Hello",
++            "added:reasoning:",
++            "reasoning:again",
++            "done:reasoning:again",
++            "added:message:",
++            "text: world",
++            "done:message: world",
++            "completed:100/64/20/12/120",
++        ]
++    );
++}
++
++#[tokio::test]
++async fn tool_call_deltas_accumulate_by_index_and_id() {
++    let events = run(
++        &[
++            chunk(json!({ "tool_calls": [{ "index": 0, "id": "call_a", "type": "function", "function": { "name": "multi_agent_v1__spawn_agent", "arguments": "" } }] }), None),
++            chunk(json!({ "tool_calls": [{ "index": 0, "function": { "arguments": "{\"message\":" } }] }), None),
++            chunk(json!({ "tool_calls": [{ "index": 0, "function": { "arguments": "\"x\"}" } }] }), None),
++            // A second parallel call that reuses index 0 with a new id.
++            chunk(json!({ "tool_calls": [{ "index": 0, "id": "call_b", "function": { "name": "exec_command", "arguments": "{}" } }] }), None),
++            // A call identified only by id.
++            chunk(json!({ "tool_calls": [{ "id": "call_c", "function": { "name": "apply_patch", "arguments": "{\"input\":" } }] }), None),
++            chunk(json!({ "tool_calls": [{ "function": { "arguments": "\"*** Begin Patch\"}" } }] }), None),
++            chunk(json!({ "tool_calls": [{ "index": 1, "function": { "name": "unknown_tool" } }] }), Some("tool_calls")),
++        ],
++        /*done*/ true,
++        /*keep_open*/ false,
++        settings(false),
++    )
++    .await;
++    assert_eq!(events[0], "created:chatcmpl-1");
++    assert_eq!(
++        &events[1..4],
++        [
++            "done:call:multi_agent_v1/spawn_agent:call_a:{\"message\":\"x\"}",
++            "done:call:/exec_command:call_b:{}",
++            "done:custom:apply_patch:call_c:*** Begin Patch",
++        ]
++    );
++    assert!(events[4].starts_with("done:call:/unknown_tool:call_"));
++    assert!(events[4].ends_with(":{}"));
++    assert_eq!(events[5], "completed");
++}
++
++#[tokio::test]
++async fn tool_calls_are_emitted_when_the_finish_reason_is_stop() {
++    let events = run(
++        &[
++            chunk(json!({ "content": "Running." }), None),
++            chunk(json!({ "tool_calls": [{ "index": 0, "id": "call_a", "function": { "name": "exec_command", "arguments": "{}" } }] }), Some("stop")),
++        ],
++        /*done*/ true,
++        /*keep_open*/ false,
++        settings(false),
++    )
++    .await;
++    assert_eq!(
++        &events[1..],
++        [
++            "added:message:",
++            "text:Running.",
++            "done:message:Running.",
++            "done:call:/exec_command:call_a:{}",
++            "completed",
++        ]
++    );
++}
++
++#[tokio::test]
++async fn finish_reasons_map_to_terminal_errors() {
++    for (reason, expected) in [
++        ("length", "error:incomplete:max_output_tokens"),
++        ("content_filter", "error:content_filter"),
++        ("insufficient_system_resource", "error:retryable"),
++    ] {
++        let events = run(
++            &[
++                chunk(json!({ "content": "partial" }), None),
++                chunk(json!({ "tool_calls": [{ "index": 0, "id": "call_a", "function": { "name": "exec_command", "arguments": "{}" } }] }), Some(reason)),
++            ],
++            /*done*/ true,
++            /*keep_open*/ false,
++            settings(false),
++        )
++        .await;
++        assert_eq!(
++            events.last().map(String::as_str),
++            Some(expected),
++            "{reason}"
++        );
++        assert!(events.contains(&"done:message:partial".to_string()));
++        assert!(!events.iter().any(|event| event.starts_with("done:call")), "{reason}: {events:?}");
++    }
++}
++
++#[tokio::test]
++async fn streams_end_after_the_grace_period_without_done() {
++    let events = run(
++        &[chunk(json!({ "content": "bye" }), Some("stop"))],
++        /*done*/ false,
++        /*keep_open*/ true,
++        settings(false),
++    )
++    .await;
++    assert_eq!(events.last().map(String::as_str), Some("completed"));
++}
++
++#[tokio::test]
++async fn streams_without_a_finish_reason_fail_retryably() {
++    let events = run(
++        &[
++            chunk(json!({ "content": "cut" }), None),
++            chunk(json!({ "tool_calls": [{ "index": 0, "id": "call_a", "function": { "name": "exec_command", "arguments": "{\"cmd\":\"touch marker\"}" } }] }), None),
++        ],
++        /*done*/ false,
++        /*keep_open*/ false,
++        settings(false),
++    )
++    .await;
++    assert_eq!(
++        events.last().map(String::as_str),
++        Some("error:stream:chat completion stream ended before a finish reason")
++    );
++    assert!(!events.iter().any(|event| event.starts_with("done:")), "{events:?}");
++}
++
++#[tokio::test]
++async fn error_chunks_end_the_stream() {
++    let events = run(
++        &[
++            chunk(json!({ "content": "x" }), None),
++            json!({ "error": { "message": "This model's maximum context length is 8192 tokens" } }),
++        ],
++        /*done*/ true,
++        /*keep_open*/ false,
++        settings(false),
++    )
++    .await;
++    assert_eq!(
++        events.last().map(String::as_str),
++        Some("error:context_window")
++    );
++    assert!(!events.iter().any(|event| event.starts_with("completed")));
++}
++
++#[tokio::test]
++async fn think_tags_split_across_chunks_become_reasoning() {
++    let events = run(
++        &[
++            chunk(json!({ "content": "\n<thi" }), None),
++            chunk(json!({ "content": "nk>plan</th" }), None),
++            chunk(json!({ "content": "ink>\nanswer" }), Some("stop")),
++        ],
++        /*done*/ true,
++        /*keep_open*/ false,
++        settings(true),
++    )
++    .await;
++    let done = events
++        .iter()
++        .filter(|event| event.starts_with("done:"))
++        .cloned()
++        .collect::<Vec<_>>();
++    assert_eq!(done, ["done:reasoning:plan", "done:message:answer"]);
++
++    let plain = run(
++        &[chunk(json!({ "content": "<b>bold</b>" }), Some("stop"))],
++        /*done*/ true,
++        /*keep_open*/ false,
++        settings(true),
++    )
++    .await;
++    assert!(plain.contains(&"done:message:<b>bold</b>".to_string()));
++}
++
++#[tokio::test]
++async fn complete_json_responses_emit_the_same_events() {
++    let body = json!({
++        "id": "chatcmpl-json",
++        "object": "chat.completion",
++        "choices": [{
++            "index": 0,
++            "message": {
++                "role": "assistant",
++                "reasoning_content": "why",
++                "content": "Done.",
++                "tool_calls": [{ "id": "call_a", "type": "function", "function": { "name": "exec_command", "arguments": "{\"cmd\":\"ls\"}" } }],
++            },
++            "finish_reason": "tool_calls",
++        }],
++        "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "prompt_cache_hit_tokens": 4 },
++    });
++    let mut stream = spawn_chat_completion(Bytes::from(body.to_string()), None, settings(false));
++    let mut events = Vec::new();
++    while let Some(event) = stream.rx_event.recv().await {
++        events.push(describe(event));
++    }
++    assert_eq!(
++        events,
++        [
++            "created:chatcmpl-json",
++            "added:reasoning:",
++            "reasoning:why",
++            "done:reasoning:why",
++            "added:message:",
++            "text:Done.",
++            "done:message:Done.",
++            "done:call:/exec_command:call_a:{\"cmd\":\"ls\"}",
++            "completed:10/4/5/0/15",
++        ]
++    );
++}
+diff --git a/codex-rs/codex-api/src/sse/mod.rs b/codex-rs/codex-api/src/sse/mod.rs
+index b4872ba6ac66bf9ad6e2eb8b7348d702b6c9b26a..b3fa1c51e6074a170ceafe653a0140c7fac24245 100644
+--- a/codex-rs/codex-api/src/sse/mod.rs
++++ b/codex-rs/codex-api/src/sse/mod.rs
+@@ -1,3 +1,4 @@
++pub(crate) mod chat;
+ pub(crate) mod responses;
+ mod responses_error;
+ 
+diff --git a/codex-rs/config/src/thread_config.rs b/codex-rs/config/src/thread_config.rs
+index 36bbbb58c302cd4823f2a83b3f2a203e7a0cbee3..9b93431f6f5f9506e47abb6887e5c1cdd703f3fc 100644
+--- a/codex-rs/config/src/thread_config.rs
++++ b/codex-rs/config/src/thread_config.rs
+@@ -307,6 +307,7 @@ mod tests {
+             aws: None,
+             wire_api: WireApi::Responses,
+             error_envelope: None,
++            chat: None,
+             query_params: None,
+             http_headers: None,
+             env_http_headers: None,
+diff --git a/codex-rs/config/src/thread_config/remote.rs b/codex-rs/config/src/thread_config/remote.rs
+index b28cefa9cceba327718e9044b0caf3d683eacb8a..204a05c562b95478b06477ba276dbc2d90ffc6e5 100644
+--- a/codex-rs/config/src/thread_config/remote.rs
++++ b/codex-rs/config/src/thread_config/remote.rs
+@@ -185,6 +185,7 @@ fn model_provider_from_proto(
+         aws: None,
+         wire_api,
+         error_envelope: None,
++        chat: None,
+         query_params: provider.query_params.map(redacted_string_map),
+         http_headers: provider.http_headers.map(redacted_string_map),
+         env_http_headers: provider.env_http_headers.map(|map| map.values),
+@@ -217,6 +218,7 @@ fn model_provider_to_proto(
+         gateway_oauth: _,
+         aws: _,
+         wire_api,
++        chat: _,
+         query_params,
+         http_headers,
+         env_http_headers,
+@@ -316,6 +318,7 @@ fn proto_string_map(values: HashMap<String, RedactedString>) -> proto::StringMap
+ fn proto_wire_api(wire_api: WireApi) -> proto::WireApi {
+     match wire_api {
+         WireApi::Responses => proto::WireApi::Responses,
++        WireApi::Chat => proto::WireApi::Unspecified,
+     }
+ }
+ 
+@@ -568,6 +571,7 @@ mod tests {
+             }),
+             wire_api: WireApi::Responses,
+             error_envelope: None,
++            chat: None,
+             query_params: Some(HashMap::from([(
+                 "api-version".to_string(),
+                 "2026-04-16".into(),
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index bb2f66df0ae78a99978e490985019501c69d27d4..0217198b2394e01f6f128a84011e295b11998e4b 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -591,6 +591,219 @@
+       },
+       "type": "object"
+     },
++    "ChatMaxTokensField": {
++      "description": "Request field that carries the output token limit.",
++      "enum": [
++        "max_tokens",
++        "max_completion_tokens"
++      ],
++      "type": "string"
++    },
++    "ChatMidConversationInstructions": {
++      "description": "Role of developer instructions that arrive after the conversation started.",
++      "oneOf": [
++        {
++          "description": "Wrap the instructions in a user message.",
++          "enum": [
++            "user"
++          ],
++          "type": "string"
++        },
++        {
++          "description": "Send a system message at the position where the instructions arrived.",
++          "enum": [
++            "system"
++          ],
++          "type": "string"
++        }
++      ]
++    },
++    "ChatOptions": {
++      "additionalProperties": false,
++      "description": "Chat Completions behavior of a provider whose `wire_api` is `chat`.\n\nEvery field has a default suited to OpenAI-compatible endpoints, so providers only list the behaviors that differ.",
++      "properties": {
++        "context_length_error_patterns": {
++          "default": [],
++          "description": "Additional case-insensitive error message fragments that mean the context window was exceeded.",
++          "items": {
++            "type": "string"
++          },
++          "type": "array"
++        },
++        "extra_body": {
++          "additionalProperties": true,
++          "default": {},
++          "description": "Fields merged into the top level of every request body.",
++          "type": "object"
++        },
++        "image_input": {
++          "default": true,
++          "description": "Whether the model accepts image inputs.",
++          "type": "boolean"
++        },
++        "include_usage": {
++          "default": true,
++          "description": "Request a usage chunk at the end of each stream.",
++          "type": "boolean"
++        },
++        "max_images": {
++          "default": null,
++          "description": "Number of most recent images kept in a request.",
++          "format": "uint32",
++          "minimum": 0.0,
++          "type": "integer"
++        },
++        "max_output_tokens": {
++          "default": null,
++          "description": "Output token limit sent in the `max_tokens_field` field.",
++          "format": "uint64",
++          "minimum": 0.0,
++          "type": "integer"
++        },
++        "max_tokens_field": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/ChatMaxTokensField"
++            }
++          ],
++          "default": "max_tokens",
++          "description": "Request field that carries `max_output_tokens`."
++        },
++        "mid_conversation_instructions": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/ChatMidConversationInstructions"
++            }
++          ],
++          "default": "user",
++          "description": "Role used for developer instructions that arrive after the conversation started."
++        },
++        "reasoning_field": {
++          "default": "reasoning_content",
++          "description": "Assistant message field that carries replayed reasoning content.",
++          "type": "string"
++        },
++        "reasoning_replay": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/ChatReasoningReplay"
++            }
++          ],
++          "default": "current_turn",
++          "description": "Which reasoning content is sent back to the model with later requests."
++        },
++        "send_reasoning_effort": {
++          "default": false,
++          "description": "Send the selected reasoning effort as `reasoning_effort`.",
++          "type": "boolean"
++        },
++        "structured_output": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/ChatStructuredOutput"
++            }
++          ],
++          "default": "json_schema",
++          "description": "How a structured output request is expressed."
++        },
++        "system_role": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/ChatSystemRole"
++            }
++          ],
++          "default": "system",
++          "description": "Role of the single leading message that carries the instructions."
++        },
++        "think_tags": {
++          "default": false,
++          "description": "Treat a leading `<think>` block of the content as reasoning.",
++          "type": "boolean"
++        },
++        "tool_output_images": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/ChatToolOutputImages"
++            }
++          ],
++          "default": "user_message",
++          "description": "How images returned by tools reach the model."
++        }
++      },
++      "type": "object"
++    },
++    "ChatReasoningReplay": {
++      "description": "Reasoning content sent back to a Chat Completions model.",
++      "oneOf": [
++        {
++          "enum": [
++            "none",
++            "all"
++          ],
++          "type": "string"
++        },
++        {
++          "description": "Reasoning produced after the last user message.",
++          "enum": [
++            "current_turn"
++          ],
++          "type": "string"
++        }
++      ]
++    },
++    "ChatStructuredOutput": {
++      "description": "How a structured output request is expressed to a Chat Completions model.",
++      "oneOf": [
++        {
++          "description": "`response_format` of type `json_schema`.",
++          "enum": [
++            "json_schema"
++          ],
++          "type": "string"
++        },
++        {
++          "description": "`response_format` of type `json_object`, with the schema in the instructions.",
++          "enum": [
++            "json_object"
++          ],
++          "type": "string"
++        },
++        {
++          "description": "The schema in the instructions only.",
++          "enum": [
++            "prompt"
++          ],
++          "type": "string"
++        }
++      ]
++    },
++    "ChatSystemRole": {
++      "description": "Role of the leading instructions message in a Chat Completions request.",
++      "enum": [
++        "system",
++        "developer"
++      ],
++      "type": "string"
++    },
++    "ChatToolOutputImages": {
++      "description": "How images returned by tools reach a Chat Completions model.",
++      "oneOf": [
++        {
++          "description": "A user message after the tool results carries the images.",
++          "enum": [
++            "user_message"
++          ],
++          "type": "string"
++        },
++        {
++          "description": "Images are replaced by a placeholder.",
++          "enum": [
++            "omit"
++          ],
++          "type": "string"
++        }
++      ]
++    },
+     "CircuitBreakAction": {
+       "oneOf": [
+         {
+@@ -2892,6 +3105,14 @@
+           ],
+           "description": "Optional API capability overrides for a custom Responses-compatible provider. Unspecified capabilities retain their existing provider defaults."
+         },
++        "chat": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/ChatOptions"
++            }
++          ],
++          "description": "Chat Completions behavior when `wire_api` is `chat`."
++        },
+         "env_http_headers": {
+           "additionalProperties": {
+             "type": "string"
+@@ -6949,6 +7170,13 @@
+             "responses"
+           ],
+           "type": "string"
++        },
++        {
++          "description": "The Chat Completions API at `/chat/completions`.",
++          "enum": [
++            "chat"
++          ],
++          "type": "string"
+         }
+       ]
+     },
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index 773486a3bc5080f5fcfbceb7afb0cb0d613aee50..1f3f69c35bb2d28a2226d8484f4eecf8f4cebb0c 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -41,6 +41,7 @@ use async_channel::Sender;
+ use codex_api::AgentIdentityTelemetry;
+ use codex_api::ApiError;
+ use codex_api::AuthProvider;
++use codex_api::ChatClient as ApiChatClient;
+ use codex_api::Compression;
+ use codex_api::ErrorEnvelopePolicy;
+ use codex_api::MemoriesClient as ApiMemoriesClient;
+@@ -1966,6 +1967,166 @@ impl ResponsesHttpExecutor<'_> {
+     }
+ }
+ 
++impl ResponsesHttpExecutor<'_> {
++    /// Streams a turn through the Chat Completions endpoint of a `wire_api = "chat"` provider.
++    ///
++    /// The request is built exactly like a Responses request and converted by the Chat client,
++    /// so history preparation, request contributors, and credential recovery stay shared.
++    #[allow(clippy::too_many_arguments)]
++    pub(crate) async fn stream_chat_http(
++        &self,
++        event_sender: Option<&Sender<ProtocolEvent>>,
++        prompt: &Prompt,
++        model_info: &ModelInfo,
++        session_telemetry: &SessionTelemetry,
++        effort: Option<ReasoningEffortConfig>,
++        summary: ReasoningSummaryConfig,
++        service_tier: Option<String>,
++        responses_metadata: &CodexResponsesMetadata,
++        inference_trace: &InferenceTraceContext,
++    ) -> Result<ResponseStream> {
++        let chat_options = Arc::new(
++            self.client
++                .state
++                .provider
++                .info()
++                .chat
++                .clone()
++                .unwrap_or_default(),
++        );
++        let auth_manager = self.client.state.provider.auth_manager();
++        let mut auth_recovery = auth_manager
++            .as_ref()
++            .map(AuthManager::unauthorized_recovery);
++        let mut provider_auth_recovery_attempted = false;
++        let mut pending_retry = PendingUnauthorizedRetry::default();
++        loop {
++            let client_setup = self
++                .client
++                .current_client_setup(ClientRouting::Workspace)
++                .await?;
++            tracing::Span::current().record("api.path", "/chat/completions");
++            let transport = self.client.build_api_transport(
++                &client_setup.api_provider,
++                "/chat/completions",
++                client_setup.redirect_policy,
++            )?;
++            let request_auth_context = AuthRequestTelemetryContext::new(
++                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
++                client_setup.api_auth.as_ref(),
++                client_setup.agent_identity_telemetry.clone(),
++                pending_retry,
++            );
++            let (request_telemetry, sse_telemetry) = ModelClientSession::build_streaming_telemetry(
++                session_telemetry,
++                request_auth_context,
++                RequestRouteTelemetry::for_endpoint("/chat/completions"),
++                self.client.state.auth_env_telemetry.clone(),
++            );
++            let mut request = self.client.build_responses_request(
++                prompt,
++                model_info,
++                effort.clone(),
++                summary,
++                service_tier.clone(),
++                responses_metadata,
++                /*include_internal*/ false,
++            )?;
++            self.client
++                .prepare_response_items_for_request(&mut request.input);
++            let request_session_telemetry =
++                session_telemetry_for_request(session_telemetry, &request);
++            let interceptors = crate::model_request::prepare(
++                &self.client.request_contributors,
++                &self.client.state.thread_id.to_string(),
++                &model_info.slug,
++                codex_extension_api::ModelRequestKind::Generation,
++                &mut request.client_metadata,
++            );
++            let inference_trace_attempt = inference_trace.start_attempt();
++            let mut extra_headers = ApiHeaderMap::new();
++            add_originator_header(&mut extra_headers, self.client.state.originator.as_str());
++            inference_trace_attempt.add_request_headers(&mut extra_headers);
++            if let Some(input) = tool_metadata::bounded_input(&request, &request.input) {
++                if let Some(recorder) = &self.client.executed_tool_calls {
++                    recorder.invalidate_wire_inventory_loss(&request.input, &input);
++                }
++                request.input = input;
++            }
++            inference_trace_attempt.record_started(&request);
++            let options = ApiResponsesOptions {
++                session_id: Some(self.client.responses_session_id(responses_metadata)),
++                thread_id: Some(responses_metadata.thread_id.to_string()),
++                session_source: Some(self.client.state.session_source.clone()),
++                extra_headers,
++                compression: Compression::None,
++                turn_state: None,
++            };
++            let client = ApiChatClient::new(
++                transport,
++                client_setup.api_provider,
++                client_setup.api_auth,
++                Arc::clone(&chat_options),
++            )
++            .with_telemetry(Some(request_telemetry), Some(sse_telemetry))
++            .with_error_envelope(self.client.state.error_envelope.clone());
++
++            match client.stream_request(&request, options).await {
++                Ok(stream) => {
++                    let (stream, _) = map_response_stream(
++                        stream,
++                        request_session_telemetry,
++                        inference_trace_attempt,
++                        Arc::clone(&self.client.state.provider),
++                        interceptors,
++                    );
++                    return Ok(stream);
++                }
++                Err(ApiError::Transport(unauthorized_transport))
++                    if self
++                        .client
++                        .state
++                        .provider
++                        .is_recoverable_auth_error(&unauthorized_transport) =>
++                {
++                    let response_debug_context =
++                        extract_response_debug_context(&unauthorized_transport);
++                    inference_trace_attempt.record_failed(
++                        &unauthorized_transport,
++                        response_debug_context.request_id.as_deref(),
++                        /*output_items*/ &[],
++                    );
++                    pending_retry = PendingUnauthorizedRetry::from_recovery(
++                        handle_unauthorized(
++                            unauthorized_transport,
++                            &mut auth_recovery,
++                            &mut provider_auth_recovery_attempted,
++                            session_telemetry,
++                            &self.client.state.provider,
++                            event_sender,
++                            responses_metadata.turn_id.as_deref(),
++                            client.applied_bearer(),
++                        )
++                        .await?,
++                    );
++                    continue;
++                }
++                Err(err) => {
++                    let response_debug_context =
++                        extract_response_debug_context_from_api_error(&err);
++                    let err = self.client.state.provider.map_api_error(err);
++                    inference_trace_attempt.record_failed(
++                        &err,
++                        response_debug_context.request_id.as_deref(),
++                        /*output_items*/ &[],
++                    );
++                    return Err(err);
++                }
++            }
++        }
++    }
++}
++
+ impl ModelClientSession {
+     /// Streams a turn via the Responses API over WebSocket transport.
+     #[allow(clippy::too_many_arguments)]
+@@ -2435,6 +2596,21 @@ impl ModelClientSession {
+                     )
+                     .await
+             }
++            WireApi::Chat => {
++                ResponsesHttpExecutor::new(&self.client)
++                    .stream_chat_http(
++                        self.client.event_sender.as_ref(),
++                        prompt,
++                        model_info,
++                        session_telemetry,
++                        effort,
++                        summary,
++                        service_tier,
++                        responses_metadata,
++                        inference_trace,
++                    )
++                    .await
++            }
+         }
+     }
+ 
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index d1d43621210c979e2a98e2c2bc49698e825d71c1..25ac69322004c22b9dc29388a5c6b2356237c014 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -81,6 +81,7 @@ use codex_file_system::FindUpErrorPolicy;
+ use codex_file_system::find_nearest_ancestor_with_markers;
+ use codex_login::CodexAuth;
+ use codex_model_provider::RemoteCompactionSupport;
++use codex_model_provider_info::WireApi;
+ use codex_protocol::ResponseItemId;
+ use codex_protocol::config_types::AutoCompactTokenLimitScope;
+ use codex_protocol::config_types::ModeKind;
+@@ -3104,6 +3105,11 @@ async fn try_run_sampling_request(
+                         super::TokenUsageContext::Sampling,
+                     )
+                     .await;
++                // Chat providers may omit usage; an estimate keeps auto-compaction working
++                // without inventing billed token counts.
++                if token_usage.is_none() && turn_context.provider.info().wire_api == WireApi::Chat {
++                    sess.recompute_token_usage(&turn_context).await;
++                }
+                 should_emit_token_count = true;
+                 should_emit_turn_diff = true;
+                 if let Err(err) = budget_result {
+diff --git a/codex-rs/core/tests/responses_headers.rs b/codex-rs/core/tests/responses_headers.rs
+index 48871ade1ea9ac29747fc673779dd3c38a6e625e..a3554a84722be180cc57921d9d62fe57a5813e20 100644
+--- a/codex-rs/core/tests/responses_headers.rs
++++ b/codex-rs/core/tests/responses_headers.rs
+@@ -83,6 +83,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
+         aws: None,
+         wire_api: WireApi::Responses,
+         error_envelope: None,
++        chat: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+@@ -231,6 +232,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
+         aws: None,
+         wire_api: WireApi::Responses,
+         error_envelope: None,
++        chat: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+@@ -360,6 +362,7 @@ async fn responses_respects_model_info_overrides_from_config() {
+         aws: None,
+         wire_api: WireApi::Responses,
+         error_envelope: None,
++        chat: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+diff --git a/codex-rs/core/tests/suite/client.rs b/codex-rs/core/tests/suite/client.rs
+index 905a0e0d5d5aa46556964dc9cd8c7ea379e2d887..44ad874896b8b2e74435dac0664e36b9f96eebfe 100644
+--- a/codex-rs/core/tests/suite/client.rs
++++ b/codex-rs/core/tests/suite/client.rs
+@@ -1708,6 +1708,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
+         aws: None,
+         wire_api: WireApi::Responses,
+         error_envelope: None,
++        chat: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+@@ -3215,6 +3216,7 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
+         aws: None,
+         wire_api: WireApi::Responses,
+         error_envelope: None,
++        chat: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+@@ -4056,6 +4058,7 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
+         gateway_oauth: None,
+         aws: None,
+         error_envelope: None,
++        chat: None,
+         query_params: Some(std::collections::HashMap::from([(
+             "api-version".to_string(),
+             "2025-04-01-preview".into(),
+@@ -4141,6 +4144,7 @@ async fn env_var_overrides_loaded_auth() {
+         // Reuse the existing environment variable to avoid using unsafe code
+         env_key: Some(EXISTING_ENV_VAR_WITH_NON_EMPTY_VALUE.to_string()),
+         error_envelope: None,
++        chat: None,
+         query_params: Some(std::collections::HashMap::from([(
+             "api-version".to_string(),
+             "2025-04-01-preview".into(),
+diff --git a/codex-rs/core/tests/suite/client_websockets.rs b/codex-rs/core/tests/suite/client_websockets.rs
+index 8960e5d687d2ada9e3989f9e634e1ddc0a8d02f4..0e09a2df0b9344514041b6e70539c81a370cbf1d 100755
+--- a/codex-rs/core/tests/suite/client_websockets.rs
++++ b/codex-rs/core/tests/suite/client_websockets.rs
+@@ -2723,6 +2723,7 @@ fn websocket_provider_with_connect_timeout(
+         aws: None,
+         wire_api: WireApi::Responses,
+         error_envelope: None,
++        chat: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+diff --git a/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs b/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
+index 9103ed84e1e133a2a38386fff011ce8e85a5e609..ca466f11207a8502e5897d6f8bf308121dd8950a 100644
+--- a/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
++++ b/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
+@@ -75,6 +75,7 @@ async fn continue_after_stream_error() {
+         aws: None,
+         wire_api: WireApi::Responses,
+         error_envelope: None,
++        chat: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+diff --git a/codex-rs/core/tests/suite/stream_no_completed.rs b/codex-rs/core/tests/suite/stream_no_completed.rs
+index 48cdfdf1f4986bfc90ff9422fb42f3fdb7a2ba94..91007c7aa31537b55e458efe6a5cb17896d31a46 100644
+--- a/codex-rs/core/tests/suite/stream_no_completed.rs
++++ b/codex-rs/core/tests/suite/stream_no_completed.rs
+@@ -60,6 +60,7 @@ async fn retries_on_early_close() {
+         aws: None,
+         wire_api: WireApi::Responses,
+         error_envelope: None,
++        chat: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+diff --git a/codex-rs/login/src/auth_env_telemetry.rs b/codex-rs/login/src/auth_env_telemetry.rs
+index d66ec107a8602dbc0b455069938444733b4b16e7..1698f51fff7f009b3f42f56aa67073a4149f5f0a 100644
+--- a/codex-rs/login/src/auth_env_telemetry.rs
++++ b/codex-rs/login/src/auth_env_telemetry.rs
+@@ -70,6 +70,7 @@ mod tests {
+             aws: None,
+             wire_api: WireApi::Responses,
+             error_envelope: None,
++            chat: None,
+             query_params: None,
+             http_headers: None,
+             env_http_headers: None,
+diff --git a/codex-rs/model-provider-info/src/chat.rs b/codex-rs/model-provider-info/src/chat.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..416e708a1f6fc301b4ee20eb007c2e0ff393ad3f
+--- /dev/null
++++ b/codex-rs/model-provider-info/src/chat.rs
+@@ -0,0 +1,71 @@
++//! Validation of providers that speak the Chat Completions wire protocol.
++
++use crate::ModelProviderInfo;
++use crate::RemoteCompactionSupport;
++use crate::WireApi;
++
++/// Request body fields owned by the request builder, which `extra_body` cannot override.
++const RESERVED_EXTRA_BODY_FIELDS: &[&str] = &[
++    "model",
++    "messages",
++    "stream",
++    "stream_options",
++    "tools",
++    "tool_choice",
++    "parallel_tool_calls",
++    "response_format",
++];
++
++pub(crate) fn validate(info: &ModelProviderInfo) -> Result<(), String> {
++    if info.wire_api != WireApi::Chat {
++        if info.chat.is_some() {
++            return Err("provider chat options require wire_api = \"chat\"".to_string());
++        }
++        return Ok(());
++    }
++    if info.supports_websockets {
++        return Err("wire_api = \"chat\" cannot be combined with supports_websockets".to_string());
++    }
++    if info
++        .capabilities
++        .and_then(|capabilities| capabilities.remote_compaction)
++        == Some(RemoteCompactionSupport::V2)
++    {
++        return Err(
++            "wire_api = \"chat\" cannot be combined with capabilities.remote_compaction = \"v2\""
++                .to_string(),
++        );
++    }
++    if info.model_catalog_url.is_some() {
++        return Err("wire_api = \"chat\" cannot be combined with model_catalog_url".to_string());
++    }
++    let Some(options) = info.chat.as_ref() else {
++        return Ok(());
++    };
++    if options.max_output_tokens == Some(0) {
++        return Err("provider chat.max_output_tokens must be greater than zero".to_string());
++    }
++    if options.max_images == Some(0) {
++        return Err("provider chat.max_images must be greater than zero".to_string());
++    }
++    if options.reasoning_field.trim().is_empty() {
++        return Err("provider chat.reasoning_field must not be empty".to_string());
++    }
++    if options
++        .context_length_error_patterns
++        .iter()
++        .any(|pattern| pattern.trim().is_empty())
++    {
++        return Err(
++            "provider chat.context_length_error_patterns must not contain empty patterns"
++                .to_string(),
++        );
++    }
++    if let Some(field) = RESERVED_EXTRA_BODY_FIELDS
++        .iter()
++        .find(|field| options.extra_body.contains_key(**field))
++    {
++        return Err(format!("provider chat.extra_body cannot set `{field}`"));
++    }
++    Ok(())
++}
+diff --git a/codex-rs/model-provider-info/src/lib.rs b/codex-rs/model-provider-info/src/lib.rs
+index 21231874ad00b56365a087001844585dbe3f412e..839716a9d1d57e52479773884580b93a869e3620 100644
+--- a/codex-rs/model-provider-info/src/lib.rs
++++ b/codex-rs/model-provider-info/src/lib.rs
+@@ -11,6 +11,7 @@
+ use codex_client::Provider as ApiProvider;
+ use codex_client::RetryConfig as ApiRetryConfig;
+ use codex_protocol::auth::AuthMode;
++use codex_protocol::config_types::ChatOptions;
+ use codex_protocol::config_types::ModelProviderAuthInfo;
+ use codex_protocol::error::CodexErr;
+ use codex_protocol::error::EnvVarError;
+@@ -32,6 +33,7 @@ use std::sync::RwLock;
+ use std::time::Duration;
+ 
+ mod capabilities;
++mod chat;
+ mod error_envelope;
+ mod gateway_oauth;
+ pub use capabilities::ModelProviderCapabilities;
+@@ -99,7 +101,6 @@ pub const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str =
+     "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
+ const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER: &str = "x-amzn-mantle-client-agent";
+ const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE: &str = "codex";
+-const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
+ pub const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
+ pub const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
+ 
+@@ -110,12 +111,15 @@ pub enum WireApi {
+     /// The Responses API exposed by OpenAI at `/v1/responses`.
+     #[default]
+     Responses,
++    /// The Chat Completions API at `/chat/completions`.
++    Chat,
+ }
+ 
+ impl fmt::Display for WireApi {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         let value = match self {
+             Self::Responses => "responses",
++            Self::Chat => "chat",
+         };
+         f.write_str(value)
+     }
+@@ -129,8 +133,11 @@ impl<'de> Deserialize<'de> for WireApi {
+         let value = String::deserialize(deserializer)?;
+         match value.as_str() {
+             "responses" => Ok(Self::Responses),
+-            "chat" => Err(serde::de::Error::custom(CHAT_WIRE_API_REMOVED_ERROR)),
+-            _ => Err(serde::de::Error::unknown_variant(&value, &["responses"])),
++            "chat" => Ok(Self::Chat),
++            _ => Err(serde::de::Error::unknown_variant(
++                &value,
++                &["responses", "chat"],
++            )),
+         }
+     }
+ }
+@@ -171,6 +178,8 @@ pub struct ModelProviderInfo {
+     pub capabilities: Option<ModelProviderCapabilities>,
+     /// Recognition of HTTP 2xx JSON error envelopes returned in place of model responses.
+     pub error_envelope: Option<ModelProviderErrorEnvelope>,
++    /// Chat Completions behavior when `wire_api` is `chat`.
++    pub chat: Option<ChatOptions>,
+     /// Optional query parameters to append to the base URL.
+     pub query_params: Option<HashMap<String, RedactedString>>,
+     /// Additional HTTP headers to include in requests to this provider where
+@@ -307,6 +316,7 @@ other non-default provider fields are not supported"
+         if let Some(envelope) = &self.error_envelope {
+             envelope.validate()?;
+         }
++        chat::validate(self)?;
+         if let Some(aws) = self.aws.as_ref() {
+             if self.supports_websockets {
+                 // TODO(celia-oai): Support AWS SigV4 signing for WebSocket
+@@ -543,6 +553,7 @@ other non-default provider fields are not supported"
+             aws: None,
+             wire_api: WireApi::Responses,
+             error_envelope: None,
++            chat: None,
+             query_params: None,
+             http_headers: Some(
+                 [("version".to_string(), env!("CARGO_PKG_VERSION").into())]
+@@ -596,6 +607,7 @@ other non-default provider fields are not supported"
+             })),
+             wire_api: WireApi::Responses,
+             error_envelope: None,
++            chat: None,
+             query_params: None,
+             http_headers: Some(HashMap::from([(
+                 AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string(),
+@@ -774,6 +786,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
+         aws: None,
+         wire_api,
+         error_envelope: None,
++        chat: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+diff --git a/codex-rs/model-provider-info/src/model_provider_info_tests.rs b/codex-rs/model-provider-info/src/model_provider_info_tests.rs
+index 3d64346420ca6c1b34e57c1917fe4cc27bd65774..4bbcdf7b833242fb79eb1a7b5dd0138a748bac1d 100644
+--- a/codex-rs/model-provider-info/src/model_provider_info_tests.rs
++++ b/codex-rs/model-provider-info/src/model_provider_info_tests.rs
+@@ -1,4 +1,6 @@
+ use super::*;
++use codex_protocol::config_types::ChatMidConversationInstructions;
++use codex_protocol::config_types::ChatReasoningReplay;
+ use codex_utils_absolute_path::AbsolutePathBuf;
+ use codex_utils_absolute_path::AbsolutePathBufGuard;
+ use pretty_assertions::assert_eq;
+@@ -87,6 +89,7 @@ base_url = "http://localhost:11434/v1"
+         aws: None,
+         wire_api: WireApi::Responses,
+         error_envelope: None,
++        chat: None,
+         query_params: None,
+         http_headers: None,
+         env_http_headers: None,
+@@ -125,6 +128,7 @@ query_params = { api-version = "2025-04-01-preview" }
+         aws: None,
+         wire_api: WireApi::Responses,
+         error_envelope: None,
++        chat: None,
+         query_params: Some(maplit::hashmap! {
+             "api-version".to_string() => "2025-04-01-preview".into(),
+         }),
+@@ -167,6 +171,7 @@ supports_standalone_web_search = true
+         aws: None,
+         wire_api: WireApi::Responses,
+         error_envelope: None,
++        chat: None,
+         query_params: None,
+         http_headers: Some(maplit::hashmap! {
+             "X-Example-Header".to_string() => "example-value".into(),
+@@ -190,16 +195,79 @@ supports_standalone_web_search = true
+ }
+ 
+ #[test]
+-fn test_deserialize_chat_wire_api_shows_helpful_error() {
++fn test_deserialize_chat_wire_api_with_options() {
+     let provider_toml = r#"
+-name = "OpenAI using Chat Completions"
+-base_url = "https://api.openai.com/v1"
+-env_key = "OPENAI_API_KEY"
++name = "Chat provider"
++base_url = "https://chat.example.com/v1"
++env_key = "CHAT_API_KEY"
+ wire_api = "chat"
++
++[chat]
++mid_conversation_instructions = "system"
++reasoning_replay = "all"
++max_output_tokens = 8192
++context_length_error_patterns = ["上下文过长"]
++extra_body = { enable_thinking = true }
+         "#;
+ 
+-    let err = toml::from_str::<ModelProviderInfo>(provider_toml).unwrap_err();
+-    assert!(err.to_string().contains(CHAT_WIRE_API_REMOVED_ERROR));
++    let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
++    assert_eq!(provider.wire_api, WireApi::Chat);
++    let chat = provider.chat.clone().expect("chat options");
++    assert_eq!(
++        chat.mid_conversation_instructions,
++        ChatMidConversationInstructions::System
++    );
++    assert_eq!(chat.reasoning_replay, ChatReasoningReplay::All);
++    assert_eq!(chat.reasoning_field, "reasoning_content");
++    assert_eq!(chat.max_output_tokens, Some(8192));
++    assert_eq!(
++        chat.extra_body
++            .get("enable_thinking")
++            .and_then(|value| value.as_bool()),
++        Some(true)
++    );
++    assert_eq!(provider.validate(), Ok(()));
++}
++
++#[test]
++fn test_validate_chat_wire_api_conflicts() {
++    let chat_provider = |options: ChatOptions| ModelProviderInfo {
++        name: "Chat provider".to_string(),
++        base_url: Some("https://chat.example.com/v1".to_string()),
++        wire_api: WireApi::Chat,
++        chat: Some(options),
++        ..Default::default()
++    };
++    let rejected = [
++        ModelProviderInfo {
++            wire_api: WireApi::Responses,
++            ..chat_provider(ChatOptions::default())
++        },
++        ModelProviderInfo {
++            supports_websockets: true,
++            ..chat_provider(ChatOptions::default())
++        },
++        ModelProviderInfo {
++            capabilities: Some(ModelProviderCapabilities {
++                remote_compaction: Some(RemoteCompactionSupport::V2),
++                ..Default::default()
++            }),
++            ..chat_provider(ChatOptions::default())
++        },
++        chat_provider(ChatOptions {
++            max_output_tokens: Some(0),
++            ..Default::default()
++        }),
++        chat_provider(ChatOptions {
++            context_length_error_patterns: vec![" ".to_string()],
++            ..Default::default()
++        }),
++        chat_provider(toml::from_str("extra_body = { tools = [] }").unwrap()),
++    ];
++    for provider in rejected {
++        assert!(provider.validate().is_err(), "{provider:?}");
++    }
++    assert_eq!(chat_provider(ChatOptions::default()).validate(), Ok(()));
+ }
+ 
+ #[test]
+@@ -359,6 +427,7 @@ fn test_create_amazon_bedrock_provider() {
+             }),
+             wire_api: WireApi::Responses,
+             error_envelope: None,
++            chat: None,
+             query_params: None,
+             http_headers: Some(maplit::hashmap! {
+                 AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string() =>
+diff --git a/codex-rs/model-provider/src/capabilities.rs b/codex-rs/model-provider/src/capabilities.rs
+index ea6e5fc9e1e4d74d8a3eceec673cf22ee785434b..48a557cc17d107ddb84a33d145f1ba468d6029af 100644
+--- a/codex-rs/model-provider/src/capabilities.rs
++++ b/codex-rs/model-provider/src/capabilities.rs
+@@ -2,6 +2,7 @@
+ 
+ use codex_model_provider_info::ModelProviderInfo;
+ use codex_model_provider_info::RemoteCompactionSupport;
++use codex_model_provider_info::WireApi;
+ 
+ /// Optional provider-backed features that Codex may expose at runtime.
+ ///
+@@ -28,6 +29,15 @@ impl Default for ProviderCapabilities {
+ 
+ impl ProviderCapabilities {
+     pub(crate) fn from_config(info: &ModelProviderInfo) -> Self {
++        // Hosted tools and compaction items exist only in the Responses protocol.
++        if info.wire_api == WireApi::Chat {
++            return Self {
++                image_generation: false,
++                web_search: false,
++                external_web_access: false,
++                remote_compaction: RemoteCompactionSupport::Unsupported,
++            };
++        }
+         let defaults = Self::default();
+         let overrides = info.capabilities.unwrap_or_default();
+         Self {
+diff --git a/codex-rs/model-provider/src/provider.rs b/codex-rs/model-provider/src/provider.rs
+index 74e16968e08d21220ca2b68b12cb8df562203dd5..69ef1aa748c774e1335625205ee9c38b109cc2b5 100644
+--- a/codex-rs/model-provider/src/provider.rs
++++ b/codex-rs/model-provider/src/provider.rs
+@@ -14,6 +14,7 @@ use codex_login::GatewayAuthManager;
+ use codex_login::WorkspaceRoutingRequest;
+ use codex_login::default_client::ClientRedirectPolicy;
+ use codex_model_provider_info::ModelProviderInfo;
++use codex_model_provider_info::WireApi;
+ use codex_models_manager::cache::ModelsCache;
+ use codex_models_manager::manager::OpenAiModelsManager;
+ use codex_models_manager::manager::SharedModelsManager;
+@@ -396,6 +397,11 @@ impl ConfiguredModelProvider {
+             })
+         });
+         if let Some(model_catalog) = config_model_catalog {
++            let model_catalog = if self.info.wire_api == WireApi::Chat {
++                normalize_chat_catalog(model_catalog)
++            } else {
++                model_catalog
++            };
+             return Arc::new(StaticModelsManager::new(
+                 self.auth_manager.clone(),
+                 model_catalog,
+@@ -425,6 +431,15 @@ impl ConfiguredModelProvider {
+     }
+ }
+ 
++/// Removes catalog features that only the Responses protocol can carry.
++fn normalize_chat_catalog(mut catalog: ModelsResponse) -> ModelsResponse {
++    for model in &mut catalog.models {
++        model.supports_search_tool = false;
++        model.use_responses_lite = false;
++    }
++    catalog
++}
++
+ impl ModelProvider for ConfiguredModelProvider {
+     fn info(&self) -> &ModelProviderInfo {
+         &self.info
+@@ -662,6 +677,7 @@ mod tests {
+             aws: None,
+             wire_api: WireApi::Responses,
+             error_envelope: None,
++            chat: None,
+             query_params: None,
+             http_headers: None,
+             env_http_headers: None,
+diff --git a/codex-rs/protocol/src/config_types.rs b/codex-rs/protocol/src/config_types.rs
+index 3c66b90c325451097364bb001cfec1db433ed794..bd43e611f8f6d543dc6a0fa47c2cbad8fd2a1e7b 100644
+--- a/codex-rs/protocol/src/config_types.rs
++++ b/codex-rs/protocol/src/config_types.rs
+@@ -646,6 +646,133 @@ fn is_default_provider_auth_cwd(path: &AbsolutePathBuf) -> bool {
+     path == &default_provider_auth_cwd()
+ }
+ 
++/// Chat Completions behavior of a provider whose `wire_api` is `chat`.
++///
++/// Every field has a default suited to OpenAI-compatible endpoints, so providers only list
++/// the behaviors that differ.
++#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema)]
++#[serde(default)]
++#[schemars(deny_unknown_fields)]
++pub struct ChatOptions {
++    /// Role of the single leading message that carries the instructions.
++    pub system_role: ChatSystemRole,
++    /// Role used for developer instructions that arrive after the conversation started.
++    pub mid_conversation_instructions: ChatMidConversationInstructions,
++    /// Which reasoning content is sent back to the model with later requests.
++    pub reasoning_replay: ChatReasoningReplay,
++    /// Assistant message field that carries replayed reasoning content.
++    pub reasoning_field: String,
++    /// Request a usage chunk at the end of each stream.
++    pub include_usage: bool,
++    /// How a structured output request is expressed.
++    pub structured_output: ChatStructuredOutput,
++    /// Send the selected reasoning effort as `reasoning_effort`.
++    pub send_reasoning_effort: bool,
++    /// Output token limit sent in the `max_tokens_field` field.
++    pub max_output_tokens: Option<u64>,
++    /// Request field that carries `max_output_tokens`.
++    pub max_tokens_field: ChatMaxTokensField,
++    /// Whether the model accepts image inputs.
++    pub image_input: bool,
++    /// How images returned by tools reach the model.
++    pub tool_output_images: ChatToolOutputImages,
++    /// Number of most recent images kept in a request.
++    pub max_images: Option<u32>,
++    /// Treat a leading `<think>` block of the content as reasoning.
++    pub think_tags: bool,
++    /// Additional case-insensitive error message fragments that mean the context window
++    /// was exceeded.
++    pub context_length_error_patterns: Vec<String>,
++    /// Fields merged into the top level of every request body.
++    pub extra_body: serde_json::Map<String, Value>,
++}
++
++impl Default for ChatOptions {
++    fn default() -> Self {
++        Self {
++            system_role: ChatSystemRole::default(),
++            mid_conversation_instructions: ChatMidConversationInstructions::default(),
++            reasoning_replay: ChatReasoningReplay::default(),
++            reasoning_field: "reasoning_content".to_string(),
++            include_usage: true,
++            structured_output: ChatStructuredOutput::default(),
++            send_reasoning_effort: false,
++            max_output_tokens: None,
++            max_tokens_field: ChatMaxTokensField::default(),
++            image_input: true,
++            tool_output_images: ChatToolOutputImages::default(),
++            max_images: None,
++            think_tags: false,
++            context_length_error_patterns: Vec::new(),
++            extra_body: serde_json::Map::new(),
++        }
++    }
++}
++
++/// Role of the leading instructions message in a Chat Completions request.
++#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
++#[serde(rename_all = "snake_case")]
++pub enum ChatSystemRole {
++    #[default]
++    System,
++    Developer,
++}
++
++/// Role of developer instructions that arrive after the conversation started.
++#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
++#[serde(rename_all = "snake_case")]
++pub enum ChatMidConversationInstructions {
++    /// Wrap the instructions in a user message.
++    #[default]
++    User,
++    /// Send a system message at the position where the instructions arrived.
++    System,
++}
++
++/// Reasoning content sent back to a Chat Completions model.
++#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
++#[serde(rename_all = "snake_case")]
++pub enum ChatReasoningReplay {
++    None,
++    /// Reasoning produced after the last user message.
++    #[default]
++    CurrentTurn,
++    All,
++}
++
++/// How a structured output request is expressed to a Chat Completions model.
++#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
++#[serde(rename_all = "snake_case")]
++pub enum ChatStructuredOutput {
++    /// `response_format` of type `json_schema`.
++    #[default]
++    JsonSchema,
++    /// `response_format` of type `json_object`, with the schema in the instructions.
++    JsonObject,
++    /// The schema in the instructions only.
++    Prompt,
++}
++
++/// Request field that carries the output token limit.
++#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
++#[serde(rename_all = "snake_case")]
++pub enum ChatMaxTokensField {
++    #[default]
++    MaxTokens,
++    MaxCompletionTokens,
++}
++
++/// How images returned by tools reach a Chat Completions model.
++#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
++#[serde(rename_all = "snake_case")]
++pub enum ChatToolOutputImages {
++    /// A user message after the tool results carries the images.
++    #[default]
++    UserMessage,
++    /// Images are replaced by a placeholder.
++    Omit,
++}
++
+ /// Represents the trust level for a project directory.
+ /// This determines the approval policy and sandbox mode applied.
+ #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS)]

@@ -189,5 +189,75 @@
     "checks": [
       "araceae-home-directory"
     ]
+  },
+  "provider-auth-rejected-token.patch": {
+    "description": "Pass the credential refused with HTTP 401 to provider auth command refreshes as ARACEAE_PROVIDER_AUTH_REJECTED_TOKEN",
+    "depends_on": [
+      "araceae-home-directory.patch"
+    ],
+    "sha256": "75d5de8b087af4a77b758bf6e0fa2b9dec9586b19bd0e9cf2da2a5b963e44884",
+    "checks": [
+      "provider-auth-rejected-token"
+    ]
+  },
+  "platform-error-envelope.patch": {
+    "description": "Recognize configured HTTP 2xx {code, reason, message} gateway error envelopes as refused credentials or terminal request errors",
+    "depends_on": [
+      "provider-auth-rejected-token.patch"
+    ],
+    "sha256": "8aede71cbedc77c8c02587af89d3e2db8d183a6c3a4b57f642422abc65885741",
+    "checks": [
+      "platform-error-envelope"
+    ]
+  },
+  "subagent-model-lock.patch": {
+    "description": "Keep spawned subagents on the parent model and reasoning effort when agents.lock_subagent_model is set",
+    "depends_on": [
+      "platform-error-envelope.patch"
+    ],
+    "sha256": "a28ce7f6c957750b183507e294ba73308b6dccff6fb902f7d92bd00d433e55d9",
+    "checks": [
+      "subagent-model-lock"
+    ]
+  },
+  "application-context-world-state.patch": {
+    "description": "Render application additionalContext as one replaceable world-state developer message limited to 10,000 estimated tokens",
+    "depends_on": [
+      "subagent-model-lock.patch"
+    ],
+    "sha256": "7d40a6323cd41b760a6d9497cd91b3af1f52403387ddfc6f889b34dbe9749c55",
+    "checks": [
+      "application-context-world-state"
+    ]
+  },
+  "apply-patch-function-tool.patch": {
+    "description": "Offer apply_patch as a JSON function tool selected by apply_patch_tool_type, which also applies to fallback model metadata",
+    "depends_on": [
+      "application-context-world-state.patch"
+    ],
+    "sha256": "0f685b59c57fd3684b47844a93494ce333449007a938e5698f8fe56788490b7e",
+    "checks": [
+      "apply-patch-function-tool"
+    ]
+  },
+  "raw-usage-notifications.patch": {
+    "description": "Deliver rawResponse/completed usage notifications without the raw-events opt-in, including resumed threads",
+    "depends_on": [
+      "apply-patch-function-tool.patch"
+    ],
+    "sha256": "bf8f2cb08571dfa0af6ae1d08bc168de102240a33f6ed91eaff56c9b514819e7",
+    "checks": [
+      "raw-usage-notifications"
+    ]
+  },
+  "chat-wire-api.patch": {
+    "description": "Speak the Chat Completions wire protocol for providers with wire_api = \"chat\", configured by [model_providers.<id>.chat]",
+    "depends_on": [
+      "raw-usage-notifications.patch"
+    ],
+    "sha256": "a3eb8e7e302d8e74b48642a02f5ff78b414ebc4649f9a54cd767d8ed679d6b72",
+    "checks": [
+      "chat-wire-api"
+    ]
   }
 }
